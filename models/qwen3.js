@@ -121,28 +121,40 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
   // thread useful reduction work: one workgroup per output row n, WG threads
   // stride K and reduce. 2D workgroup grid because N (151936 for lm_head)
   // exceeds the 65535 per-dimension dispatch limit.
+  // Vectorized + subgroup-reduced: reads weights as vec4<f16> and x as vec4<f32>
+  // (4 elems/load → better memory throughput on the bandwidth-bound GEMV), and
+  // reduces partials with subgroupAdd (no barrier tree). Requires K % 4 == 0 (all
+  // Qwen3 matrices: K ∈ {1024,2048,3072}). One workgroup per output row.
   const GEMV_WG = 64;
   const GEMV_WGSL = `
 enable f16;
+enable subgroups;
 struct D { N:u32, K:u32, _a:u32, _b:u32 };
-@group(0) @binding(0) var<storage, read>       x : array<f32>;
-@group(0) @binding(1) var<storage, read>       W : array<f16>;
+@group(0) @binding(0) var<storage, read>       x : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W : array<vec4<f16>>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             d : D;
-var<workgroup> red : array<f32, ${GEMV_WG}>;
+var<workgroup> part : array<f32, ${GEMV_WG}>;   // one partial per subgroup (oversized, safe)
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
-  let n = wg.x + wg.y * nwg.x;       // uniform across the workgroup → barriers safe
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let n = wg.x + wg.y * nwg.x;
   if (n >= d.N) { return; }
-  let K = d.K; let wbase = n*K;
+  let K4 = d.K / 4u; let wbase = n*K4;
   var acc : f32 = 0.0;
-  var k = lid.x;
-  loop { if (k >= K) { break; } acc = acc + x[k]*f32(W[wbase+k]); k = k + ${GEMV_WG}u; }
-  red[lid.x] = acc; workgroupBarrier();
-  var s = ${GEMV_WG}u/2u;
-  loop { if (s==0u) { break; } if (lid.x<s) { red[lid.x]=red[lid.x]+red[lid.x+s]; } workgroupBarrier(); s=s/2u; }
-  if (lid.x==0u) { y[n] = red[0]; }
+  var c = lid.x;
+  loop { if (c >= K4) { break; } acc = acc + dot(x[c], vec4<f32>(W[wbase+c])); c = c + ${GEMV_WG}u; }
+  let ssum = subgroupAdd(acc);            // full sum within each subgroup
+  let sgIdx = lid.x / sgs;
+  if (sgi == 0u) { part[sgIdx] = ssum; }
+  workgroupBarrier();
+  if (lid.x == 0u) {
+    let nsg = (${GEMV_WG}u + sgs - 1u) / sgs;
+    var tot : f32 = 0.0;
+    for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[i]; }
+    y[n] = tot;
+  }
 }`;
   function gemv(xBuf, wBuf, yBuf, N, K) {
     const pipe = E.getPipeline('q3.gemv', GEMV_WGSL);
