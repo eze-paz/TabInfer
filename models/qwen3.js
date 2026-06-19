@@ -180,9 +180,65 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [gx, gy, 1]);
   }
-  // Pick the right kernel: GEMV for single-token decode, tiled GEMM for prefill.
+  // ----- Batched matvec for small T (prefill / speculative verify) -----
+  // y[T,N] = x[T,K]·W[N,K]ᵀ. One workgroup per output row n; each WEIGHT row is
+  // read ONCE and reused across all T tokens (the T-analog of N_ROWS) → a T-token
+  // forward reads the weights once, like decode. vec4 loads + subgroupAdd. The old
+  // tiled GEMM read weights per 16-tile and was ~3.7× slower at T=8 (measured).
+  // Handles T ≤ MATVEC_MAXT in one dispatch; K % 4 == 0.
+  const MATVEC_WG = 64;
+  const MATVEC_MAXT = 16;
+  const MATVEC_WGSL = `
+enable f16;
+enable subgroups;
+struct D { T:u32, N:u32, K:u32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       x : array<vec4<f32>>;   // [T, K/4]
+@group(0) @binding(1) var<storage, read>       W : array<vec4<f16>>;   // [N, K/4]
+@group(0) @binding(2) var<storage, read_write> y : array<f32>;          // [T, N]
+@group(0) @binding(3) var<uniform>             d : D;
+var<workgroup> part : array<f32, ${MATVEC_MAXT * MATVEC_WG}>;  // part[t*WG + subgroupIdx]
+@compute @workgroup_size(${MATVEC_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let n = wg.x + wg.y * nwg.x;
+  if (n >= d.N) { return; }
+  let K4 = d.K / 4u; let wbase = n*K4; let T = d.T;
+  var acc : array<f32, ${MATVEC_MAXT}>;
+  for (var t:u32=0u; t<${MATVEC_MAXT}u; t=t+1u) { acc[t] = 0.0; }
+  var c = lid.x;
+  loop {
+    if (c >= K4) { break; }
+    let wv = vec4<f32>(W[wbase+c]);                 // weight chunk — read once
+    for (var t:u32=0u; t<T; t=t+1u) { acc[t] = acc[t] + dot(x[t*K4 + c], wv); }
+    c = c + ${MATVEC_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var t:u32=0u; t<T; t=t+1u) {
+    let s = subgroupAdd(acc[t]);
+    if (sgi == 0u) { part[t*${MATVEC_WG}u + sgIdx] = s; }
+  }
+  workgroupBarrier();
+  if (lid.x < T) {
+    let t = lid.x; let nsg = (${MATVEC_WG}u + sgs - 1u) / sgs;
+    var tot : f32 = 0.0;
+    for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[t*${MATVEC_WG}u + i]; }
+    y[t*d.N + n] = tot;
+  }
+}`;
+  function matvecT(xBuf, wBuf, yBuf, T, N, K) {
+    const pipe = E.getPipeline('q3.matvecT', MATVEC_WGSL);
+    const d = uniform(new Uint32Array([T, N, K, 0]));
+    const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
+    return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [gx, gy, 1]);
+  }
+
+  // Pick the right kernel: GEMV for T=1 decode, batched matvec for small T
+  // (prefill/verify), tiled GEMM only for large T.
   function linear(xBuf, wBuf, yBuf, T, N, K) {
-    return (T === 1) ? gemv(xBuf, wBuf, yBuf, N, K) : linearT(xBuf, wBuf, yBuf, T, N, K);
+    if (T === 1) return gemv(xBuf, wBuf, yBuf, N, K);
+    if (T <= MATVEC_MAXT) return matvecT(xBuf, wBuf, yBuf, T, N, K);
+    return linearT(xBuf, wBuf, yBuf, T, N, K);
   }
 
   // ============================================================
@@ -540,6 +596,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const y=new Float32Array(N);
       for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*WR[n*K+k];y[n]=a;}
       check('gemv', maxAbs(got,y));
+      [xb,wb,yb].forEach(b=>b.destroy());
+    }
+    // --- matvecT (batched small-T matmul) vs CPU ---
+    {
+      const T=8,N=130,K=256;
+      const x=new Float32Array(T*K),W=new Float32Array(N*K);
+      for(let i=0;i<x.length;i++)x[i]=Math.sin(i*0.05);
+      for(let i=0;i<W.length;i++)W[i]=Math.cos(i*0.013);
+      const WR=roundF16(W);
+      const xb=f32buf(x),wb=f16buf(W),yb=E.createBuffer(T*N*4,ST(),'y');
+      await matvecT(xb,wb,yb,T,N,K);
+      const got=await E.readF32(yb,T*N);
+      const y=new Float32Array(T*N);
+      for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*WR[n*K+k];y[t*N+n]=a;}
+      check('matvecT', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
     }
     // --- argmax ---
