@@ -47,9 +47,10 @@ const SandpieQwen3 = (function () {
   // ============================================================
   const WG_H = 256;
   const RMSNORM_WGSL = `
+enable f16;
 struct P { T:u32, H:u32, eps:f32, _p:u32 };
 @group(0) @binding(0) var<storage, read>       x : array<f32>;
-@group(0) @binding(1) var<storage, read>       w : array<f32>;
+@group(0) @binding(1) var<storage, read>       w : array<f16>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             p : P;
 var<workgroup> red : array<f32, ${WG_H}>;
@@ -64,7 +65,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   loop { if (stride==0u){break;} if (lid.x<stride){red[lid.x]=red[lid.x]+red[lid.x+stride];} workgroupBarrier(); stride=stride/2u; }
   let inv = inverseSqrt(red[0]/f32(H) + p.eps);
   i = lid.x;
-  loop { if (i >= H) { break; } y[base+i] = x[base+i]*inv*w[i]; i = i + ${WG_H}u; }
+  loop { if (i >= H) { break; } y[base+i] = x[base+i]*inv*f32(w[i]); i = i + ${WG_H}u; }
 }`;
   function rmsnorm(xBuf, wBuf, yBuf, T, H, eps) {
     const pipe = E.getPipeline('q3.rmsnorm', RMSNORM_WGSL);
@@ -84,9 +85,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // ============================================================
   const TILE = 16;
   const LINEAR_WGSL = `
+enable f16;
 struct D { T:u32, N:u32, K:u32, _p:u32 };
 @group(0) @binding(0) var<storage, read>       x : array<f32>;
-@group(0) @binding(1) var<storage, read>       W : array<f32>;
+@group(0) @binding(1) var<storage, read>       W : array<f16>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             d : D;
 var<workgroup> tX : array<array<f32, ${TILE}>, ${TILE}>;
@@ -100,7 +102,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
     let xCol=t*${TILE}u+lid.x;
     let wCol=t*${TILE}u+lid.y;   // index into K dim of W[col, K]
     tX[lid.y][lid.x]=select(0.0, x[row*K+xCol], (row<T)&&(xCol<K));
-    tW[lid.y][lid.x]=select(0.0, W[col*K+wCol], (col<N)&&(wCol<K));
+    tW[lid.y][lid.x]=select(0.0, f32(W[col*K+wCol]), (col<N)&&(wCol<K));
     workgroupBarrier();
     for (var k:u32=0u;k<${TILE}u;k=k+1u){ acc=acc+tX[lid.y][k]*tW[k][lid.x]; }
     workgroupBarrier();
@@ -121,9 +123,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
   // exceeds the 65535 per-dimension dispatch limit.
   const GEMV_WG = 64;
   const GEMV_WGSL = `
+enable f16;
 struct D { N:u32, K:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       x : array<f32>;
-@group(0) @binding(1) var<storage, read>       W : array<f32>;
+@group(0) @binding(1) var<storage, read>       W : array<f16>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             d : D;
 var<workgroup> red : array<f32, ${GEMV_WG}>;
@@ -135,7 +138,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   let K = d.K; let wbase = n*K;
   var acc : f32 = 0.0;
   var k = lid.x;
-  loop { if (k >= K) { break; } acc = acc + x[k]*W[wbase+k]; k = k + ${GEMV_WG}u; }
+  loop { if (k >= K) { break; } acc = acc + x[k]*f32(W[wbase+k]); k = k + ${GEMV_WG}u; }
   red[lid.x] = acc; workgroupBarrier();
   var s = ${GEMV_WG}u/2u;
   loop { if (s==0u) { break; } if (lid.x<s) { red[lid.x]=red[lid.x]+red[lid.x+s]; } workgroupBarrier(); s=s/2u; }
@@ -156,16 +159,17 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Kernel 3 — Embedding gather.  y[T,H] = embed[ids[t], :]
   // ============================================================
   const EMBED_WGSL = `
+enable f16;
 struct P { T:u32, H:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       ids   : array<u32>;
-@group(0) @binding(1) var<storage, read>       embed : array<f32>;
+@group(0) @binding(1) var<storage, read>       embed : array<f16>;
 @group(0) @binding(2) var<storage, read_write> y     : array<f32>;
 @group(0) @binding(3) var<uniform>             p     : P;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   let idx=gid.x; let total=p.T*p.H; if(idx>=total){return;}
   let t=idx/p.H; let h=idx%p.H;
-  y[idx]=embed[ids[t]*p.H + h];
+  y[idx]=f32(embed[ids[t]*p.H + h]);
 }`;
   function embedGather(idsBuf, embedBuf, yBuf, T, H) {
     const pipe = E.getPipeline('q3.embed', EMBED_WGSL);
@@ -180,9 +184,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // One workgroup per (t,head); hd threads.
   // ============================================================
   const ROPEQK_WGSL = `
+enable f16;
 struct P { T:u32, nH:u32, hd:u32, posBase:u32, theta:f32, eps:f32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       inp  : array<f32>;
-@group(0) @binding(1) var<storage, read>       normW: array<f32>;
+@group(0) @binding(1) var<storage, read>       normW: array<f16>;
 @group(0) @binding(2) var<storage, read_write> out  : array<f32>;
 @group(0) @binding(3) var<uniform>             p    : P;
 var<workgroup> red : array<f32, 128>;
@@ -199,7 +204,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   var stride=64u;
   loop{ if(stride==0u){break;} if(j<stride){red[j]=red[j]+red[j+stride];} workgroupBarrier(); stride=stride/2u; }
   let inv=inverseSqrt(red[0]/f32(hd)+p.eps);
-  if(j<hd){ nrm[j]=v*inv*normW[j]; }
+  if(j<hd){ nrm[j]=v*inv*f32(normW[j]); }
   workgroupBarrier();
   if(j>=hd){ return; }
   // RoPE rotate_half: pair j with j±hd/2
@@ -313,6 +318,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
   // ============================================================
   function f32buf(arr) { return E.uploadF32(arr instanceof Float32Array ? arr : new Float32Array(arr), ST()); }
   function u32buf(arr) { const a = arr instanceof Uint32Array ? arr : new Uint32Array(arr); const b = E.createBuffer(a.byteLength, ST(), 'ids'); E.device().queue.writeBuffer(b,0,a.buffer,a.byteOffset,a.byteLength); return b; }
+  // f16 weight upload (weights are f16 at runtime) + the matching f16-rounded
+  // values for the CPU reference, so tests isolate kernel logic from f16 rounding.
+  function f16buf(arr) { const a = arr instanceof Float32Array ? arr : new Float32Array(arr); const bits = f32ToF16bits(a); const b = E.createBuffer(a.length*2, ST(), 'w16'); E.device().queue.writeBuffer(b,0,bits); return b; }
+  function roundF16(arr) { return f16ToF32(f32ToF16bits(arr instanceof Float32Array ? arr : new Float32Array(arr))); }
   const maxAbs = (a, b) => { let m = 0; for (let i=0;i<a.length;i++) m=Math.max(m, Math.abs(a[i]-b[i])); return m; };
 
   async function selfTestKernels() {
@@ -326,11 +335,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       const x=new Float32Array(T*H), w=new Float32Array(H);
       for(let i=0;i<x.length;i++)x[i]=Math.sin(i*0.07);
       for(let i=0;i<H;i++)w[i]=0.5+0.5*Math.cos(i*0.03);
-      const y=new Float32Array(T*H);
-      const xb=f32buf(x), wb=f32buf(w), yb=E.createBuffer(T*H*4, ST(),'y');
+      const y=new Float32Array(T*H); const wR=roundF16(w);
+      const xb=f32buf(x), wb=f16buf(w), yb=E.createBuffer(T*H*4, ST(),'y');
       await rmsnorm(xb,wb,yb,T,H,eps);
       const got=await E.readF32(yb,T*H);
-      for(let t=0;t<T;t++){let ss=0;for(let i=0;i<H;i++)ss+=x[t*H+i]**2;const inv=1/Math.sqrt(ss/H+eps);for(let i=0;i<H;i++)y[t*H+i]=x[t*H+i]*inv*w[i];}
+      for(let t=0;t<T;t++){let ss=0;for(let i=0;i<H;i++)ss+=x[t*H+i]**2;const inv=1/Math.sqrt(ss/H+eps);for(let i=0;i<H;i++)y[t*H+i]=x[t*H+i]*inv*wR[i];}
       check('rmsnorm', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
     }
@@ -340,11 +349,12 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       const x=new Float32Array(T*K),W=new Float32Array(N*K);
       for(let i=0;i<x.length;i++)x[i]=Math.sin(i*0.11);
       for(let i=0;i<W.length;i++)W[i]=Math.cos(i*0.05);
-      const xb=f32buf(x),wb=f32buf(W),yb=E.createBuffer(T*N*4,ST(),'y');
+      const WR=roundF16(W);
+      const xb=f32buf(x),wb=f16buf(W),yb=E.createBuffer(T*N*4,ST(),'y');
       await linearT(xb,wb,yb,T,N,K);
       const got=await E.readF32(yb,T*N);
       const y=new Float32Array(T*N);
-      for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*W[n*K+k];y[t*N+n]=a;}
+      for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*WR[n*K+k];y[t*N+n]=a;}
       check('linearT', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
     }
@@ -353,11 +363,12 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       const T=4,H=32,V=20;
       const embed=new Float32Array(V*H); for(let i=0;i<embed.length;i++)embed[i]=i*0.01;
       const ids=new Uint32Array([3,0,19,7]);
-      const ib=u32buf(ids),eb=f32buf(embed),yb=E.createBuffer(T*H*4,ST(),'y');
+      const eR=roundF16(embed);
+      const ib=u32buf(ids),eb=f16buf(embed),yb=E.createBuffer(T*H*4,ST(),'y');
       await embedGather(ib,eb,yb,T,H);
       const got=await E.readF32(yb,T*H);
       const y=new Float32Array(T*H);
-      for(let t=0;t<T;t++)for(let h=0;h<H;h++)y[t*H+h]=embed[ids[t]*H+h];
+      for(let t=0;t<T;t++)for(let h=0;h<H;h++)y[t*H+h]=eR[ids[t]*H+h];
       check('embedGather', maxAbs(got,y));
       [ib,eb,yb].forEach(b=>b.destroy());
     }
@@ -367,14 +378,15 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       const inp=new Float32Array(T*nH*hd),nw=new Float32Array(hd);
       for(let i=0;i<inp.length;i++)inp[i]=Math.sin(i*0.3);
       for(let i=0;i<hd;i++)nw[i]=0.7+0.1*i;
-      const ib=f32buf(inp),nb=f32buf(nw),ob=E.createBuffer(inp.length*4,ST(),'o');
+      const nwR=roundF16(nw);
+      const ib=f32buf(inp),nb=f16buf(nw),ob=E.createBuffer(inp.length*4,ST(),'o');
       await ropeQK(ib,nb,ob,T,nH,hd,posBase,theta,eps);
       const got=await E.readF32(ob,inp.length);
       // CPU ref
       const y=new Float32Array(inp.length); const half=hd/2;
       for(let t=0;t<T;t++)for(let h=0;h<nH;h++){
         const base=t*(nH*hd)+h*hd; let ss=0; for(let j=0;j<hd;j++)ss+=inp[base+j]**2; const inv=1/Math.sqrt(ss/hd+eps);
-        const nrm=new Float32Array(hd); for(let j=0;j<hd;j++)nrm[j]=inp[base+j]*inv*nw[j];
+        const nrm=new Float32Array(hd); for(let j=0;j<hd;j++)nrm[j]=inp[base+j]*inv*nwR[j];
         const pos=posBase+t;
         for(let j=0;j<hd;j++){const fi=j<half?j:j-half;const ang=pos*Math.pow(theta,-2*fi/hd);const c=Math.cos(ang),s=Math.sin(ang);
           const partner=j<half?nrm[j+half]:nrm[j-half];const rot=j<half?-partner:partner;y[base+j]=nrm[j]*c+rot*s;}
@@ -427,11 +439,12 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       const x=new Float32Array(K),W=new Float32Array(N*K);
       for(let i=0;i<K;i++)x[i]=Math.sin(i*0.21);
       for(let i=0;i<W.length;i++)W[i]=Math.cos(i*0.013);
-      const xb=f32buf(x),wb=f32buf(W),yb=E.createBuffer(N*4,ST(),'y');
+      const WR=roundF16(W);
+      const xb=f32buf(x),wb=f16buf(W),yb=E.createBuffer(N*4,ST(),'y');
       await gemv(xb,wb,yb,N,K);
       const got=await E.readF32(yb,N);
       const y=new Float32Array(N);
-      for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*W[n*K+k];y[n]=a;}
+      for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*WR[n*K+k];y[n]=a;}
       check('gemv', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
     }
@@ -543,18 +556,36 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
   })();
 
   // ============================================================
-  // Weight loader — safetensors (bf16) → per-tensor f32 GPU buffers.
-  // bf16→f32 is a lossless <<16. Cached in Cache Storage so reloads are instant.
+  // Weight loader — safetensors (bf16) → per-tensor f16 GPU buffers.
+  // Weights are stored as f16 (half the bytes of f32): decode reads every weight
+  // each token, so this ~halves memory bandwidth AND the GPU footprint (~3GB→1.5GB).
+  // Kernels read array<f16> and convert to f32 for the math (activations stay f32).
+  // bf16→f16 goes via f32 (different exponent widths). Cached in Cache Storage.
   // ============================================================
   const MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/';
   const CACHE_NAME = 'sandpie-webgpu-models';
-  let _weights = null;            // name -> { buf, shape, numel }
+  let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
 
-  function bf16ToF32(u16) {
-    const n = u16.length, out = new Uint32Array(n);
-    for (let i = 0; i < n; i++) out[i] = u16[i] << 16;
-    return new Float32Array(out.buffer);
+  // f32 → f16 bits (round-to-nearest), handling normals, subnormals, overflow.
+  const _f32a = new Float32Array(1), _u32a = new Uint32Array(_f32a.buffer);
+  function f32ToF16(val) {
+    _f32a[0] = val; const x = _u32a[0];
+    const sign = (x >>> 16) & 0x8000;
+    const exp = (x >>> 23) & 0xff; const mant = x & 0x7fffff;
+    if (exp === 0xff) return sign | (mant ? 0x7e00 : 0x7c00);   // NaN / Inf
+    let e = exp - 127 + 15;
+    if (e >= 31) return sign | 0x7c00;                          // overflow → Inf
+    if (e <= 0) {                                               // subnormal / zero
+      if (e < -10) return sign;
+      const m = mant | 0x800000; const shift = 14 - e;
+      let half = m >>> shift;
+      if ((m >>> (shift - 1)) & 1) half += 1;                  // round
+      return sign | half;
+    }
+    let half = (e << 10) | (mant >>> 13);
+    if ((mant >>> 12) & 1) half += 1;                          // round to nearest
+    return sign | half;
   }
   function f16ToF32(u16) {
     const n = u16.length, out = new Float32Array(n);
@@ -564,6 +595,18 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       else if (e === 31) out[i] = f ? NaN : (s ? -Infinity : Infinity);
       else out[i] = (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
     }
+    return out;
+  }
+  // bf16 bits → f16 bits (via lossless bf16→f32, then rounded f32→f16).
+  function bf16ToF16bits(u16) {
+    const n = u16.length, out = new Uint16Array(n);
+    const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+    for (let i = 0; i < n; i++) { ti[0] = u16[i] << 16; out[i] = f32ToF16(t[0]); }
+    return out;
+  }
+  function f32ToF16bits(f32) {
+    const out = new Uint16Array(f32.length);
+    for (let i = 0; i < f32.length; i++) out[i] = f32ToF16(f32[i]);
     return out;
   }
 
@@ -601,13 +644,14 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       const [begin, end] = info.data_offsets;
       const numel = info.shape.reduce((a, b) => a * b, 1);
       const raw = new Uint8Array(ab, dataStart + begin, end - begin);
-      let f32;
-      if (info.dtype === 'BF16') f32 = bf16ToF32(new Uint16Array(raw.buffer, raw.byteOffset, numel));
-      else if (info.dtype === 'F16') f32 = f16ToF32(new Uint16Array(raw.buffer, raw.byteOffset, numel));
-      else if (info.dtype === 'F32') f32 = new Float32Array(raw.buffer, raw.byteOffset, numel);
+      let f16bits;
+      if (info.dtype === 'BF16') f16bits = bf16ToF16bits(new Uint16Array(raw.buffer, raw.byteOffset, numel));
+      else if (info.dtype === 'F16') f16bits = new Uint16Array(raw.buffer, raw.byteOffset, numel);
+      else if (info.dtype === 'F32') f16bits = f32ToF16bits(new Float32Array(raw.buffer, raw.byteOffset, numel));
       else throw new Error('unsupported dtype ' + info.dtype + ' for ' + name);
-      const buf = E.createBuffer(numel * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
-      E.device().queue.writeBuffer(buf, 0, f32);
+      // f16 storage buffer: numel*2 bytes (createBuffer rounds up to 4).
+      const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
+      E.device().queue.writeBuffer(buf, 0, f16bits);
       _weights[name] = { buf, shape: info.shape, numel };
       if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
     }
@@ -616,6 +660,18 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
   }
   const _td = new TextDecoder();
   function dec_(u8) { return _td.decode(u8); }
+  // Read an f16 GPU buffer back to a CPU Float32Array (debug only).
+  async function readF16(buf, n) {
+    const bytes = Math.ceil(n * 2 / 4) * 4;
+    const staging = E.createBuffer(bytes, U.COPY_DST | U.MAP_READ, 'rd16');
+    const enc = E.device().createCommandEncoder();
+    enc.copyBufferToBuffer(buf, 0, staging, 0, bytes);
+    E.device().queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const u16 = new Uint16Array(staging.getMappedRange().slice(0), 0, n);
+    const out = f16ToF32(u16); staging.unmap(); staging.destroy();
+    return out;
+  }
 
   // ============================================================
   // Forward graph + KV cache + generate
@@ -725,7 +781,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
     selfTestKernels,
     TOK, loadModel, forward, generate, isLoaded: () => _loaded,
     _dbg: {
-      weight: async (name, n) => E.readF32(_weights[name].buf, n || _weights[name].numel),
+      weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
       names: () => Object.keys(_weights || {}),
     },
