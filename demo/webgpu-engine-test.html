@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sandpie WebGPU engine — capability + GEMM bench</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background:#0d1117; color:#c9d1d9; margin:0; padding:1.5rem; }
+  h1 { font-size:1.1rem; color:#58a6ff; margin:0 0 0.25rem; }
+  .sub { color:#8b949e; margin:0 0 1.25rem; }
+  button { font:inherit; background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; padding:0.4rem 0.9rem; cursor:pointer; margin-right:0.5rem; }
+  button:hover { border-color:#58a6ff; }
+  button:disabled { opacity:0.5; cursor:default; }
+  pre { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1rem; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  .ok { color:#3fb950; } .bad { color:#f85149; } .hi { color:#d29922; }
+  table { border-collapse:collapse; margin-top:0.5rem; }
+  td, th { border:1px solid #30363d; padding:0.3rem 0.8rem; text-align:right; }
+  th { color:#8b949e; }
+  .flag { display:inline-block; padding:0.1rem 0.5rem; border-radius:4px; margin:0.15rem 0.3rem 0.15rem 0; }
+  .flag.yes { background:#15301c; color:#3fb950; } .flag.no { background:#3a1416; color:#f85149; }
+</style>
+</head>
+<body>
+<h1>sandpie WebGPU engine — capability + GEMM bench</h1>
+<p class="sub">Open this in the browser you actually run sandpie in. It answers the one question the whole engine project rests on: does <em>this</em> device expose the fast subgroup / subgroup-matrix path?</p>
+
+<div>
+  <button id="run">Run all</button>
+  <button id="runCaps">Capabilities only</button>
+  <span id="status" class="hi"></span>
+</div>
+
+<h2 style="font-size:0.95rem; color:#8b949e;">Device capabilities</h2>
+<div id="flags"></div>
+<pre id="caps">—</pre>
+
+<h2 style="font-size:0.95rem; color:#8b949e;">GEMM correctness</h2>
+<pre id="self">—</pre>
+
+<h2 style="font-size:0.95rem; color:#8b949e;">GEMM throughput (portable tiled f32 — baseline, no subgroup ops yet)</h2>
+<pre id="bench">—</pre>
+
+<!-- Load the actual engine module from the repo so we test the real code. -->
+<script src="../modules/webgpu-engine.js"></script>
+<script>
+  // Verbose engine logs in the console for this harness.
+  try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
+  const E = window.SandpieWebGPU;
+  const $ = id => document.getElementById(id);
+  const set = (id, t, cls) => { const el = $(id); el.textContent = t; if (cls) el.className = cls; };
+
+  function renderFlags(c) {
+    const f = (label, on) => `<span class="flag ${on ? 'yes' : 'no'}">${on ? '✓' : '✗'} ${label}</span>`;
+    $('flags').innerHTML =
+      f('subgroups', c.hasSubgroups) +
+      f('shader-f16', c.hasF16) +
+      f('subgroup-matrix (fast GEMM)', c.hasSubgroupMatrix) +
+      f('timestamp-query', c.hasTimestamp);
+  }
+
+  async function caps() {
+    set('status', 'initialising GPU…', 'hi');
+    const c = await E.init();
+    renderFlags(c);
+    set('caps', JSON.stringify({
+      adapter: c.adapter,
+      enabledFeatures: c.enabled,
+      allAdapterFeatures: c.features,
+      keyLimits: {
+        maxStorageBufferBindingSize: c.limits.maxStorageBufferBindingSize,
+        maxBufferSize: c.limits.maxBufferSize,
+        maxComputeInvocationsPerWorkgroup: c.limits.maxComputeInvocationsPerWorkgroup,
+        maxComputeWorkgroupStorageSize: c.limits.maxComputeWorkgroupStorageSize,
+      },
+    }, null, 2));
+    set('status', '', '');
+    return c;
+  }
+
+  async function runAll() {
+    $('run').disabled = $('runCaps').disabled = true;
+    try {
+      if (!('gpu' in navigator)) { set('caps', 'WebGPU NOT available in this browser (navigator.gpu missing).', 'bad'); return; }
+      await caps();
+
+      set('status', 'GEMM correctness…', 'hi');
+      const st = await E.selfTest();
+      set('self', `max abs error ${st.maxErr.toExponential(2)} → ${st.ok ? 'PASS' : 'FAIL'}`, st.ok ? 'ok' : 'bad');
+
+      set('status', 'benchmarking…', 'hi');
+      const rows = await E.bench([256, 512, 1024, 2048]);
+      let html = '<table><tr><th>size (N³)</th><th>ms / GEMM</th><th>GFLOP/s</th></tr>';
+      for (const r of rows) html += `<tr><td>${r.size}</td><td>${r.ms}</td><td>${r.gflops}</td></tr>`;
+      html += '</table>';
+      $('bench').innerHTML = html;
+      set('status', 'done', 'ok');
+    } catch (e) {
+      set('status', 'error: ' + (e && e.message || e), 'bad');
+      console.error(e);
+    } finally {
+      $('run').disabled = $('runCaps').disabled = false;
+    }
+  }
+
+  $('run').addEventListener('click', runAll);
+  $('runCaps').addEventListener('click', async () => {
+    $('run').disabled = $('runCaps').disabled = true;
+    try { if (!('gpu' in navigator)) { set('caps', 'WebGPU NOT available (navigator.gpu missing).', 'bad'); } else { await caps(); } }
+    catch (e) { set('status', 'error: ' + (e && e.message || e), 'bad'); }
+    finally { $('run').disabled = $('runCaps').disabled = false; }
+  });
+</script>
+</body>
+</html>
