@@ -178,6 +178,7 @@ const SandpieWebGPU = (function () {
   // 2c. Compute pipeline cache
   // ============================================================
   const _pipelineCache = new Map();   // cacheKey -> GPUComputePipeline
+  const _pipeLabels = new WeakMap();  // pipeline -> cacheKey (for the profiler)
   function getPipeline(cacheKey, wgsl, entryPoint) {
     let p = _pipelineCache.get(cacheKey);
     if (p) return p;
@@ -188,7 +189,38 @@ const SandpieWebGPU = (function () {
       label: cacheKey,
     });
     _pipelineCache.set(cacheKey, p);
+    _pipeLabels.set(p, cacheKey);
     return p;
+  }
+
+  // ---- GPU timestamp profiler --------------------------------------------------
+  // beginProfile() → each subsequent dispatch() writes begin/end GPU timestamps
+  // around its compute pass into a query set, tagged by the pipeline's label.
+  // endProfile() resolves them and returns [{label, us}] per dispatch — the exact
+  // per-stage GPU time. Requires the 'timestamp-query' feature.
+  let _prof = null;
+  function profiling() { return !!_prof; }
+  function beginProfile(capacity) {
+    if (!_caps || !_caps.hasTimestamp) throw new Error('timestamp-query not available');
+    const cap = capacity || 512;
+    _prof = { qs: device().createQuerySet({ type: 'timestamp', count: cap * 2 }), cap, n: 0, labels: [] };
+  }
+  async function endProfile() {
+    const p = _prof; _prof = null;
+    if (!p || p.n === 0) { if (p) p.qs.destroy(); return []; }
+    const bytes = p.n * 2 * 8;   // 2 timestamps/dispatch, u64 each
+    const resolve = createBuffer(bytes, GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC, 'qresolve');
+    const read = createBuffer(bytes, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ, 'qread');
+    const enc = device().createCommandEncoder();
+    enc.resolveQuerySet(p.qs, 0, p.n * 2, resolve, 0);
+    enc.copyBufferToBuffer(resolve, 0, read, 0, bytes);
+    device().queue.submit([enc.finish()]);
+    await read.mapAsync(GPUMapMode.READ);
+    const ts = new BigInt64Array(read.getMappedRange().slice(0));
+    const out = [];
+    for (let i = 0; i < p.n; i++) out.push({ label: p.labels[i], us: Number(ts[i * 2 + 1] - ts[i * 2]) / 1000 });
+    read.unmap(); read.destroy(); resolve.destroy(); p.qs.destroy();
+    return out;
   }
 
   // Dispatch a single compute pass over an ordered list of storage buffers bound
@@ -198,7 +230,14 @@ const SandpieWebGPU = (function () {
     const entries = buffers.map((b, i) => ({ binding: i, resource: { buffer: b } }));
     const bindGroup = device().createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
     const enc = device().createCommandEncoder();
-    const pass = enc.beginComputePass();
+    // When profiling, time this pass with begin/end GPU timestamps.
+    let passDesc;
+    if (_prof && _prof.n < _prof.cap) {
+      const qi = _prof.n++;
+      _prof.labels.push(_pipeLabels.get(pipeline) || 'op');
+      passDesc = { timestampWrites: { querySet: _prof.qs, beginningOfPassWriteIndex: qi * 2, endOfPassWriteIndex: qi * 2 + 1 } };
+    }
+    const pass = enc.beginComputePass(passDesc);
     pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(workgroups[0] || 1, workgroups[1] || 1, workgroups[2] || 1);
@@ -344,7 +383,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   return {
     // engine core
     init, device, caps,
-    renderWGSL, getPipeline, dispatch,
+    renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling,
     createBuffer, uploadF32, readF32, gemm,
     // measurement
     selfTest, bench,
