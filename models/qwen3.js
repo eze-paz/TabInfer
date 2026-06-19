@@ -33,11 +33,19 @@ const SandpieQwen3 = (function () {
   const U = GPUBufferUsage;
   const ST = () => (U.STORAGE | U.COPY_DST | U.COPY_SRC);
 
-  // Small uniform buffer from a Uint32Array/Float32Array (padded to 16 bytes).
+  // Pooled uniform buffers. Each uniform() call in a forward gets a STABLE buffer
+  // (indexed by call order, reset per forward via uniformReset()) whose contents
+  // are rewritten each token — so the engine's bind-group cache keeps hitting
+  // instead of rebuilding ~250 bind groups/token. Pool buffers are a fixed 32B
+  // (covers every kernel's uniform). Outside a forward (self-tests) the index just
+  // keeps growing — still correct, just allocates a few extra pool slots once.
+  let _uPool = [], _uIdx = 0;
+  function uniformReset() { _uIdx = 0; }
   function uniform(arr) {
-    const bytes = Math.max(16, Math.ceil(arr.byteLength / 16) * 16);
-    const buf = E.createBuffer(bytes, U.UNIFORM | U.COPY_DST, 'u');
-    E.device().queue.writeBuffer(buf, 0, arr.buffer, arr.byteOffset, arr.byteLength);
+    let buf = _uPool[_uIdx];
+    if (!buf) { buf = E.createBuffer(32, U.UNIFORM | U.COPY_DST, 'u' + _uIdx); _uPool[_uIdx] = buf; }
+    E.device().queue.writeBuffer(buf, 0, arr.buffer, arr.byteOffset || 0, arr.byteLength);
+    _uIdx++;
     return buf;
   }
 
@@ -69,11 +77,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }`;
   function rmsnorm(xBuf, wBuf, yBuf, T, H, eps) {
     const pipe = E.getPipeline('q3.rmsnorm', RMSNORM_WGSL);
-    const p = E.createBuffer(16, U.UNIFORM | U.COPY_DST, 'u');
-    // pack T,H (u32) + eps (f32) into the 16-byte uniform
-    const u = new ArrayBuffer(16); const du = new DataView(u);
+    // pack T,H (u32) + eps (f32); pooled uniform (stable buffer for bind-group cache)
+    const u = new Uint32Array(4); const du = new DataView(u.buffer);
     du.setUint32(0, T, true); du.setUint32(4, H, true); du.setFloat32(8, eps, true);
-    E.device().queue.writeBuffer(p, 0, u);
+    const p = uniform(u);
     return E.dispatch(pipe, [xBuf, wBuf, yBuf, p], [T, 1, 1]);
   }
 
@@ -445,10 +452,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     // buffer is WebGPU UB (miscompiles on Intel: produces wrong values silently).
     if (inBuf === outBuf) throw new Error('ropeQK: in-place not allowed (use a separate output buffer)');
     const pipe = E.getPipeline('q3.ropeqk', ROPEQK_WGSL);
-    const u = new ArrayBuffer(32); const dv = new DataView(u);
+    const u = new Uint32Array(8); const dv = new DataView(u.buffer);
     dv.setUint32(0,T,true); dv.setUint32(4,nH,true); dv.setUint32(8,hd,true);
     dv.setUint32(12,posBase,true); dv.setFloat32(16,theta,true); dv.setFloat32(20,eps,true);
-    const p = E.createBuffer(32, U.UNIFORM|U.COPY_DST, 'u'); E.device().queue.writeBuffer(p,0,u);
+    const p = uniform(u);   // pooled (stable buffer for bind-group cache)
     return E.dispatch(pipe, [inBuf, normWBuf, outBuf, p], [T*nH, 1, 1]);
   }
 
@@ -1114,6 +1121,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const Wq = (n) => _weights[n];         // int4 record (projections/lm_head)
     const s = _scr;
     const ids = setIds(idsArray);
+    uniformReset();   // pooled uniforms get stable buffers per call-site → bind-group cache hits
     E.beginBatch();   // record the whole forward into ONE command buffer (1 submit vs ~364)
     await embedGather(ids, W('model.embed_tokens.weight'), s.x, T, H);
     for (let l = 0; l < C.numLayers; l++) {

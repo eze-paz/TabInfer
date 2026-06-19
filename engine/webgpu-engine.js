@@ -102,7 +102,7 @@ const SandpieWebGPU = (function () {
       // weak iGPUs. Surface it loudly and drop our handles so the next call
       // re-inits rather than using a dead device.
       console.error('[webgpu-engine] DEVICE LOST:', info && info.reason, info && info.message);
-      _device = null; _caps = null; _pipelineCache.clear();
+      _device = null; _caps = null; _pipelineCache.clear(); _bgCache.clear();
     });
 
     const info = (_adapter.info) || (await (_adapter.requestAdapterInfo ? _adapter.requestAdapterInfo() : Promise.resolve({})));
@@ -131,8 +131,11 @@ const SandpieWebGPU = (function () {
   // ============================================================
   // Minimal GPU buffer helpers. Real tensor lifetime management (pooling, the
   // KV cache) comes with the model graph; for the core + bench these suffice.
+  const _bufIds = new WeakMap(); let _bufCtr = 0;   // stable id per buffer (for the bind-group cache)
   function createBuffer(byteLength, usage, label) {
-    return device().createBuffer({ size: Math.max(4, Math.ceil(byteLength / 4) * 4), usage, label });
+    const b = device().createBuffer({ size: Math.max(4, Math.ceil(byteLength / 4) * 4), usage, label });
+    _bufIds.set(b, ++_bufCtr);
+    return b;
   }
   function uploadF32(arr, usage, label) {
     const u = usage || (GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
@@ -179,6 +182,7 @@ const SandpieWebGPU = (function () {
   // ============================================================
   const _pipelineCache = new Map();   // cacheKey -> GPUComputePipeline
   const _pipeLabels = new WeakMap();  // pipeline -> cacheKey (for the profiler)
+  const _bgCache = new Map();         // (pipeline,buffers) key -> GPUBindGroup
   function getPipeline(cacheKey, wgsl, entryPoint) {
     let p = _pipelineCache.get(cacheKey);
     if (p) return p;
@@ -227,8 +231,19 @@ const SandpieWebGPU = (function () {
   // at @group(0) @binding(0..n) in declaration order. Returns when submitted (not
   // when finished) unless `await: true`.
   function dispatch(pipeline, buffers, workgroups, opts) {
-    const entries = buffers.map((b, i) => ({ binding: i, resource: { buffer: b } }));
-    const bindGroup = device().createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+    // Cache bind groups by (pipeline, buffer identities). The forward issues the
+    // SAME ~250 (pipeline, buffer-set) combos every token (persistent scratch /
+    // weights / pooled uniforms), so this turns ~250 createBindGroup/token into
+    // ~0 after the first token — the bulk of the measured CPU-encode cost.
+    let key = _pipeLabels.get(pipeline) || '';
+    for (let i = 0; i < buffers.length; i++) key += '|' + (_bufIds.get(buffers[i]) || 0);
+    let bindGroup = _bgCache.get(key);
+    if (!bindGroup) {
+      const entries = buffers.map((b, i) => ({ binding: i, resource: { buffer: b } }));
+      bindGroup = device().createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
+      if (_bgCache.size > 4096) _bgCache.clear();   // bound it (transient test buffers etc.)
+      _bgCache.set(key, bindGroup);
+    }
     // Batch mode: record into the shared encoder (one submit per batch) — kills
     // the per-dispatch submit bubbles. Each dispatch still gets its own compute
     // pass, so pass-boundary barriers preserve read-after-write ordering.
