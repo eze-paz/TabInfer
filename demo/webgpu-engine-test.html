@@ -32,6 +32,18 @@
   <span id="status" class="hi"></span>
 </div>
 
+<h2 style="font-size:0.95rem; color:#8b949e;">Chat (Qwen3-0.6B, int4, runs entirely in this tab)</h2>
+<div>
+  <textarea id="prompt" rows="2" style="width:100%; background:#161b22; color:#c9d1d9; border:1px solid #30363d; border-radius:8px; padding:0.6rem; font:inherit;">What is the capital of France?</textarea>
+  <div style="margin:0.4rem 0;">
+    <button id="gen">Load model &amp; generate</button>
+    <label style="color:#8b949e; font-size:0.85rem;">max tokens <input id="maxtok" type="number" value="80" style="width:4rem; background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;"></label>
+    <span id="genstat" class="hi"></span>
+    <span id="tps" class="ok" style="margin-left:0.6rem;"></span>
+  </div>
+  <pre id="out" style="min-height:3rem;">—</pre>
+</div>
+
 <h2 style="font-size:0.95rem; color:#8b949e;">Qwen3 kernel correctness (vs CPU reference)</h2>
 <pre id="kernels">— click "Run Qwen3 kernel tests"</pre>
 
@@ -122,6 +134,34 @@
       set('kernels', 'ERROR: ' + (e && e.message || e), 'bad'); console.error(e);
       set('status', 'kernel test error', 'bad');
     } finally { $('runKernels').disabled = false; }
+  });
+
+  $('gen').addEventListener('click', async () => {
+    const Q = window.SandpieQwen3;
+    $('gen').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
+    try {
+      if (!Q.isLoaded()) {
+        $('genstat').textContent = 'loading model (first run downloads ~1.5GB, cached after)…';
+        await Q.loadModel({ onProgress: (p) => {
+          if (p.phase === 'download') $('genstat').textContent = `downloading ${p.pct}%`;
+          else if (p.phase === 'parse') $('genstat').textContent = `quantizing ${p.pct}%`;
+        }});
+      }
+      $('genstat').textContent = 'generating…';
+      const prompt = $('prompt').value;
+      const maxTokens = +$('maxtok').value || 80;
+      let n = 0, t0 = 0;
+      const out = await Q.generate(prompt, { maxTokens, onToken: (piece) => {
+        if (n === 0) t0 = performance.now();   // start timing at first token (exclude prefill)
+        n++;
+        $('out').textContent += piece;
+      }});
+      const secs = (performance.now() - t0) / 1000;
+      $('tps').textContent = n > 1 ? `${(n / secs).toFixed(1)} tok/s (${n} tokens)` : '';
+      $('genstat').textContent = 'done';
+    } catch (e) {
+      $('genstat').textContent = 'error: ' + (e && e.message || e); console.error(e);
+    } finally { $('gen').disabled = false; }
   });
 
   $('run').addEventListener('click', runAll);
