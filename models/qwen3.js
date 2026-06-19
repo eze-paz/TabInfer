@@ -1093,9 +1093,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _scrT = T;
   }
   function copyRange(src, dst, dstFloatOffset, floatCount) {
-    const enc = E.device().createCommandEncoder();
-    enc.copyBufferToBuffer(src, 0, dst, dstFloatOffset * 4, floatCount * 4);
-    E.device().queue.submit([enc.finish()]);
+    E.copyBuffer(src, 0, dst, dstFloatOffset * 4, floatCount * 4);   // batch-aware
   }
   function setIds(arr) {
     if (!_idsBuf || _idsCap < arr.length) { if (_idsBuf) _idsBuf.destroy(); _idsBuf = E.createBuffer(Math.max(16, arr.length * 4), U.STORAGE | U.COPY_DST, 'ids'); _idsCap = arr.length; }
@@ -1114,6 +1112,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const Wq = (n) => _weights[n];         // int4 record (projections/lm_head)
     const s = _scr;
     const ids = setIds(idsArray);
+    E.beginBatch();   // record the whole forward into ONE command buffer (1 submit vs ~364)
     await embedGather(ids, W('model.embed_tokens.weight'), s.x, T, H);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
@@ -1140,12 +1139,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
     // last token row → its own [H] buffer, then lm_head
-    { const enc = E.device().createCommandEncoder(); enc.copyBufferToBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4); E.device().queue.submit([enc.finish()]); }
+    E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
     await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
     // GPU-side greedy argmax → read back only the 4-byte token id (not 600KB logits).
     await argmaxKernel(s.logits, s.tok, C.vocab);
-    const _t1 = _PERF ? performance.now() : 0;   // all commands issued (no explicit GPU wait yet)
-    if (_PERF) await E.device().queue.onSubmittedWorkDone();  // GPU drain (excludes map)
+    const _t1 = _PERF ? performance.now() : 0;   // all commands recorded
+    await E.endBatch();                           // single submit + GPU drain
     const _t2 = _PERF ? performance.now() : 0;
     const tok = await readU32(s.tok);            // copy + mapAsync round-trip
     if (_PERF) _perfData = { encode_ms: +(_t1 - _t0).toFixed(2), gpu_drain_ms: +(_t2 - _t1).toFixed(2), map_ms: +(performance.now() - _t2).toFixed(2) };

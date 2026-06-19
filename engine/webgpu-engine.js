@@ -229,7 +229,10 @@ const SandpieWebGPU = (function () {
   function dispatch(pipeline, buffers, workgroups, opts) {
     const entries = buffers.map((b, i) => ({ binding: i, resource: { buffer: b } }));
     const bindGroup = device().createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
-    const enc = device().createCommandEncoder();
+    // Batch mode: record into the shared encoder (one submit per batch) — kills
+    // the per-dispatch submit bubbles. Each dispatch still gets its own compute
+    // pass, so pass-boundary barriers preserve read-after-write ordering.
+    const enc = _batchEncoder || device().createCommandEncoder();
     // When profiling, time this pass with begin/end GPU timestamps.
     let passDesc;
     if (_prof && _prof.n < _prof.cap) {
@@ -242,8 +245,29 @@ const SandpieWebGPU = (function () {
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(workgroups[0] || 1, workgroups[1] || 1, workgroups[2] || 1);
     pass.end();
+    if (_batchEncoder) return Promise.resolve();        // submitted later by endBatch()
     device().queue.submit([enc.finish()]);
     return (opts && opts.await) ? device().queue.onSubmittedWorkDone() : Promise.resolve();
+  }
+
+  // ---- Batch: record a whole forward into ONE command buffer, submit once -----
+  // beginBatch() → subsequent dispatch()/copyBuffer() append to one encoder;
+  // endBatch() submits it and returns the completion promise. ~364 submits/token
+  // → 1, eliminating inter-submit GPU idle bubbles (the measured decode wall).
+  let _batchEncoder = null;
+  function beginBatch() { _batchEncoder = device().createCommandEncoder({ label: 'forward' }); }
+  function endBatch() {
+    if (!_batchEncoder) return Promise.resolve();
+    const enc = _batchEncoder; _batchEncoder = null;
+    device().queue.submit([enc.finish()]);
+    return device().queue.onSubmittedWorkDone();
+  }
+  // Buffer copy that respects batch mode.
+  function copyBuffer(src, srcByteOff, dst, dstByteOff, bytes) {
+    if (_batchEncoder) { _batchEncoder.copyBufferToBuffer(src, srcByteOff, dst, dstByteOff, bytes); return; }
+    const enc = device().createCommandEncoder();
+    enc.copyBufferToBuffer(src, srcByteOff, dst, dstByteOff, bytes);
+    device().queue.submit([enc.finish()]);
   }
 
   // ============================================================
@@ -383,7 +407,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   return {
     // engine core
     init, device, caps,
-    renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling,
+    renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling, beginBatch, endBatch, copyBuffer,
     createBuffer, uploadF32, readF32, gemm,
     // measurement
     selfTest, bench,
