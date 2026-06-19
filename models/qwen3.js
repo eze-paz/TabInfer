@@ -73,7 +73,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const u = new ArrayBuffer(16); const du = new DataView(u);
     du.setUint32(0, T, true); du.setUint32(4, H, true); du.setFloat32(8, eps, true);
     E.device().queue.writeBuffer(p, 0, u);
-    return E.dispatch(pipe, [xBuf, wBuf, yBuf, p], [T, 1, 1], { await: true });
+    return E.dispatch(pipe, [xBuf, wBuf, yBuf, p], [T, 1, 1]);
   }
 
   // ============================================================
@@ -110,7 +110,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
   function linearT(xBuf, wBuf, yBuf, T, N, K) {
     const pipe = E.getPipeline('q3.linearT', LINEAR_WGSL);
     const d = uniform(new Uint32Array([T, N, K, 0]));
-    return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [Math.ceil(N/TILE), Math.ceil(T/TILE), 1], { await: true });
+    return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [Math.ceil(N/TILE), Math.ceil(T/TILE), 1]);
   }
 
   // ============================================================
@@ -131,7 +131,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   function embedGather(idsBuf, embedBuf, yBuf, T, H) {
     const pipe = E.getPipeline('q3.embed', EMBED_WGSL);
     const p = uniform(new Uint32Array([T, H, 0, 0]));
-    return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1], { await: true });
+    return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1]);
   }
 
   // ============================================================
@@ -185,7 +185,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     dv.setUint32(0,T,true); dv.setUint32(4,nH,true); dv.setUint32(8,hd,true);
     dv.setUint32(12,posBase,true); dv.setFloat32(16,theta,true); dv.setFloat32(20,eps,true);
     const p = E.createBuffer(32, U.UNIFORM|U.COPY_DST, 'u'); E.device().queue.writeBuffer(p,0,u);
-    return E.dispatch(pipe, [inBuf, normWBuf, outBuf, p], [T*nH, 1, 1], { await: true });
+    return E.dispatch(pipe, [inBuf, normWBuf, outBuf, p], [T*nH, 1, 1]);
   }
 
   // ============================================================
@@ -230,7 +230,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
     const pipe = E.getPipeline('q3.attn', ATTN_WGSL);
     const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
-    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [Math.ceil((T*nHq)/64), 1, 1], { await: true });
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [Math.ceil((T*nHq)/64), 1, 1]);
   }
 
   // ============================================================
@@ -250,7 +250,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   function swiglu(gateBuf, upBuf, yBuf, n) {
     const pipe = E.getPipeline('q3.swiglu', SWIGLU_WGSL);
     const p = uniform(new Uint32Array([n, 0, 0, 0]));
-    return E.dispatch(pipe, [gateBuf, upBuf, yBuf, p], [Math.ceil(n/64), 1, 1], { await: true });
+    return E.dispatch(pipe, [gateBuf, upBuf, yBuf, p], [Math.ceil(n/64), 1, 1]);
   }
 
   // ============================================================
@@ -266,7 +266,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
   function addInPlace(aBuf, bBuf, n) {
     const pipe = E.getPipeline('q3.add', ADD_WGSL);
     const p = uniform(new Uint32Array([n, 0, 0, 0]));
-    return E.dispatch(pipe, [aBuf, bBuf, p], [Math.ceil(n/64), 1, 1], { await: true });
+    return E.dispatch(pipe, [aBuf, bBuf, p], [Math.ceil(n/64), 1, 1]);
   }
 
   // ============================================================
