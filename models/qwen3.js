@@ -297,6 +297,43 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return E.dispatch(pipe, [gateBuf, upBuf, yBuf, p], [Math.ceil(n/64), 1, 1]);
   }
 
+  // ----- FUSED gate+up+SwiGLU for decode (T==1): swi[I] = silu(gate·x)*(up·x) -----
+  // Collapses 3 decode dispatches (gemv gate, gemv up, swiglu) into 1. The GPU is
+  // dispatch-overhead-bound at decode (measured ~0.29ms/dispatch launch), so cutting
+  // the count is the lever. One workgroup per output row i; threads stride H computing
+  // BOTH dot products, then shared-mem reduce both and apply silu*mul.
+  const GUS_WG = 64;
+  const GATEUP_WGSL = `
+enable f16;
+struct D { I:u32, H:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       x     : array<f32>;
+@group(0) @binding(1) var<storage, read>       gateW : array<f16>;
+@group(0) @binding(2) var<storage, read>       upW   : array<f16>;
+@group(0) @binding(3) var<storage, read_write> swi   : array<f32>;
+@group(0) @binding(4) var<uniform>             d     : D;
+var<workgroup> rg : array<f32, ${GUS_WG}>;
+var<workgroup> ru : array<f32, ${GUS_WG}>;
+@compute @workgroup_size(${GUS_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>) {
+  let i = wg.x + wg.y * nwg.x;
+  if (i >= d.I) { return; }
+  let H = d.H; let wbase = i*H;
+  var g : f32 = 0.0; var u : f32 = 0.0;
+  var k = lid.x;
+  loop { if (k >= H) { break; } let xv = x[k]; g = g + xv*f32(gateW[wbase+k]); u = u + xv*f32(upW[wbase+k]); k = k + ${GUS_WG}u; }
+  rg[lid.x] = g; ru[lid.x] = u; workgroupBarrier();
+  var s = ${GUS_WG}u/2u;
+  loop { if (s==0u) { break; } if (lid.x<s) { rg[lid.x]=rg[lid.x]+rg[lid.x+s]; ru[lid.x]=ru[lid.x]+ru[lid.x+s]; } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u) { let gg=rg[0]; let silu=gg/(1.0+exp(-gg)); swi[i]=silu*ru[0]; }
+}`;
+  function gateUpSilu(xBuf, gateWBuf, upWBuf, swiBuf, I, H) {
+    const pipe = E.getPipeline('q3.gateup', GATEUP_WGSL);
+    const d = uniform(new Uint32Array([I, H, 0, 0]));
+    const gx = Math.min(I, 65535), gy = Math.ceil(I / gx);
+    return E.dispatch(pipe, [xBuf, gateWBuf, upWBuf, swiBuf, d], [gx, gy, 1]);
+  }
+
   // ============================================================
   // Kernel 7 — Residual add (in place).  a[n] += b[n]
   // ============================================================
@@ -477,6 +514,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*WR[n*K+k];y[n]=a;}
       check('gemv', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
+    }
+    // --- gateUpSilu (fused gate+up+swiglu, T=1) vs CPU ---
+    {
+      const I=160,H=320;
+      const x=new Float32Array(H),gW=new Float32Array(I*H),uW=new Float32Array(I*H);
+      for(let i=0;i<H;i++)x[i]=Math.sin(i*0.17);
+      for(let i=0;i<I*H;i++){gW[i]=Math.cos(i*0.011);uW[i]=Math.sin(i*0.009);}
+      const gWR=roundF16(gW), uWR=roundF16(uW);
+      const xb=f32buf(x),gb=f16buf(gW),ub=f16buf(uW),yb=E.createBuffer(I*4,ST(),'y');
+      await gateUpSilu(xb,gb,ub,yb,I,H);
+      const got=await E.readF32(yb,I);
+      const y=new Float32Array(I);
+      for(let i=0;i<I;i++){let g=0,u=0;for(let k=0;k<H;k++){g+=x[k]*gWR[i*H+k];u+=x[k]*uWR[i*H+k];}const silu=g/(1+Math.exp(-g));y[i]=silu*u;}
+      check('gateUpSilu', maxAbs(got,y));
+      [xb,gb,ub,yb].forEach(b=>b.destroy());
     }
     // --- argmax ---
     {
@@ -784,9 +836,14 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await linear(s.attn, W(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
       await addInPlace(s.x, s.oproj, T * H);
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linear(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
-      await linear(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
-      await swiglu(s.gate, s.up, s.swi, T * I);
+      if (T === 1) {
+        // Decode: one fused dispatch instead of gate-gemv + up-gemv + swiglu.
+        await gateUpSilu(s.normed, W(p + 'mlp.gate_proj.weight'), W(p + 'mlp.up_proj.weight'), s.swi, I, H);
+      } else {
+        await linear(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+        await linear(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+        await swiglu(s.gate, s.up, s.swi, T * I);
+      }
       await linear(s.swi, W(p + 'mlp.down_proj.weight'), s.down, T, H, I);
       await addInPlace(s.x, s.down, T * H);
     }
@@ -833,7 +890,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   return {
     CONFIG,
-    rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
+    rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, gateUpSilu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
     _dbg: {
