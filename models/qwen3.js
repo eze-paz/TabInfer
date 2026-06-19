@@ -177,6 +177,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   out[base+j] = xj*c + rot*s;
 }`;
   function ropeQK(inBuf, normWBuf, outBuf, T, nH, hd, posBase, theta, eps) {
+    // outBuf MUST differ from inBuf — aliasing read + read_write bindings to one
+    // buffer is WebGPU UB (miscompiles on Intel: produces wrong values silently).
+    if (inBuf === outBuf) throw new Error('ropeQK: in-place not allowed (use a separate output buffer)');
     const pipe = E.getPipeline('q3.ropeqk', ROPEQK_WGSL);
     const u = new ArrayBuffer(32); const dv = new DataView(u);
     dv.setUint32(0,T,true); dv.setUint32(4,nH,true); dv.setUint32(8,hd,true);
@@ -382,10 +385,297 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
     return out;
   }
 
+  // ============================================================
+  // Tokenizer — byte-level BPE (Qwen2Tokenizer), faithful to tokenizer.json:
+  // pretokenizer regex (contractions expanded since JS lacks (?i:) groups) →
+  // byte-level encode → rank-ordered BPE merges → vocab ids. Specials spliced
+  // directly. Loaded from tokenizer.json (vocab + merges + added_tokens).
+  // ============================================================
+  const SPECIAL = { endoftext: 151643, im_start: 151644, im_end: 151645, think: 151667, think_end: 151668 };
+  // JS port of the Qwen pre_tokenizer Split regex ((?i:'s|…) expanded to case classes).
+  const PRETOK_RE = /(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
+
+  // GPT-2 byte↔unicode map (printable bytes map to themselves; the rest to a
+  // private high range) so every byte becomes a visible char for BPE.
+  function buildByteMaps() {
+    const bs = [];
+    for (let i = 33; i <= 126; i++) bs.push(i);
+    for (let i = 161; i <= 172; i++) bs.push(i);
+    for (let i = 174; i <= 255; i++) bs.push(i);
+    const cs = bs.slice(); let n = 0;
+    for (let b = 0; b < 256; b++) if (!bs.includes(b)) { bs.push(b); cs.push(256 + n); n++; }
+    const byteEnc = new Array(256), byteDec = {};
+    for (let i = 0; i < bs.length; i++) { const ch = String.fromCharCode(cs[i]); byteEnc[bs[i]] = ch; byteDec[ch] = bs[i]; }
+    return { byteEnc, byteDec };
+  }
+
+  const TOK = (function () {
+    let vocab = null, idToTok = null, bpeRanks = null, byteEnc = null, byteDec = null, ready = false;
+    const enc = new TextEncoder(), dec = new TextDecoder();
+
+    async function load(root) {
+      if (ready) return;
+      const url = (root || 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/') + 'tokenizer.json';
+      const j = await (await fetch(url)).json();
+      vocab = j.model.vocab;                       // token string -> id
+      idToTok = {}; for (const k in vocab) idToTok[vocab[k]] = k;
+      for (const a of (j.added_tokens || [])) { vocab[a.content] = a.id; idToTok[a.id] = a.content; }
+      bpeRanks = new Map();
+      const merges = j.model.merges || [];
+      for (let i = 0; i < merges.length; i++) {
+        const m = merges[i];
+        const pair = Array.isArray(m) ? (m[0] + ' ' + m[1]) : m.replace(' ', ' ');
+        bpeRanks.set(pair, i);
+      }
+      ({ byteEnc, byteDec } = buildByteMaps());
+      ready = true;
+    }
+
+    // BPE-merge one byte-encoded piece (a string of byte-chars) into subword tokens.
+    function bpe(piece) {
+      let word = Array.from(piece);
+      if (word.length < 2) return word;
+      for (;;) {
+        let best = null, bestRank = Infinity, bestI = -1;
+        for (let i = 0; i < word.length - 1; i++) {
+          const r = bpeRanks.get(word[i] + ' ' + word[i + 1]);
+          if (r !== undefined && r < bestRank) { bestRank = r; best = i; bestI = i; }
+        }
+        if (best === null) break;
+        const merged = word[bestI] + word[bestI + 1];
+        word = word.slice(0, bestI).concat(merged, word.slice(bestI + 2));
+      }
+      return word;
+    }
+
+    // Encode raw text (no special-token handling) → id[].
+    function encodeText(text) {
+      const ids = [];
+      const matches = text.match(PRETOK_RE) || [];
+      for (const piece of matches) {
+        const bytes = enc.encode(piece);
+        let s = ''; for (const b of bytes) s += byteEnc[b];
+        for (const sub of bpe(s)) {
+          const id = vocab[sub];
+          if (id !== undefined) ids.push(id);
+          // (no byte_fallback in this tokenizer; unknown subwords shouldn't occur)
+        }
+      }
+      return ids;
+    }
+
+    // Build the Qwen3 ChatML prompt with special ids spliced in.
+    function encodeChat(messages, { addGenerationPrompt = true } = {}) {
+      const ids = [];
+      const seg = (role, content) => {
+        ids.push(SPECIAL.im_start);
+        ids.push(...encodeText(role + '\n' + content));
+        ids.push(SPECIAL.im_end);
+        ids.push(...encodeText('\n'));
+      };
+      for (const m of messages) seg(m.role, typeof m.content === 'string' ? m.content : '');
+      if (addGenerationPrompt) { ids.push(SPECIAL.im_start); ids.push(...encodeText('assistant\n')); }
+      return ids;
+    }
+
+    function decode(ids) {
+      let s = ''; for (const id of ids) { const t = idToTok[id]; if (t !== undefined) s += t; }
+      // reverse byte-level: each char -> its byte (skip chars not in byteDec, e.g. specials)
+      const bytes = [];
+      for (const ch of s) { const b = byteDec[ch]; if (b !== undefined) bytes.push(b); }
+      return dec.decode(new Uint8Array(bytes));
+    }
+
+    return { load, encodeText, encodeChat, decode, isReady: () => ready };
+  })();
+
+  // ============================================================
+  // Weight loader — safetensors (bf16) → per-tensor f32 GPU buffers.
+  // bf16→f32 is a lossless <<16. Cached in Cache Storage so reloads are instant.
+  // ============================================================
+  const MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/';
+  const CACHE_NAME = 'sandpie-webgpu-models';
+  let _weights = null;            // name -> { buf, shape, numel }
+  let _loaded = false;
+
+  function bf16ToF32(u16) {
+    const n = u16.length, out = new Uint32Array(n);
+    for (let i = 0; i < n; i++) out[i] = u16[i] << 16;
+    return new Float32Array(out.buffer);
+  }
+  function f16ToF32(u16) {
+    const n = u16.length, out = new Float32Array(n);
+    for (let i = 0; i < n; i++) {
+      const h = u16[i], s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x03ff;
+      if (e === 0) out[i] = (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024);
+      else if (e === 31) out[i] = f ? NaN : (s ? -Infinity : Infinity);
+      else out[i] = (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024);
+    }
+    return out;
+  }
+
+  async function fetchModelBytes(onProgress) {
+    const url = MODEL_ROOT + 'model.safetensors';
+    let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
+    if (cache) { const hit = await cache.match(url); if (hit) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await hit.arrayBuffer(); } }
+    const resp = await fetch(url);
+    const total = +(resp.headers.get('content-length') || 0);
+    const reader = resp.body.getReader(); const chunks = []; let recv = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      chunks.push(value); recv += value.length;
+      if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
+    }
+    const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+    if (cache) { try { await cache.put(url, new Response(out, { headers: { 'content-length': String(recv) } })); } catch (_) {} }
+    return out.buffer;
+  }
+
+  async function loadModel({ onProgress } = {}) {
+    if (_loaded) return;
+    await E.init();
+    await TOK.load(MODEL_ROOT);
+    onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
+    const ab = await fetchModelBytes(onProgress);
+    onProgress && onProgress({ phase: 'parse', pct: 0 });
+    const headerLen = Number(new DataView(ab, 0, 8).getBigUint64(0, true));
+    const header = JSON.parse(dec_(new Uint8Array(ab, 8, headerLen)));
+    const dataStart = 8 + headerLen;
+    _weights = {};
+    const names = Object.keys(header).filter(n => n !== '__metadata__');
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i], info = header[name];
+      const [begin, end] = info.data_offsets;
+      const numel = info.shape.reduce((a, b) => a * b, 1);
+      const raw = new Uint8Array(ab, dataStart + begin, end - begin);
+      let f32;
+      if (info.dtype === 'BF16') f32 = bf16ToF32(new Uint16Array(raw.buffer, raw.byteOffset, numel));
+      else if (info.dtype === 'F16') f32 = f16ToF32(new Uint16Array(raw.buffer, raw.byteOffset, numel));
+      else if (info.dtype === 'F32') f32 = new Float32Array(raw.buffer, raw.byteOffset, numel);
+      else throw new Error('unsupported dtype ' + info.dtype + ' for ' + name);
+      const buf = E.createBuffer(numel * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
+      E.device().queue.writeBuffer(buf, 0, f32);
+      _weights[name] = { buf, shape: info.shape, numel };
+      if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
+    }
+    onProgress && onProgress({ phase: 'parse', pct: 100 });
+    _loaded = true;
+  }
+  const _td = new TextDecoder();
+  function dec_(u8) { return _td.decode(u8); }
+
+  // ============================================================
+  // Forward graph + KV cache + generate
+  // ============================================================
+  const MAX_SEQ = 2048;
+  let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
+  let _scr = null;    // scratch buffers, sized to _scrT rows
+  let _scrT = 0;
+  let _idsBuf = null, _idsCap = 0;
+
+  function scrBuf(n, label) { return E.createBuffer(n * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, label); }
+  function ensureKv() {
+    if (_kv) return;
+    const { numLayers, nKvHeads, headDim } = CONFIG;
+    const per = MAX_SEQ * nKvHeads * headDim;
+    _kv = [];
+    for (let l = 0; l < numLayers; l++) _kv.push({ k: scrBuf(per, 'k' + l), v: scrBuf(per, 'v' + l) });
+  }
+  function ensureScratch(T) {
+    if (_scr && _scrT >= T) return;
+    if (_scr) for (const b of Object.values(_scr)) b.destroy && b.destroy();
+    const { hidden: H, nHeads, nKvHeads, headDim, intermediate: I } = CONFIG;
+    _scr = {
+      x: scrBuf(T * H, 'x'), normed: scrBuf(T * H, 'normed'),
+      q: scrBuf(T * nHeads * headDim, 'q'), k: scrBuf(T * nKvHeads * headDim, 'k'), v: scrBuf(T * nKvHeads * headDim, 'v'),
+      qr: scrBuf(T * nHeads * headDim, 'qr'), kr: scrBuf(T * nKvHeads * headDim, 'kr'),
+      attn: scrBuf(T * nHeads * headDim, 'attn'), oproj: scrBuf(T * H, 'oproj'),
+      gate: scrBuf(T * I, 'gate'), up: scrBuf(T * I, 'up'), swi: scrBuf(T * I, 'swi'), down: scrBuf(T * H, 'down'),
+      last: scrBuf(H, 'last'), logits: scrBuf(CONFIG.vocab, 'logits'),
+    };
+    _scrT = T;
+  }
+  function copyRange(src, dst, dstFloatOffset, floatCount) {
+    const enc = E.device().createCommandEncoder();
+    enc.copyBufferToBuffer(src, 0, dst, dstFloatOffset * 4, floatCount * 4);
+    E.device().queue.submit([enc.finish()]);
+  }
+  function setIds(arr) {
+    if (!_idsBuf || _idsCap < arr.length) { if (_idsBuf) _idsBuf.destroy(); _idsBuf = E.createBuffer(Math.max(16, arr.length * 4), U.STORAGE | U.COPY_DST, 'ids'); _idsCap = arr.length; }
+    E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(arr));
+    return _idsBuf;
+  }
+
+  // Run the transformer over T tokens at absolute positions [posBase, posBase+T).
+  // Updates the KV cache; returns logits (Float32Array[vocab]) for the LAST token.
+  async function forward(idsArray, posBase) {
+    const C = CONFIG, H = C.hidden, nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim, I = C.intermediate;
+    const T = idsArray.length, S = posBase + T;
+    ensureKv(); ensureScratch(T);
+    const W = (n) => _weights[n].buf;
+    const s = _scr;
+    const ids = setIds(idsArray);
+    await embedGather(ids, W('model.embed_tokens.weight'), s.x, T, H);
+    for (let l = 0; l < C.numLayers; l++) {
+      const p = 'model.layers.' + l + '.';
+      await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
+      await linearT(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+      await linearT(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+      await linearT(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+      // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
+      // read and a read_write binding is undefined behavior in WebGPU (miscompiles
+      // on Intel). Write rope output to a separate buffer.
+      await ropeQK(s.q, W(p + 'self_attn.q_norm.weight'), s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
+      await ropeQK(s.k, W(p + 'self_attn.k_norm.weight'), s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
+      copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
+      copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
+      await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
+      await linearT(s.attn, W(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
+      await addInPlace(s.x, s.oproj, T * H);
+      await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
+      await linearT(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+      await linearT(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+      await swiglu(s.gate, s.up, s.swi, T * I);
+      await linearT(s.swi, W(p + 'mlp.down_proj.weight'), s.down, T, H, I);
+      await addInPlace(s.x, s.down, T * H);
+    }
+    await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
+    // last token row → its own [H] buffer, then lm_head
+    { const enc = E.device().createCommandEncoder(); enc.copyBufferToBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4); E.device().queue.submit([enc.finish()]); }
+    await linearT(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
+    return await E.readF32(s.logits, C.vocab);
+  }
+
+  function argmax(arr) { let mi = 0, mv = arr[0]; for (let i = 1; i < arr.length; i++) if (arr[i] > mv) { mv = arr[i]; mi = i; } return mi; }
+
+  // Greedy generate. onToken(text) streams decoded pieces.
+  async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
+    await loadModel({});
+    const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
+    let logits = await forward(ids, 0);
+    let pos = ids.length; const outIds = [];
+    for (let step = 0; step < maxTokens; step++) {
+      if (signal && signal.aborted) break;
+      const next = argmax(logits);
+      if (next === SPECIAL.im_end || next === SPECIAL.endoftext) break;
+      outIds.push(next);
+      if (onToken) { try { onToken(TOK.decode([next])); } catch (_) {} }
+      if (pos >= MAX_SEQ) break;
+      logits = await forward([next], pos); pos++;
+    }
+    return TOK.decode(outIds);
+  }
+
   return {
     CONFIG,
     rmsnorm, linearT, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
+    TOK, loadModel, forward, generate, isLoaded: () => _loaded,
+    _dbg: {
+      weight: async (name, n) => E.readF32(_weights[name].buf, n || _weights[name].numel),
+      weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
+      names: () => Object.keys(_weights || {}),
+    },
   };
 })();
 
