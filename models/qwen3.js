@@ -113,6 +113,45 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
     return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [Math.ceil(N/TILE), Math.ceil(T/TILE), 1]);
   }
 
+  // ----- Decode GEMV: y[N] = x[K] · W[N,K]ᵀ  (the T==1 fast path) -----
+  // Mirrors the reference engine's separate M==1 path. The tiled GEMM wastes
+  // ~94% of its threads at T=1 (16-row tile, 1 valid row); this gives every
+  // thread useful reduction work: one workgroup per output row n, WG threads
+  // stride K and reduce. 2D workgroup grid because N (151936 for lm_head)
+  // exceeds the 65535 per-dimension dispatch limit.
+  const GEMV_WG = 64;
+  const GEMV_WGSL = `
+struct D { N:u32, K:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       x : array<f32>;
+@group(0) @binding(1) var<storage, read>       W : array<f32>;
+@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+@group(0) @binding(3) var<uniform>             d : D;
+var<workgroup> red : array<f32, ${GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>) {
+  let n = wg.x + wg.y * nwg.x;       // uniform across the workgroup → barriers safe
+  if (n >= d.N) { return; }
+  let K = d.K; let wbase = n*K;
+  var acc : f32 = 0.0;
+  var k = lid.x;
+  loop { if (k >= K) { break; } acc = acc + x[k]*W[wbase+k]; k = k + ${GEMV_WG}u; }
+  red[lid.x] = acc; workgroupBarrier();
+  var s = ${GEMV_WG}u/2u;
+  loop { if (s==0u) { break; } if (lid.x<s) { red[lid.x]=red[lid.x]+red[lid.x+s]; } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u) { y[n] = red[0]; }
+}`;
+  function gemv(xBuf, wBuf, yBuf, N, K) {
+    const pipe = E.getPipeline('q3.gemv', GEMV_WGSL);
+    const d = uniform(new Uint32Array([N, K, 0, 0]));
+    const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
+    return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [gx, gy, 1]);
+  }
+  // Pick the right kernel: GEMV for single-token decode, tiled GEMM for prefill.
+  function linear(xBuf, wBuf, yBuf, T, N, K) {
+    return (T === 1) ? gemv(xBuf, wBuf, yBuf, N, K) : linearT(xBuf, wBuf, yBuf, T, N, K);
+  }
+
   // ============================================================
   // Kernel 3 — Embedding gather.  y[T,H] = embed[ids[t], :]
   // ============================================================
@@ -382,6 +421,20 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       check('addInPlace', maxAbs(got,y));
       [ab,bb].forEach(x=>x.destroy());
     }
+    // --- gemv (decode T=1 path) vs CPU; also vs linearT for equivalence ---
+    {
+      const N=200,K=320;
+      const x=new Float32Array(K),W=new Float32Array(N*K);
+      for(let i=0;i<K;i++)x[i]=Math.sin(i*0.21);
+      for(let i=0;i<W.length;i++)W[i]=Math.cos(i*0.013);
+      const xb=f32buf(x),wb=f32buf(W),yb=E.createBuffer(N*4,ST(),'y');
+      await gemv(xb,wb,yb,N,K);
+      const got=await E.readF32(yb,N);
+      const y=new Float32Array(N);
+      for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*W[n*K+k];y[n]=a;}
+      check('gemv', maxAbs(got,y));
+      [xb,wb,yb].forEach(b=>b.destroy());
+    }
     return out;
   }
 
@@ -424,7 +477,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       const merges = j.model.merges || [];
       for (let i = 0; i < merges.length; i++) {
         const m = merges[i];
-        const pair = Array.isArray(m) ? (m[0] + ' ' + m[1]) : m.replace(' ', ' ');
+        const pair = Array.isArray(m) ? (m[0] + ' ' + m[1]) : m.replace(' ', ' ');
         bpeRanks.set(pair, i);
       }
       ({ byteEnc, byteDec } = buildByteMaps());
@@ -438,7 +491,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       for (;;) {
         let best = null, bestRank = Infinity, bestI = -1;
         for (let i = 0; i < word.length - 1; i++) {
-          const r = bpeRanks.get(word[i] + ' ' + word[i + 1]);
+          const r = bpeRanks.get(word[i] + ' ' + word[i + 1]);
           if (r !== undefined && r < bestRank) { bestRank = r; best = i; bestI = i; }
         }
         if (best === null) break;
@@ -619,9 +672,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linearT(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
-      await linearT(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
-      await linearT(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+      await linear(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+      await linear(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+      await linear(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
       // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
       // read and a read_write binding is undefined behavior in WebGPU (miscompiles
       // on Intel). Write rope output to a separate buffer.
@@ -630,19 +683,19 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
       copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
       await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
-      await linearT(s.attn, W(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
+      await linear(s.attn, W(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
       await addInPlace(s.x, s.oproj, T * H);
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linearT(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
-      await linearT(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+      await linear(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+      await linear(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
       await swiglu(s.gate, s.up, s.swi, T * I);
-      await linearT(s.swi, W(p + 'mlp.down_proj.weight'), s.down, T, H, I);
+      await linear(s.swi, W(p + 'mlp.down_proj.weight'), s.down, T, H, I);
       await addInPlace(s.x, s.down, T * H);
     }
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
     // last token row → its own [H] buffer, then lm_head
     { const enc = E.device().createCommandEncoder(); enc.copyBufferToBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4); E.device().queue.submit([enc.finish()]); }
-    await linearT(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
+    await linear(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
     return await E.readF32(s.logits, C.vocab);
   }
 
@@ -668,7 +721,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
 
   return {
     CONFIG,
-    rmsnorm, linearT, embedGather, ropeQK, attention, swiglu, addInPlace,
+    rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, isLoaded: () => _loaded,
     _dbg: {
