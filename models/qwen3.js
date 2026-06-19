@@ -233,8 +233,140 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [gx, gy, 1]);
   }
 
-  // Pick the right kernel: GEMV for T=1 decode, batched matvec for small T
-  // (prefill/verify), tiled GEMM only for large T.
+  // ============================================================
+  // INT4 weight path — group-wise symmetric int4 (G=QGROUP) along K.
+  // Weights packed 8 nibbles/u32 (nibble for k=8w+i in bits [4i..4i+3]); one f16
+  // scale per group. Dequant: w ≈ (nibble-8)*scale. 4× less weight bandwidth than
+  // f16 → the lever for the bandwidth-bound GEMV (proven). Used for all projection
+  // + lm_head matrices; embed/norms stay f16.  Requires K % 32 == 0.
+  // ============================================================
+  const QGROUP = 32;
+
+  // ---- INT4 decode GEMV (T=1), GEMVQ_NR rows/workgroup (activation reused) ----
+  const GEMVQ_NR = 4;
+  const GEMVQ_WGSL = `
+enable f16;
+enable subgroups;
+struct D { N:u32, K:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [K/4]
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/QGROUP] scales
+@group(0) @binding(3) var<storage, read_write> y  : array<f32>;          // [N]
+@group(0) @binding(4) var<uniform>             d  : D;
+var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${GEMVQ_NR}u;
+  if (rowBase >= d.N) { return; }
+  let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
+  var acc : array<f32, ${GEMVQ_NR}>;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { acc[r] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = x[2u*w]; let xb = x[2u*w + 1u];      // activation chunk — read once, reused across rows
+    let grp = (w*8u)/${QGROUP}u;
+    for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+      let row = rowBase + r;
+      let p = W[row*words + w];
+      let s = f32(sc[row*gpr + grp]);
+      let lo = vec4<f32>(unpack4xU8(p & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      let hi = vec4<f32>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      acc[r] = acc[r] + s*( dot(vec4<f32>(lo.x,hi.x,lo.y,hi.y), xa) + dot(vec4<f32>(lo.z,hi.z,lo.w,hi.w), xb) );
+    }
+    w = w + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+    let ss = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${GEMVQ_NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.N) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
+      y[row] = t;
+    }
+  }
+}`;
+  function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K) {
+    const pipe = E.getPipeline('q3.gemvQ', GEMVQ_WGSL);
+    const d = uniform(new Uint32Array([N, K, 0, 0]));
+    const nWG = Math.ceil(N / GEMVQ_NR);
+    const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
+  }
+
+  // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
+  const MATVECQ_WGSL = `
+enable f16;
+enable subgroups;
+struct D { T:u32, N:u32, K:u32, tBase:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [(tBase+t)*K/4 + ...]
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;
+@group(0) @binding(3) var<storage, read_write> y  : array<f32>;          // [Tfull*N]
+@group(0) @binding(4) var<uniform>             d  : D;
+var<workgroup> part : array<f32, ${MATVEC_MAXT * MATVEC_WG}>;
+@compute @workgroup_size(${MATVEC_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let n = wg.x + wg.y * nwg.x;
+  if (n >= d.N) { return; }
+  let words = d.K / 8u; let wbase = n*words;
+  let gpr = d.K / ${QGROUP}u; let sbase = n*gpr;
+  let K4 = d.K / 4u; let T = d.T;
+  var acc : array<f32, ${MATVEC_MAXT}>;
+  for (var t:u32=0u; t<${MATVEC_MAXT}u; t=t+1u) { acc[t] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let p = W[wbase + w];
+    let s = f32(sc[sbase + (w*8u)/${QGROUP}u]);
+    let lo = vec4<f32>(unpack4xU8(p & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+    let hi = vec4<f32>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+    let wa = vec4<f32>(lo.x,hi.x,lo.y,hi.y); let wb_ = vec4<f32>(lo.z,hi.z,lo.w,hi.w);
+    for (var t:u32=0u; t<T; t=t+1u) {
+      let base = (d.tBase + t)*K4;
+      acc[t] = acc[t] + s*( dot(wa, x[base + 2u*w]) + dot(wb_, x[base + 2u*w + 1u]) );
+    }
+    w = w + ${MATVEC_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var t:u32=0u; t<T; t=t+1u) {
+    let ssum = subgroupAdd(acc[t]);
+    if (sgi == 0u) { part[t*${MATVEC_WG}u + sgIdx] = ssum; }
+  }
+  workgroupBarrier();
+  if (lid.x < T) {
+    let t = lid.x; let nsg=(${MATVEC_WG}u+sgs-1u)/sgs; var tot:f32=0.0;
+    for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[t*${MATVEC_WG}u + i]; }
+    y[(d.tBase + t)*d.N + n] = tot;
+  }
+}`;
+  function matvecQ(xBuf, packBuf, scBuf, yBuf, T, N, K, tBase) {
+    const pipe = E.getPipeline('q3.matvecQ', MATVECQ_WGSL);
+    const d = uniform(new Uint32Array([T, N, K, tBase || 0]));
+    const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
+    return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
+  }
+
+  // Router for the int4 weight path. wrec = { pack, scales, N, K }.
+  async function linearQ(xBuf, wrec, yBuf, T, N, K) {
+    if (T === 1) return gemvQ(xBuf, wrec.pack, wrec.scales, yBuf, N, K);
+    for (let t0 = 0; t0 < T; t0 += MATVEC_MAXT) {
+      const tc = Math.min(MATVEC_MAXT, T - t0);
+      await matvecQ(xBuf, wrec.pack, wrec.scales, yBuf, tc, N, K, t0);
+    }
+  }
+
+  // (f16 path below — gemv/matvecT/linearT — retained for the f16 self-tests; the
+  // live forward now uses the int4 linearQ for all projection + lm_head matrices.)
   function linear(xBuf, wBuf, yBuf, T, N, K) {
     if (T === 1) return gemv(xBuf, wBuf, yBuf, N, K);
     if (T <= MATVEC_MAXT) return matvecT(xBuf, wBuf, yBuf, T, N, K);
@@ -613,6 +745,42 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       check('matvecT', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
     }
+    // --- int4 quant helpers for the GEMV-Q / matvec-Q tests ---
+    const f32ToBf16 = (a) => { const u=new Uint16Array(a.length); const t=new Float32Array(1),ti=new Uint32Array(t.buffer); for(let i=0;i<a.length;i++){t[0]=a[i];u[i]=ti[0]>>>16;} return u; };
+    const dequantInt4 = (pack, scales, N, K) => { const G=QGROUP,wpr=K/8,gpr=K/G; const w=new Float32Array(N*K);
+      for(let n=0;n<N;n++)for(let k=0;k<K;k++){const word=pack[n*wpr+(k>>3)];const nib=(word>>>(4*(k&7)))&0xF;const sc=f16ToF32scalar(scales[n*gpr+Math.floor(k/G)]);w[n*K+k]=(nib-8)*sc;} return w; };
+    const qbuf = (u32) => { const b=E.createBuffer(u32.byteLength, ST(),'pk'); E.device().queue.writeBuffer(b,0,u32); return b; };
+    const sbuf = (u16) => { const b=E.createBuffer(u16.byteLength, ST(),'scs'); E.device().queue.writeBuffer(b,0,u16); return b; };
+    // --- gemvQ (int4 decode) vs CPU dequant ---
+    {
+      const N=130,K=256;
+      const x=new Float32Array(K),Wf=new Float32Array(N*K);
+      for(let i=0;i<K;i++)x[i]=Math.sin(i*0.2);
+      for(let i=0;i<Wf.length;i++)Wf[i]=Math.cos(i*0.013);
+      const {pack,scales}=quantizeInt4Bf16(f32ToBf16(Wf),N,K);
+      const Wdq=dequantInt4(pack,scales,N,K);
+      const xb=f32buf(x),pb=qbuf(pack),sb=sbuf(scales),yb=E.createBuffer(N*4,ST(),'y');
+      await gemvQ(xb,pb,sb,yb,N,K);
+      const got=await E.readF32(yb,N); const y=new Float32Array(N);
+      for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*Wdq[n*K+k];y[n]=a;}
+      check('gemvQ', maxAbs(got,y), 1e-2);
+      [xb,pb,sb,yb].forEach(b=>b.destroy());
+    }
+    // --- matvecQ (int4 batched) vs CPU dequant ---
+    {
+      const T=5,N=96,K=128;
+      const x=new Float32Array(T*K),Wf=new Float32Array(N*K);
+      for(let i=0;i<x.length;i++)x[i]=Math.sin(i*0.05);
+      for(let i=0;i<Wf.length;i++)Wf[i]=Math.cos(i*0.017);
+      const {pack,scales}=quantizeInt4Bf16(f32ToBf16(Wf),N,K);
+      const Wdq=dequantInt4(pack,scales,N,K);
+      const xb=f32buf(x),pb=qbuf(pack),sb=sbuf(scales),yb=E.createBuffer(T*N*4,ST(),'y');
+      await matvecQ(xb,pb,sb,yb,T,N,K,0);
+      const got=await E.readF32(yb,T*N); const y=new Float32Array(T*N);
+      for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*Wdq[n*K+k];y[t*N+n]=a;}
+      check('matvecQ', maxAbs(got,y), 1e-2);
+      [xb,pb,sb,yb].forEach(b=>b.destroy());
+    }
     // --- argmax ---
     {
       const N=5000; const a=new Float32Array(N);
@@ -785,6 +953,37 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let i = 0; i < f32.length; i++) out[i] = f32ToF16(f32[i]);
     return out;
   }
+  function f16ToF32scalar(h) { const s=(h&0x8000)>>15,e=(h&0x7c00)>>10,f=h&0x03ff;
+    if(e===0) return (s?-1:1)*Math.pow(2,-14)*(f/1024);
+    if(e===31) return f?NaN:(s?-Infinity:Infinity);
+    return (s?-1:1)*Math.pow(2,e-15)*(1+f/1024); }
+
+  // Quantize a [N,K] bf16 tensor → group-wise symmetric int4 (G=QGROUP along K).
+  // Returns { pack:Uint32Array(N*K/8), scales:Uint16Array(N*K/QGROUP f16) }.
+  // nibble = clamp(round(w/scale),-8,7)+8 ; packed 8/u32 (k=8w+i → bits 4i).
+  function quantizeInt4Bf16(u16, N, K) {
+    const G = QGROUP, wpr = K / 8, gpr = K / G;
+    const pack = new Uint32Array(N * wpr), scales = new Uint16Array(N * gpr);
+    const tf = new Float32Array(1), ti = new Uint32Array(tf.buffer);
+    const f = (idx) => { ti[0] = u16[idx] << 16; return tf[0]; };
+    for (let n = 0; n < N; n++) {
+      const rU = n * K, rP = n * wpr, rS = n * gpr;
+      for (let g = 0; g < gpr; g++) {
+        let maxabs = 0;
+        for (let j = 0; j < G; j++) { const v = Math.abs(f(rU + g*G + j)); if (v > maxabs) maxabs = v; }
+        const scale = maxabs > 0 ? maxabs / 7 : 1e-8;
+        const sBits = f32ToF16(scale); scales[rS + g] = sBits;
+        const inv = 1 / f16ToF32scalar(sBits);   // quantize against the STORED (f16) scale
+        for (let j = 0; j < G; j++) {
+          const k = g*G + j;
+          let q = Math.round(f(rU + k) * inv); if (q < -8) q = -8; else if (q > 7) q = 7;
+          pack[rP + (k >> 3)] |= ((q + 8) & 0xF) << (4 * (k & 7));
+        }
+      }
+    }
+    return { pack, scales };
+  }
+  const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight';
 
   async function fetchModelBytes(onProgress) {
     const url = MODEL_ROOT + 'model.safetensors';
@@ -820,15 +1019,26 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const [begin, end] = info.data_offsets;
       const numel = info.shape.reduce((a, b) => a * b, 1);
       const raw = new Uint8Array(ab, dataStart + begin, end - begin);
-      let f16bits;
-      if (info.dtype === 'BF16') f16bits = bf16ToF16bits(new Uint16Array(raw.buffer, raw.byteOffset, numel));
-      else if (info.dtype === 'F16') f16bits = new Uint16Array(raw.buffer, raw.byteOffset, numel);
-      else if (info.dtype === 'F32') f16bits = f32ToF16bits(new Float32Array(raw.buffer, raw.byteOffset, numel));
-      else throw new Error('unsupported dtype ' + info.dtype + ' for ' + name);
-      // f16 storage buffer: numel*2 bytes (createBuffer rounds up to 4).
-      const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
-      E.device().queue.writeBuffer(buf, 0, f16bits);
-      _weights[name] = { buf, shape: info.shape, numel };
+      if (info.dtype !== 'BF16' && isQuantWeight(name)) throw new Error('quant path expects BF16 for ' + name);
+      if (isQuantWeight(name)) {
+        // INT4: [N,K] = shape. Pack + scales.
+        const N = info.shape[0], K = info.shape[1];
+        const { pack, scales } = quantizeInt4Bf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
+        const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.pack');
+        const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.sc');
+        E.device().queue.writeBuffer(packBuf, 0, pack);
+        E.device().queue.writeBuffer(scBuf, 0, scales);
+        _weights[name] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
+      } else {
+        let f16bits;
+        if (info.dtype === 'BF16') f16bits = bf16ToF16bits(new Uint16Array(raw.buffer, raw.byteOffset, numel));
+        else if (info.dtype === 'F16') f16bits = new Uint16Array(raw.buffer, raw.byteOffset, numel);
+        else if (info.dtype === 'F32') f16bits = f32ToF16bits(new Float32Array(raw.buffer, raw.byteOffset, numel));
+        else throw new Error('unsupported dtype ' + info.dtype + ' for ' + name);
+        const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
+        E.device().queue.writeBuffer(buf, 0, f16bits);
+        _weights[name] = { buf, shape: info.shape, numel };
+      }
       if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
     }
     onProgress && onProgress({ phase: 'parse', pct: 100 });
@@ -898,16 +1108,17 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const C = CONFIG, H = C.hidden, nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim, I = C.intermediate;
     const T = idsArray.length, S = posBase + T;
     ensureKv(); ensureScratch(T);
-    const W = (n) => _weights[n].buf;
+    const W = (n) => _weights[n].buf;      // f16 weight buffer (embed/norms)
+    const Wq = (n) => _weights[n];         // int4 record (projections/lm_head)
     const s = _scr;
     const ids = setIds(idsArray);
     await embedGather(ids, W('model.embed_tokens.weight'), s.x, T, H);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linear(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
-      await linear(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
-      await linear(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+      await linearQ(s.normed, Wq(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+      await linearQ(s.normed, Wq(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+      await linearQ(s.normed, Wq(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
       // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
       // read and a read_write binding is undefined behavior in WebGPU (miscompiles
       // on Intel). Write rope output to a separate buffer.
@@ -916,19 +1127,19 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
       copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
       await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
-      await linear(s.attn, W(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
+      await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
       await addInPlace(s.x, s.oproj, T * H);
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linear(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
-      await linear(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+      await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+      await linearQ(s.normed, Wq(p + 'mlp.up_proj.weight'), s.up, T, I, H);
       await swiglu(s.gate, s.up, s.swi, T * I);
-      await linear(s.swi, W(p + 'mlp.down_proj.weight'), s.down, T, H, I);
+      await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.down, T, H, I);
       await addInPlace(s.x, s.down, T * H);
     }
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
     // last token row → its own [H] buffer, then lm_head
     { const enc = E.device().createCommandEncoder(); enc.copyBufferToBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4); E.device().queue.submit([enc.finish()]); }
-    await linear(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
+    await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
     // GPU-side greedy argmax → read back only the 4-byte token id (not 600KB logits).
     await argmaxKernel(s.logits, s.tok, C.vocab);
     return await readU32(s.tok);
@@ -971,6 +1182,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
+    _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _dbg: {
       weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
