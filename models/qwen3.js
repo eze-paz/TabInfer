@@ -121,11 +121,14 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
   // thread useful reduction work: one workgroup per output row n, WG threads
   // stride K and reduce. 2D workgroup grid because N (151936 for lm_head)
   // exceeds the 65535 per-dimension dispatch limit.
-  // Vectorized + subgroup-reduced: reads weights as vec4<f16> and x as vec4<f32>
-  // (4 elems/load → better memory throughput on the bandwidth-bound GEMV), and
-  // reduces partials with subgroupAdd (no barrier tree). Requires K % 4 == 0 (all
-  // Qwen3 matrices: K ∈ {1024,2048,3072}). One workgroup per output row.
+  // Vectorized + subgroup-reduced + N_ROWS reuse. Reads weights as vec4<f16> and
+  // x as vec4<f32> (4 elems/load), reduces partials with subgroupAdd, and each
+  // workgroup computes GEMV_NR output rows — the activation chunk x[c] is read ONCE
+  // and reused across all NR rows (fewer workgroups, the activation read amortized
+  // NR×). Requires K % 4 == 0 (all Qwen3 matrices). N need not divide NR (row<N
+  // guards; out-of-range weight reads are bounds-checked to 0 and never written).
   const GEMV_WG = 64;
+  const GEMV_NR = 4;   // output rows per workgroup
   const GEMV_WGSL = `
 enable f16;
 enable subgroups;
@@ -134,32 +137,47 @@ struct D { N:u32, K:u32, _a:u32, _b:u32 };
 @group(0) @binding(1) var<storage, read>       W : array<vec4<f16>>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             d : D;
-var<workgroup> part : array<f32, ${GEMV_WG}>;   // one partial per subgroup (oversized, safe)
+var<workgroup> part : array<f32, ${GEMV_NR * GEMV_WG}>;   // part[r*WG + subgroupIdx]
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(num_workgroups) nwg:vec3<u32>,
         @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
-  let n = wg.x + wg.y * nwg.x;
-  if (n >= d.N) { return; }
-  let K4 = d.K / 4u; let wbase = n*K4;
-  var acc : f32 = 0.0;
+  let rowBase = (wg.x + wg.y * nwg.x) * ${GEMV_NR}u;
+  if (rowBase >= d.N) { return; }
+  let K4 = d.K / 4u;
+  var acc : array<f32, ${GEMV_NR}>;
+  for (var r:u32=0u; r<${GEMV_NR}u; r=r+1u) { acc[r] = 0.0; }
   var c = lid.x;
-  loop { if (c >= K4) { break; } acc = acc + dot(x[c], vec4<f32>(W[wbase+c])); c = c + ${GEMV_WG}u; }
-  let ssum = subgroupAdd(acc);            // full sum within each subgroup
+  loop {
+    if (c >= K4) { break; }
+    let xv = x[c];                                   // activation chunk — read once
+    for (var r:u32=0u; r<${GEMV_NR}u; r=r+1u) {
+      acc[r] = acc[r] + dot(xv, vec4<f32>(W[(rowBase+r)*K4 + c]));
+    }
+    c = c + ${GEMV_WG}u;
+  }
   let sgIdx = lid.x / sgs;
-  if (sgi == 0u) { part[sgIdx] = ssum; }
+  for (var r:u32=0u; r<${GEMV_NR}u; r=r+1u) {
+    let ssum = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ssum; }
+  }
   workgroupBarrier();
-  if (lid.x == 0u) {
-    let nsg = (${GEMV_WG}u + sgs - 1u) / sgs;
-    var tot : f32 = 0.0;
-    for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[i]; }
-    y[n] = tot;
+  // NR threads each finalize one row.
+  if (lid.x < ${GEMV_NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.N) {
+      let nsg = (${GEMV_WG}u + sgs - 1u) / sgs;
+      var tot : f32 = 0.0;
+      for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[lid.x*${GEMV_WG}u + i]; }
+      y[row] = tot;
+    }
   }
 }`;
   function gemv(xBuf, wBuf, yBuf, N, K) {
     const pipe = E.getPipeline('q3.gemv', GEMV_WGSL);
     const d = uniform(new Uint32Array([N, K, 0, 0]));
-    const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
+    const nWG = Math.ceil(N / GEMV_NR);
+    const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, wBuf, yBuf, d], [gx, gy, 1]);
   }
   // Pick the right kernel: GEMV for single-token decode, tiled GEMM for prefill.
