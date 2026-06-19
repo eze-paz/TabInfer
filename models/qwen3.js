@@ -314,6 +314,36 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
   }
 
   // ============================================================
+  // Kernel 8 — ArgMax over logits[N] → out[0] = index of max (greedy sampling).
+  // Single workgroup, WG threads stride N tracking (max,idx), then a shared-mem
+  // reduction. Lets us read back 4 bytes/token instead of the full 600KB logits.
+  // Tie-break differs trivially from JS (rare; irrelevant to coherence).
+  // ============================================================
+  const ARGMAX_WG = 256;
+  const ARGMAX_WGSL = `
+struct P { n:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       logits : array<f32>;
+@group(0) @binding(1) var<storage, read_write> outIdx : array<u32>;
+@group(0) @binding(2) var<uniform>             p      : P;
+var<workgroup> sv : array<f32, ${ARGMAX_WG}>;
+var<workgroup> si : array<u32, ${ARGMAX_WG}>;
+@compute @workgroup_size(${ARGMAX_WG},1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  var bv : f32 = -3.0e38; var bi : u32 = 0u;
+  var i = lid.x;
+  loop { if (i >= p.n) { break; } let v = logits[i]; if (v > bv) { bv = v; bi = i; } i = i + ${ARGMAX_WG}u; }
+  sv[lid.x] = bv; si[lid.x] = bi; workgroupBarrier();
+  var s = ${ARGMAX_WG}u/2u;
+  loop { if (s==0u) { break; } if (lid.x < s) { if (sv[lid.x+s] > sv[lid.x]) { sv[lid.x]=sv[lid.x+s]; si[lid.x]=si[lid.x+s]; } } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u) { outIdx[0] = si[0]; }
+}`;
+  function argmaxKernel(logitsBuf, outBuf, N) {
+    const pipe = E.getPipeline('q3.argmax', ARGMAX_WGSL);
+    const p = uniform(new Uint32Array([N, 0, 0, 0]));
+    return E.dispatch(pipe, [logitsBuf, outBuf, p], [1, 1, 1]);
+  }
+
+  // ============================================================
   // Self-tests — each kernel vs a CPU reference. Returns {name, ok, err}[].
   // ============================================================
   function f32buf(arr) { return E.uploadF32(arr instanceof Float32Array ? arr : new Float32Array(arr), ST()); }
@@ -447,6 +477,17 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*WR[n*K+k];y[n]=a;}
       check('gemv', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
+    }
+    // --- argmax ---
+    {
+      const N=5000; const a=new Float32Array(N);
+      for(let i=0;i<N;i++)a[i]=Math.sin(i*0.017); a[3712]=99.0;  // known max
+      const ab=f32buf(a), ob=E.createBuffer(4, ST(),'oi');
+      await argmaxKernel(ab,ob,N);
+      const enc=E.device().createCommandEncoder(); const st=E.createBuffer(4,U.COPY_DST|U.MAP_READ,'s'); enc.copyBufferToBuffer(ob,0,st,0,4); E.device().queue.submit([enc.finish()]);
+      await st.mapAsync(GPUMapMode.READ); const idx=new Uint32Array(st.getMappedRange())[0]; st.unmap(); st.destroy();
+      check('argmax', idx===3712?0:1);
+      [ab,ob].forEach(b=>b.destroy());
     }
     return out;
   }
@@ -701,6 +742,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
       attn: scrBuf(T * nHeads * headDim, 'attn'), oproj: scrBuf(T * H, 'oproj'),
       gate: scrBuf(T * I, 'gate'), up: scrBuf(T * I, 'up'), swi: scrBuf(T * I, 'swi'), down: scrBuf(T * H, 'down'),
       last: scrBuf(H, 'last'), logits: scrBuf(CONFIG.vocab, 'logits'),
+      tok: scrBuf(1, 'tok'),   // 4 bytes — GPU argmax result (u32 token id)
     };
     _scrT = T;
   }
@@ -752,25 +794,39 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
     // last token row → its own [H] buffer, then lm_head
     { const enc = E.device().createCommandEncoder(); enc.copyBufferToBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4); E.device().queue.submit([enc.finish()]); }
     await linear(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
-    return await E.readF32(s.logits, C.vocab);
+    // GPU-side greedy argmax → read back only the 4-byte token id (not 600KB logits).
+    await argmaxKernel(s.logits, s.tok, C.vocab);
+    return await readU32(s.tok);
   }
 
-  function argmax(arr) { let mi = 0, mv = arr[0]; for (let i = 1; i < arr.length; i++) if (arr[i] > mv) { mv = arr[i]; mi = i; } return mi; }
+  // Read 1 u32 from a GPU buffer.
+  async function readU32(buf) {
+    const staging = E.createBuffer(4, U.COPY_DST | U.MAP_READ, 'rdu32');
+    const enc = E.device().createCommandEncoder();
+    enc.copyBufferToBuffer(buf, 0, staging, 0, 4);
+    E.device().queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const v = new Uint32Array(staging.getMappedRange())[0];
+    staging.unmap(); staging.destroy();
+    return v;
+  }
+  // Debug: full logits readback (call right after a forward, before the next one).
+  async function readLogits() { return E.readF32(_scr.logits, CONFIG.vocab); }
 
-  // Greedy generate. onToken(text) streams decoded pieces.
+  // Greedy generate. forward() returns the next token id (argmax done on GPU).
+  // onToken(text) streams decoded pieces.
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     await loadModel({});
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
-    let logits = await forward(ids, 0);
+    let next = await forward(ids, 0);
     let pos = ids.length; const outIds = [];
     for (let step = 0; step < maxTokens; step++) {
       if (signal && signal.aborted) break;
-      const next = argmax(logits);
       if (next === SPECIAL.im_end || next === SPECIAL.endoftext) break;
       outIds.push(next);
       if (onToken) { try { onToken(TOK.decode([next])); } catch (_) {} }
       if (pos >= MAX_SEQ) break;
-      logits = await forward([next], pos); pos++;
+      next = await forward([next], pos); pos++;
     }
     return TOK.decode(outIds);
   }
@@ -779,7 +835,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
-    TOK, loadModel, forward, generate, isLoaded: () => _loaded,
+    TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
     _dbg: {
       weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
