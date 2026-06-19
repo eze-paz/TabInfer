@@ -237,8 +237,18 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Q[T, nHq*hd], K[S, nKv*hd], V[S, nKv*hd] → O[T, nHq*hd].
   // q-head h uses kv-head h/(nHq/nKv). Causal: key s attends iff s <= (S-T)+t
   // (so decode with T=1,S=cacheLen attends all; prefill T=S is lower-triangular).
-  // One workgroup per (t, qhead); single-thread softmax over S (correctness-first).
+  //
+  // PARALLEL design (the old one ran 1 THREAD per (t,head) — 16 threads for decode,
+  // ~2% iGPU occupancy, 57% of decode time). Now: ONE WORKGROUP per (t,head) with
+  // ATTN_WG threads cooperating —
+  //   • load the query row into shared memory
+  //   • scores: threads stride the keys, each computes dot(q,k_s)*scale → shared sc[]
+  //   • softmax: parallel max-reduce, then exp + parallel sum-reduce
+  //   • output: hd threads (one per dim) each sum over keys → O[d]
+  // Scores live in shared mem (capacity ATTN_MAXK = MAX_SEQ). hd ≤ ATTN_WG.
   // ============================================================
+  const ATTN_WG = 128;
+  const ATTN_MAXK = 2048;   // = MAX_SEQ; scores buffer size in shared memory
   const ATTN_WGSL = `
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       Q : array<f32>;
@@ -246,35 +256,58 @@ struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(2) var<storage, read>       V : array<f32>;
 @group(0) @binding(3) var<storage, read_write> O : array<f32>;
 @group(0) @binding(4) var<uniform>             p : P;
-@compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>){
-  let unit=gid.x; if(unit>=p.T*p.nHq){return;}
-  let t=unit/p.nHq; let hq=unit%p.nHq;
-  let hd=p.hd; let grp=p.nHq/p.nKv; let hk=hq/grp;
-  let qb=t*(p.nHq*hd)+hq*hd;
-  let scale=1.0/sqrt(f32(hd));
-  let last=(p.S-p.T)+t;
-  var m:f32=-3.0e38;
-  for(var s:u32=0u; s<=last; s=s+1u){
-    let kb=s*(p.nKv*hd)+hk*hd;
-    var dot:f32=0.0; for(var i:u32=0u;i<hd;i=i+1u){ dot=dot+Q[qb+i]*K[kb+i]; }
-    dot=dot*scale; if(dot>m){m=dot;}
+var<workgroup> qsh : array<f32, ${ATTN_WG}>;   // query row (hd ≤ ATTN_WG)
+var<workgroup> sc  : array<f32, ${ATTN_MAXK}>; // scores / probabilities per key
+var<workgroup> red : array<f32, ${ATTN_WG}>;   // reduction scratch
+@compute @workgroup_size(${ATTN_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>) {
+  let lid = lidv.x;
+  let unit = wg.x;                       // 0 .. T*nHq-1
+  let t = unit / p.nHq; let hq = unit % p.nHq;
+  let hd = p.hd; let grp = p.nHq / p.nKv; let hk = hq / grp;
+  let qb = t*(p.nHq*hd) + hq*hd;
+  let kvstride = p.nKv*hd;
+  let scale = 1.0/sqrt(f32(hd));
+  let last = (p.S - p.T) + t;            // inclusive last key
+  // load query row
+  if (lid < hd) { qsh[lid] = Q[qb+lid]; }
+  workgroupBarrier();
+  // scores: each thread handles a strided subset of keys
+  var key = lid;
+  loop {
+    if (key > last) { break; }
+    let kb = key*kvstride + hk*hd;
+    var dot : f32 = 0.0;
+    for (var i:u32=0u; i<hd; i=i+1u) { dot = dot + qsh[i]*K[kb+i]; }
+    sc[key] = dot*scale;
+    key = key + ${ATTN_WG}u;
   }
-  var denom:f32=0.0;
-  for(var i:u32=0u;i<hd;i=i+1u){ O[qb+i]=0.0; }
-  for(var s:u32=0u; s<=last; s=s+1u){
-    let kb=s*(p.nKv*hd)+hk*hd; let vb=s*(p.nKv*hd)+hk*hd;
-    var dot:f32=0.0; for(var i:u32=0u;i<hd;i=i+1u){ dot=dot+Q[qb+i]*K[kb+i]; }
-    let w=exp(dot*scale - m); denom=denom+w;
-    for(var i:u32=0u;i<hd;i=i+1u){ O[qb+i]=O[qb+i]+w*V[vb+i]; }
+  workgroupBarrier();
+  // max-reduce over sc[0..last]
+  var lmax : f32 = -3.0e38;
+  key = lid; loop { if (key > last) { break; } lmax = max(lmax, sc[key]); key = key + ${ATTN_WG}u; }
+  red[lid] = lmax; workgroupBarrier();
+  var st = ${ATTN_WG}u/2u;
+  loop { if (st==0u){break;} if (lid<st){ red[lid]=max(red[lid],red[lid+st]); } workgroupBarrier(); st=st/2u; }
+  let m = red[0]; workgroupBarrier();
+  // exp + sum-reduce
+  var lsum : f32 = 0.0;
+  key = lid; loop { if (key > last) { break; } let e = exp(sc[key]-m); sc[key]=e; lsum=lsum+e; key=key+${ATTN_WG}u; }
+  red[lid] = lsum; workgroupBarrier();
+  st = ${ATTN_WG}u/2u;
+  loop { if (st==0u){break;} if (lid<st){ red[lid]=red[lid]+red[lid+st]; } workgroupBarrier(); st=st/2u; }
+  let denom = red[0]; workgroupBarrier();
+  // output: one thread per dim sums prob*V over all keys
+  if (lid < hd) {
+    var acc : f32 = 0.0;
+    for (var s:u32=0u; s<=last; s=s+1u) { acc = acc + sc[s]*V[s*kvstride + hk*hd + lid]; }
+    O[qb+lid] = acc/denom;
   }
-  let invd=1.0/denom;
-  for(var i:u32=0u;i<hd;i=i+1u){ O[qb+i]=O[qb+i]*invd; }
 }`;
   function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
     const pipe = E.getPipeline('q3.attn', ATTN_WGSL);
     const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
-    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [Math.ceil((T*nHq)/64), 1, 1]);
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [T * nHq, 1, 1]);   // one workgroup per (t,head)
   }
 
   // ============================================================
@@ -297,51 +330,6 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return E.dispatch(pipe, [gateBuf, upBuf, yBuf, p], [Math.ceil(n/64), 1, 1]);
   }
 
-  // ----- FUSED q+k+v projections for decode (T==1) -----
-  // Collapses 3 decode dispatches (gemv q, gemv k, gemv v) into 1. All three read
-  // the SAME input x[H]; outputs are the concatenated rows [q | k | v]. One
-  // workgroup per output row r; r<Nq → q-proj, r<Nq+Nk → k-proj, else v-proj
-  // (branch is uniform across the workgroup, so no divergence). Threads stride H,
-  // shared-mem reduce, thread 0 writes to the right output buffer.
-  const QKV_WG = 64;
-  const QKV_WGSL = `
-enable f16;
-struct D { Nq:u32, Nk:u32, Nv:u32, H:u32 };
-@group(0) @binding(0) var<storage, read>       x  : array<f32>;
-@group(0) @binding(1) var<storage, read>       qW : array<f16>;
-@group(0) @binding(2) var<storage, read>       kW : array<f16>;
-@group(0) @binding(3) var<storage, read>       vW : array<f16>;
-@group(0) @binding(4) var<storage, read_write> qo : array<f32>;
-@group(0) @binding(5) var<storage, read_write> ko : array<f32>;
-@group(0) @binding(6) var<storage, read_write> vo : array<f32>;
-@group(0) @binding(7) var<uniform>             d  : D;
-var<workgroup> red : array<f32, ${QKV_WG}>;
-@compute @workgroup_size(${QKV_WG},1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
-  let r = wg.x + wg.y * nwg.x;
-  let H = d.H; let nqk = d.Nq + d.Nk; let total = nqk + d.Nv;
-  if (r >= total) { return; }
-  var acc : f32 = 0.0; var k = lid.x;
-  if (r < d.Nq) { let wb = r*H; loop { if (k>=H){break;} acc=acc+x[k]*f32(qW[wb+k]); k=k+${QKV_WG}u; } }
-  else if (r < nqk) { let wb=(r-d.Nq)*H; loop { if (k>=H){break;} acc=acc+x[k]*f32(kW[wb+k]); k=k+${QKV_WG}u; } }
-  else { let wb=(r-nqk)*H; loop { if (k>=H){break;} acc=acc+x[k]*f32(vW[wb+k]); k=k+${QKV_WG}u; } }
-  red[lid.x]=acc; workgroupBarrier();
-  var s = ${QKV_WG}u/2u;
-  loop { if (s==0u){break;} if (lid.x<s){red[lid.x]=red[lid.x]+red[lid.x+s];} workgroupBarrier(); s=s/2u; }
-  if (lid.x==0u) {
-    if (r < d.Nq) { qo[r]=red[0]; }
-    else if (r < nqk) { ko[r-d.Nq]=red[0]; }
-    else { vo[r-nqk]=red[0]; }
-  }
-}`;
-  function qkvProj(xBuf, qWBuf, kWBuf, vWBuf, qBuf, kBuf, vBuf, Nq, Nk, Nv, H) {
-    const pipe = E.getPipeline('q3.qkv', QKV_WGSL);
-    const d = uniform(new Uint32Array([Nq, Nk, Nv, H]));
-    const total = Nq + Nk + Nv;
-    const gx = Math.min(total, 65535), gy = Math.ceil(total / gx);
-    return E.dispatch(pipe, [xBuf, qWBuf, kWBuf, vWBuf, qBuf, kBuf, vBuf, d], [gx, gy, 1]);
-  }
 
   // ============================================================
   // Kernel 7 — Residual add (in place).  a[n] += b[n]
@@ -523,26 +511,6 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*WR[n*K+k];y[n]=a;}
       check('gemv', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
-    }
-    // --- qkvProj (fused q+k+v, T=1) vs CPU ---
-    {
-      const Nq=96,Nk=48,Nv=48,H=256;
-      const x=new Float32Array(H),qW=new Float32Array(Nq*H),kW=new Float32Array(Nk*H),vW=new Float32Array(Nv*H);
-      for(let i=0;i<H;i++)x[i]=Math.sin(i*0.13);
-      for(let i=0;i<qW.length;i++)qW[i]=Math.cos(i*0.011);
-      for(let i=0;i<kW.length;i++)kW[i]=Math.sin(i*0.007);
-      for(let i=0;i<vW.length;i++)vW[i]=Math.cos(i*0.005);
-      const qWR=roundF16(qW),kWR=roundF16(kW),vWR=roundF16(vW);
-      const xb=f32buf(x),qb=f16buf(qW),kb=f16buf(kW),vb=f16buf(vW);
-      const qo=E.createBuffer(Nq*4,ST(),'qo'),ko=E.createBuffer(Nk*4,ST(),'ko'),vo=E.createBuffer(Nv*4,ST(),'vo');
-      await qkvProj(xb,qb,kb,vb,qo,ko,vo,Nq,Nk,Nv,H);
-      const gq=await E.readF32(qo,Nq),gk=await E.readF32(ko,Nk),gv=await E.readF32(vo,Nv);
-      const cq=new Float32Array(Nq),ck=new Float32Array(Nk),cv=new Float32Array(Nv);
-      for(let n=0;n<Nq;n++){let a=0;for(let k=0;k<H;k++)a+=x[k]*qWR[n*H+k];cq[n]=a;}
-      for(let n=0;n<Nk;n++){let a=0;for(let k=0;k<H;k++)a+=x[k]*kWR[n*H+k];ck[n]=a;}
-      for(let n=0;n<Nv;n++){let a=0;for(let k=0;k<H;k++)a+=x[k]*vWR[n*H+k];cv[n]=a;}
-      check('qkvProj', Math.max(maxAbs(gq,cq),maxAbs(gk,ck),maxAbs(gv,cv)));
-      [xb,qb,kb,vb,qo,ko,vo].forEach(b=>b.destroy());
     }
     // --- argmax ---
     {
@@ -784,7 +752,6 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Forward graph + KV cache + generate
   // ============================================================
   const MAX_SEQ = 2048;
-  let _QKV_FUSE = true;   // decode: fuse q+k+v into one dispatch (toggle for A/B)
   let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
   let _scr = null;    // scratch buffers, sized to _scrT rows
   let _scrT = 0;
@@ -837,15 +804,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      if (T === 1 && _QKV_FUSE) {
-        // Decode: one fused dispatch for all three projections (shared input x).
-        await qkvProj(s.normed, W(p + 'self_attn.q_proj.weight'), W(p + 'self_attn.k_proj.weight'), W(p + 'self_attn.v_proj.weight'),
-          s.q, s.k, s.v, nHq * hd, nKv * hd, nKv * hd, H);
-      } else {
-        await linear(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
-        await linear(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
-        await linear(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
-      }
+      await linear(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+      await linear(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+      await linear(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
       // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
       // read and a read_write binding is undefined behavior in WebGPU (miscompiles
       // on Intel). Write rope output to a separate buffer.
@@ -906,10 +867,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   return {
     CONFIG,
-    rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, qkvProj, addInPlace,
+    rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
-    _setQkvFuse: (b) => { _QKV_FUSE = !!b; },
     _dbg: {
       weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
