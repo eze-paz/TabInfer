@@ -1063,6 +1063,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Forward graph + KV cache + generate
   // ============================================================
   const MAX_SEQ = 2048;
+  let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
   let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
   let _scr = null;    // scratch buffers, sized to _scrT rows
   let _scrT = 0;
@@ -1105,6 +1106,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Run the transformer over T tokens at absolute positions [posBase, posBase+T).
   // Updates the KV cache; returns logits (Float32Array[vocab]) for the LAST token.
   async function forward(idsArray, posBase) {
+    const _t0 = _PERF ? performance.now() : 0;
     const C = CONFIG, H = C.hidden, nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim, I = C.intermediate;
     const T = idsArray.length, S = posBase + T;
     ensureKv(); ensureScratch(T);
@@ -1142,7 +1144,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
     // GPU-side greedy argmax → read back only the 4-byte token id (not 600KB logits).
     await argmaxKernel(s.logits, s.tok, C.vocab);
-    return await readU32(s.tok);
+    const _t1 = _PERF ? performance.now() : 0;   // all commands issued (no explicit GPU wait yet)
+    if (_PERF) await E.device().queue.onSubmittedWorkDone();  // GPU drain (excludes map)
+    const _t2 = _PERF ? performance.now() : 0;
+    const tok = await readU32(s.tok);            // copy + mapAsync round-trip
+    if (_PERF) _perfData = { encode_ms: +(_t1 - _t0).toFixed(2), gpu_drain_ms: +(_t2 - _t1).toFixed(2), map_ms: +(performance.now() - _t2).toFixed(2) };
+    return tok;
   }
 
   // Read 1 u32 from a GPU buffer.
@@ -1183,6 +1190,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
+    _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
       weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
