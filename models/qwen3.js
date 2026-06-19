@@ -243,7 +243,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const QGROUP = 32;
 
   // ---- INT4 decode GEMV (T=1), GEMVQ_NR rows/workgroup (activation reused) ----
-  const GEMVQ_NR = 4;
+  const GEMVQ_NR = 8;
   const GEMVQ_WGSL = `
 enable f16;
 enable subgroups;
