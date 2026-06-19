@@ -1181,6 +1181,18 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     staging.unmap(); staging.destroy();
     return v;
   }
+  // Read `count` u32 starting at element idx — ONE mapAsync for the whole batch.
+  async function readU32Range(buf, idx, count) {
+    const bytes = count * 4;
+    const staging = E.createBuffer(bytes, U.COPY_DST | U.MAP_READ, 'rdrange');
+    const enc = E.device().createCommandEncoder();
+    enc.copyBufferToBuffer(buf, idx * 4, staging, 0, bytes);
+    E.device().queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap(); staging.destroy();
+    return out;
+  }
   // Debug: full logits readback (call right after a forward, before the next one).
   async function readLogits() { return E.readF32(_scr.logits, CONFIG.vocab); }
 
@@ -1190,27 +1202,31 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // (CPU encode, no drain wait) BEFORE reading the current token, so encode(N+1)
   // overlaps GPU-run(N) — un-doing the serialization batching introduced.
   const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
+  const GEN_BATCH = 8;   // tokens generated per GPU-resident batch (1 readback per batch)
+  // Batched GPU-resident greedy decode. Submit GEN_BATCH chained forwards back to
+  // back (no readback between — they chain through _tokHist on the GPU), so the K
+  // CPU encodes overlap the K GPU runs, then read all K tokens in ONE mapAsync.
+  // Removes the per-token readback sync that was capping the pipeline.
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     await loadModel({});
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     const L = ids.length;
-    let tok = await forward(ids, 0);            // prefill → _tokHist[L]=token0, returns token0
+    const tok0 = await forward(ids, 0);          // prefill → _tokHist[L]=token0
     const outIds = []; let pos = L;
-    // prime: submit the forward that consumes _tokHist[pos]=tok and produces _tokHist[pos+1]
-    let pending = maxTokens > 0 && !STOP(tok) && (pos + 1 < MAX_SEQ);
-    if (pending) await forward(null, pos, { chain: true, submitOnly: true });
-    for (let step = 0; step < maxTokens; step++) {
+    const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
+    if (!emit(tok0)) return TOK.decode(outIds);
+    while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
       if (signal && signal.aborted) break;
-      if (STOP(tok)) break;
-      outIds.push(tok);
-      if (onToken) { try { onToken(TOK.decode([tok])); } catch (_) {} }
-      if (!pending) break;
-      // Submit the FOLLOWING forward first — its CPU encode overlaps the GPU run of
-      // the forward we're about to read. Then read the current token.
-      const cont = (step + 1 < maxTokens) && (pos + 2 < MAX_SEQ);
-      if (cont) await forward(null, pos + 1, { chain: true, submitOnly: true });
-      tok = await readU32At(_tokHist, pos + 1);
-      pos++; pending = cont;
+      const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
+      if (K <= 0) break;
+      // K chained forwards, GPU-resident: forward(pos+k) reads _tokHist[pos+k],
+      // writes _tokHist[pos+k+1]. submitOnly → CPU encodes ahead while GPU runs.
+      for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
+      const toks = await readU32Range(_tokHist, pos + 1, K);   // one readback for the batch
+      pos += K;
+      let brk = false;
+      for (let k = 0; k < K; k++) { if (!emit(toks[k]) || outIds.length >= maxTokens) { brk = true; break; } }
+      if (brk) break;
     }
     return TOK.decode(outIds);
   }
