@@ -247,7 +247,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const GEMVQ_WGSL = `
 enable f16;
 enable subgroups;
-struct D { N:u32, K:u32, _a:u32, _b:u32 };
+struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused residual)
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [K/4]
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles
 @group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/QGROUP] scales
@@ -289,13 +289,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if (row < d.N) {
       let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
       for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
-      y[row] = t;
+      y[row] = select(0.0, y[row], d.acc != 0u) + t;
     }
   }
 }`;
-  function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K) {
+  function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
     const pipe = E.getPipeline('q3.gemvQ', GEMVQ_WGSL);
-    const d = uniform(new Uint32Array([N, K, 0, 0]));
+    const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
     const nWG = Math.ceil(N / GEMVQ_NR);
     const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
@@ -305,7 +305,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const MATVECQ_WGSL = `
 enable f16;
 enable subgroups;
-struct D { T:u32, N:u32, K:u32, tBase:u32 };
+struct D { T:u32, N:u32, K:u32, tBase:u32, acc:u32, _p0:u32, _p1:u32, _p2:u32 };  // acc=1 → y += result
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [(tBase+t)*K/4 + ...]
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;
 @group(0) @binding(2) var<storage, read>       sc : array<f16>;
@@ -346,22 +346,24 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   if (lid.x < T) {
     let t = lid.x; let nsg=(${MATVEC_WG}u+sgs-1u)/sgs; var tot:f32=0.0;
     for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[t*${MATVEC_WG}u + i]; }
-    y[(d.tBase + t)*d.N + n] = tot;
+    let idx = (d.tBase + t)*d.N + n;
+    y[idx] = select(0.0, y[idx], d.acc != 0u) + tot;
   }
 }`;
-  function matvecQ(xBuf, packBuf, scBuf, yBuf, T, N, K, tBase) {
+  function matvecQ(xBuf, packBuf, scBuf, yBuf, T, N, K, tBase, acc) {
     const pipe = E.getPipeline('q3.matvecQ', MATVECQ_WGSL);
-    const d = uniform(new Uint32Array([T, N, K, tBase || 0]));
+    const d = uniform(new Uint32Array([T, N, K, tBase || 0, acc ? 1 : 0, 0, 0, 0]));
     const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
     return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
   }
 
-  // Router for the int4 weight path. wrec = { pack, scales, N, K }.
-  async function linearQ(xBuf, wrec, yBuf, T, N, K) {
-    if (T === 1) return gemvQ(xBuf, wrec.pack, wrec.scales, yBuf, N, K);
+  // Router for the int4 weight path. wrec = { pack, scales, N, K }. acc=true →
+  // y += result (fused residual add, saves a separate addInPlace pass).
+  async function linearQ(xBuf, wrec, yBuf, T, N, K, acc) {
+    if (T === 1) return gemvQ(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
     for (let t0 = 0; t0 < T; t0 += MATVEC_MAXT) {
       const tc = Math.min(MATVEC_MAXT, T - t0);
-      await matvecQ(xBuf, wrec.pack, wrec.scales, yBuf, tc, N, K, t0);
+      await matvecQ(xBuf, wrec.pack, wrec.scales, yBuf, tc, N, K, t0, acc);
     }
   }
 
@@ -1128,14 +1130,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
       copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
       await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
-      await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
-      await addInPlace(s.x, s.oproj, T * H);
+      await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
       await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
       await linearQ(s.normed, Wq(p + 'mlp.up_proj.weight'), s.up, T, I, H);
       await swiglu(s.gate, s.up, s.swi, T * I);
-      await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.down, T, H, I);
-      await addInPlace(s.x, s.down, T * H);
+      await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);              // fused residual: x += down_proj
     }
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
     // last token row → its own [H] buffer, then lm_head
