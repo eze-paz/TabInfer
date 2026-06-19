@@ -387,7 +387,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // ============================================================
   const EMBED_WGSL = `
 enable f16;
-struct P { T:u32, H:u32, _a:u32, _b:u32 };
+struct P { T:u32, H:u32, idOff:u32, _b:u32 };   // reads ids[idOff + t] (decode: idOff=posBase into the GPU token history)
 @group(0) @binding(0) var<storage, read>       ids   : array<u32>;
 @group(0) @binding(1) var<storage, read>       embed : array<f16>;
 @group(0) @binding(2) var<storage, read_write> y     : array<f32>;
@@ -396,11 +396,11 @@ struct P { T:u32, H:u32, _a:u32, _b:u32 };
 fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   let idx=gid.x; let total=p.T*p.H; if(idx>=total){return;}
   let t=idx/p.H; let h=idx%p.H;
-  y[idx]=f32(embed[ids[t]*p.H + h]);
+  y[idx]=f32(embed[ids[p.idOff + t]*p.H + h]);
 }`;
-  function embedGather(idsBuf, embedBuf, yBuf, T, H) {
+  function embedGather(idsBuf, embedBuf, yBuf, T, H, idOff) {
     const pipe = E.getPipeline('q3.embed', EMBED_WGSL);
-    const p = uniform(new Uint32Array([T, H, 0, 0]));
+    const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
     return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1]);
   }
 
@@ -582,7 +582,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){r
   // ============================================================
   const ARGMAX_WG = 256;
   const ARGMAX_WGSL = `
-struct P { n:u32, _a:u32, _b:u32, _c:u32 };
+struct P { n:u32, outPos:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       logits : array<f32>;
 @group(0) @binding(1) var<storage, read_write> outIdx : array<u32>;
 @group(0) @binding(2) var<uniform>             p      : P;
@@ -596,11 +596,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   sv[lid.x] = bv; si[lid.x] = bi; workgroupBarrier();
   var s = ${ARGMAX_WG}u/2u;
   loop { if (s==0u) { break; } if (lid.x < s) { if (sv[lid.x+s] > sv[lid.x]) { sv[lid.x]=sv[lid.x+s]; si[lid.x]=si[lid.x+s]; } } workgroupBarrier(); s=s/2u; }
-  if (lid.x==0u) { outIdx[0] = si[0]; }
+  if (lid.x==0u) { outIdx[p.outPos] = si[0]; }   // write into the GPU token history at outPos (next position)
 }`;
-  function argmaxKernel(logitsBuf, outBuf, N) {
+  function argmaxKernel(logitsBuf, outBuf, N, outPos) {
     const pipe = E.getPipeline('q3.argmax', ARGMAX_WGSL);
-    const p = uniform(new Uint32Array([N, 0, 0, 0]));
+    const p = uniform(new Uint32Array([N, outPos || 0, 0, 0]));
     return E.dispatch(pipe, [logitsBuf, outBuf, p], [1, 1, 1]);
   }
 
@@ -1077,6 +1077,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _scr = null;    // scratch buffers, sized to _scrT rows
   let _scrT = 0;
   let _idsBuf = null, _idsCap = 0;
+  let _tokHist = null;   // GPU token history: argmax of pos P writes [P+1]; decode embed at pos P reads [P]. Enables GPU-resident chaining (no per-token CPU readback in the loop).
 
   function scrBuf(n, label) { return E.createBuffer(n * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, label); }
   function ensureKv() {
@@ -1085,6 +1086,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const per = MAX_SEQ * nKvHeads * headDim;
     _kv = [];
     for (let l = 0; l < numLayers; l++) _kv.push({ k: scrBuf(per, 'k' + l), v: scrBuf(per, 'v' + l) });
+    _tokHist = E.createBuffer(MAX_SEQ * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'tokHist');
   }
   function ensureScratch(T) {
     if (_scr && _scrT >= T) return;
@@ -1112,18 +1114,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   // Run the transformer over T tokens at absolute positions [posBase, posBase+T).
   // Updates the KV cache; returns logits (Float32Array[vocab]) for the LAST token.
-  async function forward(idsArray, posBase) {
+  // chain=true: embed reads the GPU token-history at posBase (no CPU-set ids) so
+  //   the loop runs GPU-resident. submitOnly=true: submit the batch but DON'T await
+  //   the drain or read back — lets the caller pipeline (encode N+1 while GPU runs N).
+  async function forward(idsArray, posBase, opts) {
+    const chain = !!(opts && opts.chain), submitOnly = !!(opts && opts.submitOnly);
     const _t0 = _PERF ? performance.now() : 0;
     const C = CONFIG, H = C.hidden, nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim, I = C.intermediate;
-    const T = idsArray.length, S = posBase + T;
+    const T = chain ? 1 : idsArray.length, S = posBase + T;
     ensureKv(); ensureScratch(T);
     const W = (n) => _weights[n].buf;      // f16 weight buffer (embed/norms)
     const Wq = (n) => _weights[n];         // int4 record (projections/lm_head)
     const s = _scr;
-    const ids = setIds(idsArray);
+    // embed source: prefill/normal → CPU-set ids buffer; chain → GPU token history at posBase.
+    const embIds = chain ? _tokHist : setIds(idsArray);
+    const embOff = chain ? posBase : 0;
     uniformReset();   // pooled uniforms get stable buffers per call-site → bind-group cache hits
     E.beginBatch();   // record the whole forward into ONE command buffer (1 submit vs ~364)
-    await embedGather(ids, W('model.embed_tokens.weight'), s.x, T, H);
+    await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
@@ -1149,21 +1157,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // last token row → its own [H] buffer, then lm_head
     E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
     await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
-    // GPU-side greedy argmax → read back only the 4-byte token id (not 600KB logits).
-    await argmaxKernel(s.logits, s.tok, C.vocab);
+    // GPU-side greedy argmax → write the predicted token straight into the token
+    // history at the NEXT position (posBase+T), so the next forward's embed reads it.
+    await argmaxKernel(s.logits, _tokHist, C.vocab, posBase + T);
     const _t1 = _PERF ? performance.now() : 0;   // all commands recorded
-    await E.endBatch();                           // single submit + GPU drain
+    const drain = E.endBatch();                   // single submit (returns the drain promise)
+    if (submitOnly) return undefined;             // pipelined: caller doesn't wait here
+    await drain;
     const _t2 = _PERF ? performance.now() : 0;
-    const tok = await readU32(s.tok);            // copy + mapAsync round-trip
+    const tok = await readU32At(_tokHist, posBase + T);   // the token just predicted
     if (_PERF) _perfData = { encode_ms: +(_t1 - _t0).toFixed(2), gpu_drain_ms: +(_t2 - _t1).toFixed(2), map_ms: +(performance.now() - _t2).toFixed(2) };
     return tok;
   }
 
-  // Read 1 u32 from a GPU buffer.
-  async function readU32(buf) {
+  // Read 1 u32 from a GPU buffer at element index idx (waits for the queue).
+  async function readU32At(buf, idx) {
     const staging = E.createBuffer(4, U.COPY_DST | U.MAP_READ, 'rdu32');
     const enc = E.device().createCommandEncoder();
-    enc.copyBufferToBuffer(buf, 0, staging, 0, 4);
+    enc.copyBufferToBuffer(buf, (idx || 0) * 4, staging, 0, 4);
     E.device().queue.submit([enc.finish()]);
     await staging.mapAsync(GPUMapMode.READ);
     const v = new Uint32Array(staging.getMappedRange())[0];
@@ -1173,20 +1184,33 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Debug: full logits readback (call right after a forward, before the next one).
   async function readLogits() { return E.readF32(_scr.logits, CONFIG.vocab); }
 
-  // Greedy generate. forward() returns the next token id (argmax done on GPU).
-  // onToken(text) streams decoded pieces.
+  // Greedy generate, PIPELINED + GPU-resident. The decode loop chains through the
+  // GPU token history (argmax of pos P writes _tokHist[P+1]; embed at P+1 reads it),
+  // so the CPU never round-trips the token mid-loop. We submit the next forward
+  // (CPU encode, no drain wait) BEFORE reading the current token, so encode(N+1)
+  // overlaps GPU-run(N) — un-doing the serialization batching introduced.
+  const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     await loadModel({});
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
-    let next = await forward(ids, 0);
-    let pos = ids.length; const outIds = [];
+    const L = ids.length;
+    let tok = await forward(ids, 0);            // prefill → _tokHist[L]=token0, returns token0
+    const outIds = []; let pos = L;
+    // prime: submit the forward that consumes _tokHist[pos]=tok and produces _tokHist[pos+1]
+    let pending = maxTokens > 0 && !STOP(tok) && (pos + 1 < MAX_SEQ);
+    if (pending) await forward(null, pos, { chain: true, submitOnly: true });
     for (let step = 0; step < maxTokens; step++) {
       if (signal && signal.aborted) break;
-      if (next === SPECIAL.im_end || next === SPECIAL.endoftext) break;
-      outIds.push(next);
-      if (onToken) { try { onToken(TOK.decode([next])); } catch (_) {} }
-      if (pos >= MAX_SEQ) break;
-      next = await forward([next], pos); pos++;
+      if (STOP(tok)) break;
+      outIds.push(tok);
+      if (onToken) { try { onToken(TOK.decode([tok])); } catch (_) {} }
+      if (!pending) break;
+      // Submit the FOLLOWING forward first — its CPU encode overlaps the GPU run of
+      // the forward we're about to read. Then read the current token.
+      const cont = (step + 1 < maxTokens) && (pos + 2 < MAX_SEQ);
+      if (cont) await forward(null, pos + 1, { chain: true, submitOnly: true });
+      tok = await readU32At(_tokHist, pos + 1);
+      pos++; pending = cont;
     }
     return TOK.decode(outIds);
   }
