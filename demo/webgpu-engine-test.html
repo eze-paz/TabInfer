@@ -28,8 +28,12 @@
 <div>
   <button id="run">Run all</button>
   <button id="runCaps">Capabilities only</button>
+  <button id="runKernels">Run Qwen3 kernel tests</button>
   <span id="status" class="hi"></span>
 </div>
+
+<h2 style="font-size:0.95rem; color:#8b949e;">Qwen3 kernel correctness (vs CPU reference)</h2>
+<pre id="kernels">— click "Run Qwen3 kernel tests"</pre>
 
 <h2 style="font-size:0.95rem; color:#8b949e;">Device capabilities</h2>
 <div id="flags"></div>
@@ -41,8 +45,9 @@
 <h2 style="font-size:0.95rem; color:#8b949e;">GEMM throughput (portable tiled f32 — baseline, no subgroup ops yet)</h2>
 <pre id="bench">—</pre>
 
-<!-- Load the actual engine module from the repo so we test the real code. -->
+<!-- Load the actual engine + model modules from the repo so we test the real code. -->
 <script src="../modules/webgpu-engine.js"></script>
+<script src="../modules/webgpu-qwen3.js"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -102,6 +107,22 @@
       $('run').disabled = $('runCaps').disabled = false;
     }
   }
+
+  $('runKernels').addEventListener('click', async () => {
+    $('runKernels').disabled = true;
+    set('status', 'running Qwen3 kernel tests…', 'hi');
+    try {
+      const rows = await window.SandpieQwen3.selfTestKernels();
+      const allOk = rows.every(r => r.ok);
+      $('kernels').innerHTML = rows.map(r =>
+        `<span class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'PASS' : 'FAIL'}</span>  ${r.name}  <span style="color:#6e7681">err=${r.err.toExponential(2)}</span>`
+      ).join('\n');
+      set('status', allOk ? 'all kernels PASS' : 'some kernels FAILED', allOk ? 'ok' : 'bad');
+    } catch (e) {
+      set('kernels', 'ERROR: ' + (e && e.message || e), 'bad'); console.error(e);
+      set('status', 'kernel test error', 'bad');
+    } finally { $('runKernels').disabled = false; }
+  });
 
   $('run').addEventListener('click', runAll);
   $('runCaps').addEventListener('click', async () => {
