@@ -297,41 +297,50 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return E.dispatch(pipe, [gateBuf, upBuf, yBuf, p], [Math.ceil(n/64), 1, 1]);
   }
 
-  // ----- FUSED gate+up+SwiGLU for decode (T==1): swi[I] = silu(gate·x)*(up·x) -----
-  // Collapses 3 decode dispatches (gemv gate, gemv up, swiglu) into 1. The GPU is
-  // dispatch-overhead-bound at decode (measured ~0.29ms/dispatch launch), so cutting
-  // the count is the lever. One workgroup per output row i; threads stride H computing
-  // BOTH dot products, then shared-mem reduce both and apply silu*mul.
-  const GUS_WG = 64;
-  const GATEUP_WGSL = `
+  // ----- FUSED q+k+v projections for decode (T==1) -----
+  // Collapses 3 decode dispatches (gemv q, gemv k, gemv v) into 1. All three read
+  // the SAME input x[H]; outputs are the concatenated rows [q | k | v]. One
+  // workgroup per output row r; r<Nq → q-proj, r<Nq+Nk → k-proj, else v-proj
+  // (branch is uniform across the workgroup, so no divergence). Threads stride H,
+  // shared-mem reduce, thread 0 writes to the right output buffer.
+  const QKV_WG = 64;
+  const QKV_WGSL = `
 enable f16;
-struct D { I:u32, H:u32, _a:u32, _b:u32 };
-@group(0) @binding(0) var<storage, read>       x     : array<f32>;
-@group(0) @binding(1) var<storage, read>       gateW : array<f16>;
-@group(0) @binding(2) var<storage, read>       upW   : array<f16>;
-@group(0) @binding(3) var<storage, read_write> swi   : array<f32>;
-@group(0) @binding(4) var<uniform>             d     : D;
-var<workgroup> rg : array<f32, ${GUS_WG}>;
-var<workgroup> ru : array<f32, ${GUS_WG}>;
-@compute @workgroup_size(${GUS_WG},1,1)
+struct D { Nq:u32, Nk:u32, Nv:u32, H:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<f32>;
+@group(0) @binding(1) var<storage, read>       qW : array<f16>;
+@group(0) @binding(2) var<storage, read>       kW : array<f16>;
+@group(0) @binding(3) var<storage, read>       vW : array<f16>;
+@group(0) @binding(4) var<storage, read_write> qo : array<f32>;
+@group(0) @binding(5) var<storage, read_write> ko : array<f32>;
+@group(0) @binding(6) var<storage, read_write> vo : array<f32>;
+@group(0) @binding(7) var<uniform>             d  : D;
+var<workgroup> red : array<f32, ${QKV_WG}>;
+@compute @workgroup_size(${QKV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(num_workgroups) nwg:vec3<u32>) {
-  let i = wg.x + wg.y * nwg.x;
-  if (i >= d.I) { return; }
-  let H = d.H; let wbase = i*H;
-  var g : f32 = 0.0; var u : f32 = 0.0;
-  var k = lid.x;
-  loop { if (k >= H) { break; } let xv = x[k]; g = g + xv*f32(gateW[wbase+k]); u = u + xv*f32(upW[wbase+k]); k = k + ${GUS_WG}u; }
-  rg[lid.x] = g; ru[lid.x] = u; workgroupBarrier();
-  var s = ${GUS_WG}u/2u;
-  loop { if (s==0u) { break; } if (lid.x<s) { rg[lid.x]=rg[lid.x]+rg[lid.x+s]; ru[lid.x]=ru[lid.x]+ru[lid.x+s]; } workgroupBarrier(); s=s/2u; }
-  if (lid.x==0u) { let gg=rg[0]; let silu=gg/(1.0+exp(-gg)); swi[i]=silu*ru[0]; }
+  let r = wg.x + wg.y * nwg.x;
+  let H = d.H; let nqk = d.Nq + d.Nk; let total = nqk + d.Nv;
+  if (r >= total) { return; }
+  var acc : f32 = 0.0; var k = lid.x;
+  if (r < d.Nq) { let wb = r*H; loop { if (k>=H){break;} acc=acc+x[k]*f32(qW[wb+k]); k=k+${QKV_WG}u; } }
+  else if (r < nqk) { let wb=(r-d.Nq)*H; loop { if (k>=H){break;} acc=acc+x[k]*f32(kW[wb+k]); k=k+${QKV_WG}u; } }
+  else { let wb=(r-nqk)*H; loop { if (k>=H){break;} acc=acc+x[k]*f32(vW[wb+k]); k=k+${QKV_WG}u; } }
+  red[lid.x]=acc; workgroupBarrier();
+  var s = ${QKV_WG}u/2u;
+  loop { if (s==0u){break;} if (lid.x<s){red[lid.x]=red[lid.x]+red[lid.x+s];} workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u) {
+    if (r < d.Nq) { qo[r]=red[0]; }
+    else if (r < nqk) { ko[r-d.Nq]=red[0]; }
+    else { vo[r-nqk]=red[0]; }
+  }
 }`;
-  function gateUpSilu(xBuf, gateWBuf, upWBuf, swiBuf, I, H) {
-    const pipe = E.getPipeline('q3.gateup', GATEUP_WGSL);
-    const d = uniform(new Uint32Array([I, H, 0, 0]));
-    const gx = Math.min(I, 65535), gy = Math.ceil(I / gx);
-    return E.dispatch(pipe, [xBuf, gateWBuf, upWBuf, swiBuf, d], [gx, gy, 1]);
+  function qkvProj(xBuf, qWBuf, kWBuf, vWBuf, qBuf, kBuf, vBuf, Nq, Nk, Nv, H) {
+    const pipe = E.getPipeline('q3.qkv', QKV_WGSL);
+    const d = uniform(new Uint32Array([Nq, Nk, Nv, H]));
+    const total = Nq + Nk + Nv;
+    const gx = Math.min(total, 65535), gy = Math.ceil(total / gx);
+    return E.dispatch(pipe, [xBuf, qWBuf, kWBuf, vWBuf, qBuf, kBuf, vBuf, d], [gx, gy, 1]);
   }
 
   // ============================================================
@@ -515,20 +524,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       check('gemv', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
     }
-    // --- gateUpSilu (fused gate+up+swiglu, T=1) vs CPU ---
+    // --- qkvProj (fused q+k+v, T=1) vs CPU ---
     {
-      const I=160,H=320;
-      const x=new Float32Array(H),gW=new Float32Array(I*H),uW=new Float32Array(I*H);
-      for(let i=0;i<H;i++)x[i]=Math.sin(i*0.17);
-      for(let i=0;i<I*H;i++){gW[i]=Math.cos(i*0.011);uW[i]=Math.sin(i*0.009);}
-      const gWR=roundF16(gW), uWR=roundF16(uW);
-      const xb=f32buf(x),gb=f16buf(gW),ub=f16buf(uW),yb=E.createBuffer(I*4,ST(),'y');
-      await gateUpSilu(xb,gb,ub,yb,I,H);
-      const got=await E.readF32(yb,I);
-      const y=new Float32Array(I);
-      for(let i=0;i<I;i++){let g=0,u=0;for(let k=0;k<H;k++){g+=x[k]*gWR[i*H+k];u+=x[k]*uWR[i*H+k];}const silu=g/(1+Math.exp(-g));y[i]=silu*u;}
-      check('gateUpSilu', maxAbs(got,y));
-      [xb,gb,ub,yb].forEach(b=>b.destroy());
+      const Nq=96,Nk=48,Nv=48,H=256;
+      const x=new Float32Array(H),qW=new Float32Array(Nq*H),kW=new Float32Array(Nk*H),vW=new Float32Array(Nv*H);
+      for(let i=0;i<H;i++)x[i]=Math.sin(i*0.13);
+      for(let i=0;i<qW.length;i++)qW[i]=Math.cos(i*0.011);
+      for(let i=0;i<kW.length;i++)kW[i]=Math.sin(i*0.007);
+      for(let i=0;i<vW.length;i++)vW[i]=Math.cos(i*0.005);
+      const qWR=roundF16(qW),kWR=roundF16(kW),vWR=roundF16(vW);
+      const xb=f32buf(x),qb=f16buf(qW),kb=f16buf(kW),vb=f16buf(vW);
+      const qo=E.createBuffer(Nq*4,ST(),'qo'),ko=E.createBuffer(Nk*4,ST(),'ko'),vo=E.createBuffer(Nv*4,ST(),'vo');
+      await qkvProj(xb,qb,kb,vb,qo,ko,vo,Nq,Nk,Nv,H);
+      const gq=await E.readF32(qo,Nq),gk=await E.readF32(ko,Nk),gv=await E.readF32(vo,Nv);
+      const cq=new Float32Array(Nq),ck=new Float32Array(Nk),cv=new Float32Array(Nv);
+      for(let n=0;n<Nq;n++){let a=0;for(let k=0;k<H;k++)a+=x[k]*qWR[n*H+k];cq[n]=a;}
+      for(let n=0;n<Nk;n++){let a=0;for(let k=0;k<H;k++)a+=x[k]*kWR[n*H+k];ck[n]=a;}
+      for(let n=0;n<Nv;n++){let a=0;for(let k=0;k<H;k++)a+=x[k]*vWR[n*H+k];cv[n]=a;}
+      check('qkvProj', Math.max(maxAbs(gq,cq),maxAbs(gk,ck),maxAbs(gv,cv)));
+      [xb,qb,kb,vb,qo,ko,vo].forEach(b=>b.destroy());
     }
     // --- argmax ---
     {
@@ -770,6 +784,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Forward graph + KV cache + generate
   // ============================================================
   const MAX_SEQ = 2048;
+  let _QKV_FUSE = true;   // decode: fuse q+k+v into one dispatch (toggle for A/B)
   let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
   let _scr = null;    // scratch buffers, sized to _scrT rows
   let _scrT = 0;
@@ -822,9 +837,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linear(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
-      await linear(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
-      await linear(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+      if (T === 1 && _QKV_FUSE) {
+        // Decode: one fused dispatch for all three projections (shared input x).
+        await qkvProj(s.normed, W(p + 'self_attn.q_proj.weight'), W(p + 'self_attn.k_proj.weight'), W(p + 'self_attn.v_proj.weight'),
+          s.q, s.k, s.v, nHq * hd, nKv * hd, nKv * hd, H);
+      } else {
+        await linear(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+        await linear(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+        await linear(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+      }
       // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
       // read and a read_write binding is undefined behavior in WebGPU (miscompiles
       // on Intel). Write rope output to a separate buffer.
@@ -836,14 +857,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await linear(s.attn, W(p + 'self_attn.o_proj.weight'), s.oproj, T, H, nHq * hd);
       await addInPlace(s.x, s.oproj, T * H);
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      if (T === 1) {
-        // Decode: one fused dispatch instead of gate-gemv + up-gemv + swiglu.
-        await gateUpSilu(s.normed, W(p + 'mlp.gate_proj.weight'), W(p + 'mlp.up_proj.weight'), s.swi, I, H);
-      } else {
-        await linear(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
-        await linear(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
-        await swiglu(s.gate, s.up, s.swi, T * I);
-      }
+      await linear(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+      await linear(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+      await swiglu(s.gate, s.up, s.swi, T * I);
       await linear(s.swi, W(p + 'mlp.down_proj.weight'), s.down, T, H, I);
       await addInPlace(s.x, s.down, T * H);
     }
@@ -890,9 +906,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   return {
     CONFIG,
-    rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, gateUpSilu, addInPlace,
+    rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, qkvProj, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
+    _setQkvFuse: (b) => { _QKV_FUSE = !!b; },
     _dbg: {
       weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
