@@ -418,23 +418,23 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // ============================================================
   const DELTA_DIM = 128;   // key_head_dim == value_head_dim
   const DELTA_WGSL = `
-struct P { nHeads:u32, dim:u32, _a:u32, _b:u32 };
-@group(0) @binding(0) var<storage, read>       q  : array<f32>;   // [nHeads*dim] L2-normed
-@group(0) @binding(1) var<storage, read>       k  : array<f32>;   // [nHeads*dim] L2-normed
-@group(0) @binding(2) var<storage, read>       v  : array<f32>;   // [nHeads*dim]
-@group(0) @binding(3) var<storage, read>       gb : array<f32>;   // [nHeads*2]: expg, beta per head
+struct P { nHeads:u32, dim:u32, tOff:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       q  : array<f32>;   // [T*nHeads*dim] L2-normed
+@group(0) @binding(1) var<storage, read>       k  : array<f32>;   // [T*nHeads*dim] L2-normed
+@group(0) @binding(2) var<storage, read>       v  : array<f32>;   // [T*nHeads*dim]
+@group(0) @binding(3) var<storage, read>       gb : array<f32>;   // [T*nHeads*2]: expg, beta per head
 @group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] layout [head][key][val] (val contiguous → coalesced across threads)
-@group(0) @binding(5) var<storage, read_write> outv : array<f32>; // [nHeads*dim]
+@group(0) @binding(5) var<storage, read_write> outv : array<f32>; // [T*nHeads*dim]
 @group(0) @binding(6) var<uniform>             p  : P;
 var<workgroup> ksh : array<f32, ${DELTA_DIM}>;
 var<workgroup> qsh : array<f32, ${DELTA_DIM}>;
 @compute @workgroup_size(${DELTA_DIM},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let h = wg.x; let vi = lid.x; let dim = p.dim; let base = h*dim;
+  let h = wg.x; let vi = lid.x; let dim = p.dim; let th = p.tOff*p.nHeads + h; let base = th*dim;
   if (vi < dim) { ksh[vi] = k[base+vi]; qsh[vi] = q[base+vi]; }
   workgroupBarrier();
   if (vi >= dim) { return; }
-  let expg = gb[h*2u]; let beta = gb[h*2u + 1u];
+  let expg = gb[th*2u]; let beta = gb[th*2u + 1u];
   let sbase = h*dim*dim + vi;            // S[h][kk][vi] = S[sbase + kk*dim] — coalesced across vi
   var kv : f32 = 0.0;
   for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i]*expg; S[i] = s; kv = kv + s*ksh[kk]; }
@@ -443,9 +443,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i] + ksh[kk]*delta; S[i] = s; o = o + s*qsh[kk]; }
   outv[base+vi] = o;
 }`;
-  function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim) {
+  function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, tOff) {
     const pipe = E.getPipeline('q35.delta', DELTA_WGSL);
-    const p = uniform(new Uint32Array([nHeads, dim, 0, 0]));
+    const p = uniform(new Uint32Array([nHeads, dim, tOff || 0, 0]));
     return E.dispatch(pipe, [qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, p], [nHeads, 1, 1]);
   }
 
@@ -488,12 +488,42 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     const p = uniform(new Uint32Array([convDim, 0, 0, 0]));
     return E.dispatch(pipe, [xBuf, wBuf, biasBuf, stateBuf, outBuf, p], [Math.ceil(convDim / 64), 1, 1]);
   }
+  // BATCHED causal conv over T tokens (prefill): one thread per channel walks t=0..T-1
+  // with a sliding window seeded from `state` (the K-1 pre-chunk inputs), and writes the
+  // final K-1 inputs back to `state` so the following decode continues seamlessly.
+  const CONV_PREFILL_WGSL = `
+struct P { convDim:u32, T:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       x     : array<f32>;   // [T*convDim] inputs ([t][c])
+@group(0) @binding(1) var<storage, read>       w     : array<f32>;   // [convDim*K]
+@group(0) @binding(2) var<storage, read>       bias  : array<f32>;   // [convDim]
+@group(0) @binding(3) var<storage, read_write> state : array<f32>;   // [convDim*(K-1)] oldest first
+@group(0) @binding(4) var<storage, read_write> outv  : array<f32>;   // [T*convDim]
+@group(0) @binding(5) var<uniform>             p     : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let c = gid.x; if (c >= p.convDim) { return; }
+  let K = ${CONV_K}u; let Km1 = K - 1u; let sbase = c*Km1; let wbase = c*K;
+  var w0 = state[sbase]; var w1 = state[sbase+1u]; var w2 = state[sbase+2u];   // K-1==3, oldest..newest
+  for (var t:u32=0u; t<p.T; t=t+1u) {
+    let xt = x[t*p.convDim + c];
+    let acc = bias[c] + w[wbase]*w0 + w[wbase+1u]*w1 + w[wbase+2u]*w2 + w[wbase+3u]*xt;
+    outv[t*p.convDim + c] = acc / (1.0 + exp(-acc));   // SiLU
+    w0 = w1; w1 = w2; w2 = xt;                          // shift window
+  }
+  state[sbase] = w0; state[sbase+1u] = w1; state[sbase+2u] = w2;   // carry for next chunk/decode
+}`;
+  function conv1dPrefill(xBuf, wBuf, biasBuf, stateBuf, outBuf, convDim, T) {
+    const pipe = E.getPipeline('q35.convpf', CONV_PREFILL_WGSL);
+    const p = uniform(new Uint32Array([convDim, T, 0, 0]));
+    return E.dispatch(pipe, [xBuf, wBuf, biasBuf, stateBuf, outBuf, p], [Math.ceil(convDim / 64), 1, 1]);
+  }
 
   // ============================================================
   // Per-head L2 normalize: out[h][i] = x[h][i] / sqrt(Σ_i x[h][i]^2 + eps).
   // q and k are L2-normed per head before the DeltaNet recurrence.
   // One workgroup per head, ${DELTA_DIM} threads, shared-mem sum reduction.
   // ============================================================
+  // T-aware: wg.x = head, wg.y = token; buffers laid out [token][head][dim]. T=1 → identical.
   const L2_WGSL = `
 struct P { nHeads:u32, dim:u32, eps:f32, scale:f32 };
 @group(0) @binding(0) var<storage, read>       x   : array<f32>;
@@ -502,7 +532,7 @@ struct P { nHeads:u32, dim:u32, eps:f32, scale:f32 };
 var<workgroup> red : array<f32, ${DELTA_DIM}>;
 @compute @workgroup_size(${DELTA_DIM},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let h = wg.x; let i = lid.x; let dim = p.dim; let base = h*dim;
+  let h = wg.x; let i = lid.x; let dim = p.dim; let base = (wg.y*p.nHeads + h)*dim;
   let v = select(0.0, x[base+i], i < dim);
   red[i] = v*v;
   workgroupBarrier();
@@ -514,13 +544,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   let inv = (1.0 / sqrt(red[0] + p.eps)) * p.scale;
   outv[base+i] = x[base+i] * inv;
 }`;
-  function l2normHeads(inBuf, outBuf, nHeads, dim, eps, scale) {
+  function l2normHeads(inBuf, outBuf, nHeads, dim, eps, scale, T) {
     const pipe = E.getPipeline('q35.l2', L2_WGSL);
     const u = new Uint32Array(4); const du = new DataView(u.buffer);
     du.setUint32(0, nHeads, true); du.setUint32(4, dim, true);
     du.setFloat32(8, eps, true); du.setFloat32(12, scale == null ? 1.0 : scale, true);
     const p = uniform(u);
-    return E.dispatch(pipe, [inBuf, outBuf, p], [nHeads, 1, 1]);
+    return E.dispatch(pipe, [inBuf, outBuf, p], [nHeads, T || 1, 1]);
   }
 
   // ============================================================
@@ -530,28 +560,31 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Output gb[h*2]=expg=exp(g), gb[h*2+1]=beta. One thread per head.
   // softplus(x) = log(1+exp(x)), numerically stable via max(x,0)+log1p(exp(-|x|)).
   // ============================================================
-  const GBETA_WGSL = `
+    // T-aware: gid.y = token. a,b are per-token [T,nHeads]; A_log,dt_bias per-head [nHeads];
+  // gb out [T, nHeads*2]. T=1 → identical.
+const GBETA_WGSL = `
 struct P { nHeads:u32, _a:u32, _b:u32, _c:u32 };
-@group(0) @binding(0) var<storage, read>       a      : array<f32>;   // [nHeads] in_proj_a
-@group(0) @binding(1) var<storage, read>       b      : array<f32>;   // [nHeads] in_proj_b
+@group(0) @binding(0) var<storage, read>       a      : array<f32>;   // [T*nHeads] in_proj_a
+@group(0) @binding(1) var<storage, read>       b      : array<f32>;   // [T*nHeads] in_proj_b
 @group(0) @binding(2) var<storage, read>       A_log  : array<f32>;   // [nHeads]
 @group(0) @binding(3) var<storage, read>       dt_bias: array<f32>;   // [nHeads]
-@group(0) @binding(4) var<storage, read_write> gb     : array<f32>;   // [nHeads*2]
+@group(0) @binding(4) var<storage, read_write> gb     : array<f32>;   // [T*nHeads*2]
 @group(0) @binding(5) var<uniform>             p      : P;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
   let h = gid.x; if (h >= p.nHeads) { return; }
-  let beta = 1.0 / (1.0 + exp(-b[h]));
-  let z = a[h] + dt_bias[h];
+  let th = gid.y*p.nHeads + h;
+  let beta = 1.0 / (1.0 + exp(-b[th]));
+  let z = a[th] + dt_bias[h];
   let sp = max(z, 0.0) + log(1.0 + exp(-abs(z)));   // softplus, stable
   let g = -exp(A_log[h]) * sp;
-  gb[h*2u]      = exp(g);
-  gb[h*2u + 1u] = beta;
+  gb[th*2u]      = exp(g);
+  gb[th*2u + 1u] = beta;
 }`;
-  function gbeta(aBuf, bBuf, ALogBuf, dtBiasBuf, gbBuf, nHeads) {
+  function gbeta(aBuf, bBuf, ALogBuf, dtBiasBuf, gbBuf, nHeads, T) {
     const pipe = E.getPipeline('q35.gbeta', GBETA_WGSL);
     const p = uniform(new Uint32Array([nHeads, 0, 0, 0]));
-    return E.dispatch(pipe, [aBuf, bBuf, ALogBuf, dtBiasBuf, gbBuf, p], [Math.ceil(nHeads / 64), 1, 1]);
+    return E.dispatch(pipe, [aBuf, bBuf, ALogBuf, dtBiasBuf, gbBuf, p], [Math.ceil(nHeads / 64), T || 1, 1]);
   }
 
   // ============================================================
@@ -571,7 +604,7 @@ struct P { nHeads:u32, dim:u32, eps:f32, _a:u32 };
 var<workgroup> red : array<f32, ${DELTA_DIM}>;
 @compute @workgroup_size(${DELTA_DIM},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let h = wg.x; let i = lid.x; let dim = p.dim; let base = h*dim;
+  let h = wg.x; let i = lid.x; let dim = p.dim; let base = (wg.y*p.nHeads + h)*dim;   // wg.y = token
   let xv = select(0.0, x[base+i], i < dim);
   red[i] = xv*xv;                       // variance from UN-gated x
   workgroupBarrier();
@@ -584,12 +617,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   let zg = z[base+i]; let sz = zg / (1.0 + exp(-zg));   // silu(z), applied LAST
   outv[base+i] = xv * inv * f32(w[i]) * sz;
 }`;
-  function gatedRMSNorm(xBuf, zBuf, wBuf, outBuf, nHeads, dim, eps) {
+  function gatedRMSNorm(xBuf, zBuf, wBuf, outBuf, nHeads, dim, eps, T) {
     const pipe = E.getPipeline('q35.grms', GRMS_WGSL);
     const u = new Uint32Array(4); const du = new DataView(u.buffer);
     du.setUint32(0, nHeads, true); du.setUint32(4, dim, true); du.setFloat32(8, eps, true);
     const p = uniform(u);
-    return E.dispatch(pipe, [xBuf, zBuf, wBuf, outBuf, p], [nHeads, 1, 1]);
+    return E.dispatch(pipe, [xBuf, zBuf, wBuf, outBuf, p], [nHeads, T || 1, 1]);
   }
 
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
@@ -827,23 +860,24 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // the gate half straight from qproj (stride 2*hd, offset hd) and applies it.
   //   gated[h*hd+d] = attn[h*hd+d] * sigmoid(qproj[h*2*hd + hd + d])
   // ============================================================
-  const GATE35_WGSL = `
-struct P { nH:u32, hd:u32, _a:u32, _b:u32 };
-@group(0) @binding(0) var<storage, read>       attn  : array<f32>;   // [nH*hd]
-@group(0) @binding(1) var<storage, read>       qproj : array<f32>;   // [nH*2*hd]
-@group(0) @binding(2) var<storage, read_write> outv  : array<f32>;   // [nH*hd]
+    // T-aware: index covers [T*nH*hd]; attn/out laid [T,nH*hd], qproj laid [T,nH*2*hd].
+const GATE35_WGSL = `
+struct P { nH:u32, hd:u32, T:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       attn  : array<f32>;   // [T*nH*hd]
+@group(0) @binding(1) var<storage, read>       qproj : array<f32>;   // [T*nH*2*hd]
+@group(0) @binding(2) var<storage, read_write> outv  : array<f32>;   // [T*nH*hd]
 @group(0) @binding(3) var<uniform>             p     : P;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) gid:vec3<u32>){
-  let i=gid.x; let total=p.nH*p.hd; if(i>=total){return;}
-  let h=i/p.hd; let d=i%p.hd;
-  let g=qproj[h*2u*p.hd + p.hd + d];
+  let i=gid.x; let per=p.nH*p.hd; let total=p.T*per; if(i>=total){return;}
+  let t=i/per; let r=i%per; let h=r/p.hd; let d=r%p.hd;
+  let g=qproj[t*p.nH*2u*p.hd + h*2u*p.hd + p.hd + d];
   outv[i] = attn[i] * (1.0/(1.0+exp(-g)));
 }`;
-  function applyGate35(attnBuf, qprojBuf, outBuf, nH, hd) {
+  function applyGate35(attnBuf, qprojBuf, outBuf, nH, hd, T) {
     const pipe = E.getPipeline('q35.gate', GATE35_WGSL);
-    const p = uniform(new Uint32Array([nH, hd, 0, 0]));
-    return E.dispatch(pipe, [attnBuf, qprojBuf, outBuf, p], [Math.ceil((nH*hd)/64), 1, 1]);
+    const p = uniform(new Uint32Array([nH, hd, T || 1, 0]));
+    return E.dispatch(pipe, [attnBuf, qprojBuf, outBuf, p], [Math.ceil((T||1)*nH*hd/64), 1, 1]);
   }
 
   // ============================================================
@@ -1839,6 +1873,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _swapQK = false, _deltaMaxLayer = 999;   // debug: swap q/k in recurrence; limit active delta layers
   let _subOverride = null;   // GEMV reduction: null=auto (subgroups if supported), true/false to force
   let _prefillSerial = false;   // debug A/B: force the old token-by-token (drain-every-token) prefill
+  let _batchedPrefill = false;  // batched-GEMM prefill scaffold (off: dispatch-bound, ties per-token; needs tiled GEMM)
   let _awqXor = false;       // compressed-tensors packs offset-binary (q+8) = OUR format → read direct, no transcode.
                              // (Toggle exists only for hypothetical two's-complement repos.)
   function _useSub() { return _subOverride !== null ? _subOverride : !!(E.caps && E.caps() && E.caps().hasSubgroups); }
@@ -2113,22 +2148,147 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // token-by-token (the DeltaNet recurrence is sequential), then a batched GPU-resident
   // decode loop chains GEN_BATCH forwards per readback. onToken(piece) gets each decoded
   // token. Caller must resetState() + loadModel() first. Returns the output token ids.
+  // ============================================================
+  // BATCHED PREFILL — process the whole prompt as GEMM over T tokens (each weight read
+  // ONCE for all T), instead of L per-token GEMV forwards (each weight read L times). On
+  // this bandwidth-bound iGPU that's the ~order-of-magnitude prefill win. The DeltaNet
+  // recurrence stays sequential (a per-token deltaRecur loop) — everything else is batched.
+  // ============================================================
+  const SPLIT_WGSL = `
+struct P { T:u32, dval:u32, convDim:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       qkvc : array<f32>;   // [T*convDim]  (q|k|v per token)
+@group(0) @binding(1) var<storage, read_write> qd   : array<f32>;   // [T*dval]
+@group(0) @binding(2) var<storage, read_write> kd   : array<f32>;   // [T*dval]
+@group(0) @binding(3) var<storage, read_write> vd   : array<f32>;   // [T*dval]
+@group(0) @binding(4) var<uniform>             p    : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let i=gid.x; let total=p.T*p.dval; if(i>=total){return;}
+  let t=i/p.dval; let j=i%p.dval; let cb=t*p.convDim + j;
+  qd[i]=qkvc[cb]; kd[i]=qkvc[cb+p.dval]; vd[i]=qkvc[cb+2u*p.dval];
+}`;
+  function splitQKV(qkvcBuf, qdBuf, kdBuf, vdBuf, T) {
+    const pipe = E.getPipeline('q35.split', SPLIT_WGSL);
+    const p = uniform(new Uint32Array([T, DVAL, CONV_DIM, 0]));
+    return E.dispatch(pipe, [qkvcBuf, qdBuf, kdBuf, vdBuf, p], [Math.ceil(T * DVAL / 64), 1, 1]);
+  }
+
+  let _pscr = null, _pscrCap = 0;
+  function ensurePScr(T) {
+    if (_pscr && _pscrCap >= T) return;
+    if (_pscr) for (const k in _pscr) { try { _pscr[k].destroy(); } catch (_) {} }
+    const C = CONFIG, H = C.hidden, hd = C.headDim, nHq = C.nHeads, nKv = C.nKvHeads, I = C.intermediate, dH = C.deltaHeads;
+    const b = (e, nm) => scrBuf(T * e, 'p_' + nm);
+    _pscr = {
+      x: b(H, 'x'), normed: b(H, 'normed'),
+      qproj: b(nHq * 2 * hd, 'qproj'), kf: b(nKv * hd, 'kf'), vf: b(nKv * hd, 'vf'),
+      qr: b(nHq * hd, 'qr'), kr: b(nKv * hd, 'kr'), attnO: b(nHq * hd, 'attnO'), gatedO: b(nHq * hd, 'gatedO'),
+      qkv: b(CONV_DIM, 'qkv'), qkvc: b(CONV_DIM, 'qkvc'),
+      qd: b(DVAL, 'qd'), kd: b(DVAL, 'kd'), vd: b(DVAL, 'vd'), qn: b(DVAL, 'qn'), kn: b(DVAL, 'kn'),
+      aD: b(dH, 'aD'), bD: b(dH, 'bD'), zD: b(DVAL, 'zD'), gb: b(dH * 2, 'gb'), core: b(DVAL, 'core'), gnorm: b(DVAL, 'gnorm'),
+      gate: b(I, 'gate'), up: b(I, 'up'), swi: b(I, 'swi'),
+    };
+    _pscrCap = T;
+  }
+
+  // One batched chunk of T tokens at absolute positions [posBase, posBase+T). State
+  // (KV cache / conv ring / delta S) carries across chunks. needHead → also run the final
+  // norm + lm_head + argmax on the LAST token and return the first generated token id.
+  async function forwardChunk(ids, posBase, needHead) {
+    const C = CONFIG, H = C.hidden, hd = C.headDim, nHq = C.nHeads, nKv = C.nKvHeads, I = C.intermediate;
+    const dH = C.deltaHeads, dK = C.deltaKeyDim, dV = C.deltaValDim;
+    const T = ids.length, qScale = _qScaleOn ? (1 / Math.sqrt(dK)) : 1.0;
+    const rotDim = C.rotaryDim;
+    ensureState(); ensureScratch(); ensurePScr(T);
+    const W = (n) => _weights[LP + n].buf, Wq = (n) => _weights[LP + n];
+    const ps = _pscr, s = _scr, emb = _weights['__embed_int4'];
+    uniformReset();
+    E.beginBatch();
+    setIds(ids);
+    await embedGatherQ(_idsBuf, emb.pack, emb.scales, ps.x, T, H, 0);
+    for (let l = 0; l < C.numLayers; l++) {
+      const p = 'layers.' + l + '.';
+      await rmsnorm(ps.x, W(p + 'input_layernorm.weight'), ps.normed, T, H, C.rmsEps);
+      if (C.layerFullAttn[l]) {
+        const a = p + 'self_attn.';
+        await linearQ(ps.normed, Wq(a + 'q_proj.weight'), ps.qproj, T, nHq * 2 * hd, H);
+        await linearQ(ps.normed, Wq(a + 'k_proj.weight'), ps.kf, T, nKv * hd, H);
+        await linearQ(ps.normed, Wq(a + 'v_proj.weight'), ps.vf, T, nKv * hd, H);
+        await ropeQKNorm35(ps.qproj, W(a + 'q_norm.weight'), ps.qr, T, nHq, hd, 2 * hd, rotDim, posBase, C.ropeTheta, C.rmsEps);
+        await ropeQKNorm35(ps.kf, W(a + 'k_norm.weight'), ps.kr, T, nKv, hd, hd, rotDim, posBase, C.ropeTheta, C.rmsEps);
+        copyRange(ps.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
+        copyRange(ps.vf, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
+        await attention(ps.qr, _kv[l].k, _kv[l].v, ps.attnO, T, posBase + T, nHq, nKv, hd);
+        await applyGate35(ps.attnO, ps.qproj, ps.gatedO, nHq, hd, T);
+        await linearQ(ps.gatedO, Wq(a + 'o_proj.weight'), ps.x, T, H, nHq * hd, true);
+      } else {
+        const d = p + 'linear_attn.';
+        await linearQ(ps.normed, Wq(d + 'in_proj_qkv.weight'), ps.qkv, T, CONV_DIM, H);
+        await conv1dPrefill(ps.qkv, W(d + 'conv1d.weight'), s.convBias, _convState[l], ps.qkvc, CONV_DIM, T);
+        await splitQKV(ps.qkvc, ps.qd, ps.kd, ps.vd, T);
+        await linearQ(ps.normed, Wq(d + 'in_proj_a.weight'), ps.aD, T, dH, H);
+        await linearQ(ps.normed, Wq(d + 'in_proj_b.weight'), ps.bD, T, dH, H);
+        await linearQ(ps.normed, Wq(d + 'in_proj_z.weight'), ps.zD, T, DVAL, H);
+        await gbeta(ps.aD, ps.bD, W(d + 'A_log'), W(d + 'dt_bias'), ps.gb, dH, T);
+        await l2normHeads(ps.qd, ps.qn, dH, dK, C.rmsEps, qScale, T);
+        await l2normHeads(ps.kd, ps.kn, dH, dK, C.rmsEps, 1.0, T);
+        for (let t = 0; t < T; t++) await deltaRecur(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, t);   // sequential recurrence
+        await gatedRMSNorm(ps.core, ps.zD, W(d + 'norm.weight'), ps.gnorm, dH, dV, _gnormEps, T);
+        await linearQ(ps.gnorm, Wq(d + 'out_proj.weight'), ps.x, T, H, DVAL, true);
+      }
+      await rmsnorm(ps.x, W(p + 'post_attention_layernorm.weight'), ps.normed, T, H, C.rmsEps);
+      await linearQ(ps.normed, Wq(p + 'mlp.gate_proj.weight'), ps.gate, T, I, H);
+      await linearQ(ps.normed, Wq(p + 'mlp.up_proj.weight'), ps.up, T, I, H);
+      await swiglu(ps.gate, ps.up, ps.swi, T * I);
+      await linearQ(ps.swi, Wq(p + 'mlp.down_proj.weight'), ps.x, T, H, I, true);
+    }
+    if (needHead) {
+      E.copyBuffer(ps.x, (T - 1) * H * 4, s.x, 0, H * 4);   // last token → T=1 head path
+      await rmsnorm(s.x, W('norm.weight'), s.normed, 1, H, C.rmsEps);
+      await linearQ(s.normed, emb, s.logits, 1, C.vocab, H);
+      await argmaxKernel(s.logits, _tokHist, C.vocab, posBase + T);
+    }
+    await E.endBatch();
+    return needHead ? await readU32At(_tokHist, posBase + T) : undefined;
+  }
+
+  const PCHUNK = 128;   // tokens per batched prefill chunk (bounds scratch memory + command-buffer size)
+  // Batched prefill of the whole prompt; returns the first generated token id.
+  async function forwardPrefill(ids, signal) {
+    const L = ids.length;
+    let tok;
+    for (let c = 0; c < L; c += PCHUNK) {
+      if (signal && signal.aborted) return undefined;
+      const end = Math.min(c + PCHUNK, L);
+      tok = await forwardChunk(ids.slice(c, end), c, end === L);   // last chunk computes the head
+    }
+    return tok;
+  }
+
   const PF_BATCH = 16;   // prefill: submit this many forwards before draining (bounds queue depth)
   async function _streamIds(ids, { maxTokens = 256, onToken, signal } = {}) {
     const L = ids.length;
     let tok = 0;
-    // PIPELINED PREFILL: the DeltaNet recurrence is sequential so we still run one forward
-    // per prompt token, but only DRAIN every PF_BATCH tokens (and the last). Issuing the
-    // rest submitOnly overlaps CPU-encode(i+1) with GPU-run(i) instead of stalling on each
-    // token's readback — the same pipelining win the decode loop already gets. The wasted
-    // per-token argmax into _tokHist is harmless: prefill embeds via setIds(ids[i]), not chain.
-    for (let i = 0; i < L; i++) {
+    if (_batchedPrefill && !_prefillSerial && L > 1) {
+      // BATCHED PREFILL scaffold (correct + coherent, A/B-verified identical output). OFF by
+      // default: with matvecQ chunked at MATVEC_MAXT=16 it's dispatch-bound, NOT a true tiled
+      // GEMM, so it ties the per-token path (~40 tok/s) rather than beating it. The real win
+      // needs a tiled int4 GEMM kernel + a chunked DeltaNet scan (the recurrence loop is the
+      // floor). Kept + flag-gated as the foundation for that work. _setBatchedPrefill(true).
+      tok = await forwardPrefill(ids, signal);
       if (signal && signal.aborted) return [];
-      const last = i === L - 1;
-      const sync = _prefillSerial || last || ((i + 1) % PF_BATCH === 0);
-      const opts = { noLmHead: !last, submitOnly: !sync };   // only the LAST prefill token needs logits
-      if (sync) tok = await forward(ids[i], i, opts);   // for `last`, returns the first generated token
-      else await forward(ids[i], i, opts);
+    } else {
+      // Per-token fallback (A/B via _setPrefillSerial). Pipelined: only drain every PF_BATCH
+      // tokens + the last; submitOnly overlaps CPU-encode(i+1) with GPU-run(i). Only the LAST
+      // token needs logits (noLmHead skips the 248K-vocab lm_head on the rest).
+      for (let i = 0; i < L; i++) {
+        if (signal && signal.aborted) return [];
+        const last = i === L - 1;
+        const sync = _prefillSerial || last || ((i + 1) % PF_BATCH === 0);
+        const opts = { noLmHead: !last, submitOnly: !sync };
+        if (sync) tok = await forward(ids[i], i, opts);
+        else await forward(ids[i], i, opts);
+      }
     }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
@@ -2345,6 +2505,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setSwapQK: (b) => { _swapQK = !!b; }, _setDeltaMaxLayer: (l) => { _deltaMaxLayer = l; },
     _setSub: (b) => { _subOverride = b; }, _caps: () => (E.caps ? E.caps() : null),
     _setPrefillSerial: (b) => { _prefillSerial = !!b; },
+    _setBatchedPrefill: (b) => { _batchedPrefill = !!b; },
     _probeSubgroups: async () => { _subProbed = false; await E.init(); await probeSubgroups(); return { subOverride: _subOverride, useSub: _useSub() }; },
     _setGenBatch: (k) => { _genBatch = k; }, _setAwqXor: (b) => { _awqXor = !!b; },
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
