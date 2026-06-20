@@ -1660,6 +1660,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (variant) selectModel(variant);   // may unload a different already-loaded variant
     if (_loaded) return;
     await E.init();
+    await probeSubgroups();   // mobile-safety: disable subgroups if this GPU computes them wrong
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     const src = await fetchModelBytes(onProgress);
@@ -1771,6 +1772,47 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _awqXor = false;       // compressed-tensors packs offset-binary (q+8) = OUR format → read direct, no transcode.
                              // (Toggle exists only for hypothetical two's-complement repos.)
   function _useSub() { return _subOverride !== null ? _subOverride : !!(E.caps && E.caps() && E.caps().hasSubgroups); }
+
+  // Some mobile GPUs ADVERTISE `subgroups` but compute subgroupAdd incorrectly — this was
+  // the original mobile all-"!" bug, whose fix was "don't use subgroups." Trusting
+  // caps().hasSubgroups (the capability-conditional GEMV path) silently re-introduces it on
+  // exactly those devices. So before relying on subgroups, verify the subgroup GEMV path
+  // numerically against the portable shared-mem path at load; on ANY mismatch (or error),
+  // fall back to shared-mem. Keeps the desktop subgroup speedup where it's actually correct,
+  // auto-disables it everywhere it isn't — no user-agent sniffing.
+  let _subProbed = false;
+  async function probeSubgroups() {
+    if (_subProbed) return; _subProbed = true;
+    if (_subOverride !== null) return;                                  // user forced a value — respect it
+    if (!(E.caps && E.caps() && E.caps().hasSubgroups)) return;         // no subgroups → already shared-mem
+    let bufs = [];
+    try {
+      const N = 40, K = 256;
+      const x = new Float32Array(K); for (let i = 0; i < K; i++) x[i] = Math.sin(i * 0.2);
+      const Wf = new Float32Array(N * K); for (let i = 0; i < Wf.length; i++) Wf[i] = Math.cos(i * 0.013);
+      const u16 = new Uint16Array(Wf.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < Wf.length; i++) { t[0] = Wf[i]; u16[i] = ti[0] >>> 16; }   // f32 → bf16 bits
+      const { pack, scales } = quantizeInt4Bf16(u16, N, K);
+      const xb = f32buf(x);
+      const pb = E.createBuffer(pack.byteLength, ST(), 'probe.pk'); E.device().queue.writeBuffer(pb, 0, pack);
+      const sb = E.createBuffer(scales.byteLength, ST(), 'probe.sc'); E.device().queue.writeBuffer(sb, 0, scales);
+      const yb = E.createBuffer(N * 4, ST(), 'probe.y');
+      bufs = [xb, pb, sb, yb];
+      _subOverride = true;  await gemvQ(xb, pb, sb, yb, N, K, false); const ySub = Array.from(await E.readF32(yb, N));
+      _subOverride = false; await gemvQ(xb, pb, sb, yb, N, K, false); const yRef = Array.from(await E.readF32(yb, N));
+      _subOverride = null;                                             // back to auto unless we disable below
+      let maxErr = 0, ref = 0;
+      for (let i = 0; i < N; i++) { maxErr = Math.max(maxErr, Math.abs(ySub[i] - yRef[i])); ref = Math.max(ref, Math.abs(yRef[i])); }
+      const rel = maxErr / (ref || 1);
+      if (rel > 1e-2) { _subOverride = false; console.warn('[q35] subgroup GEMV WRONG (rel ' + rel.toFixed(3) + ') — disabling subgroups, using portable shared-mem path'); }
+      else console.log('[q35] subgroup GEMV verified (rel ' + rel.toExponential(1) + ') — keeping subgroup path');
+    } catch (e) {
+      _subOverride = false;                                            // anything goes wrong → safe path
+      console.warn('[q35] subgroup probe failed — disabling subgroups:', (e && e.message) || e);
+    } finally {
+      for (const b of bufs) { try { b.destroy(); } catch (_) {} }
+    }
+  }
   let _kv = null;          // per full-attn layer: {k,v} sized MAX_SEQ ; null for delta layers
   let _convState = null;   // per delta layer: [convDim*(K-1)] causal-conv ring ; null for attn
   let _deltaS = null;      // per delta layer: [deltaHeads*valDim*keyDim] recurrent state
@@ -2124,6 +2166,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setDbgLayer: (l) => { _dbgLayer = l; }, _dbgCapRead: async (nm, n) => _dbgCap[nm] ? Array.from(await E.readF32(_dbgCap[nm], n)) : null,
     _setSwapQK: (b) => { _swapQK = !!b; }, _setDeltaMaxLayer: (l) => { _deltaMaxLayer = l; },
     _setSub: (b) => { _subOverride = b; }, _caps: () => (E.caps ? E.caps() : null),
+    _probeSubgroups: async () => { _subProbed = false; await E.init(); await probeSubgroups(); return { subOverride: _subOverride, useSub: _useSub() }; },
     _setGenBatch: (k) => { _genBatch = k; }, _setAwqXor: (b) => { _awqXor = !!b; },
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
