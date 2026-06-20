@@ -1520,7 +1520,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const QUANT_SUFFIX = ['q_proj.weight','k_proj.weight','v_proj.weight','o_proj.weight',
     'gate_proj.weight','up_proj.weight','down_proj.weight',
     'in_proj_qkv.weight','in_proj_a.weight','in_proj_b.weight','in_proj_z.weight','out_proj.weight'];
-  const isQuantWeight = (name) => QUANT_SUFFIX.some(s => name.endsWith(s));
+  // DeltaNet projections: int4 (DELTA_F16=false) or f16 (true). f16 was tested as a
+  // fix for the coherence bug — it made NO difference, so kept int4 (saves ~266MB).
+  const DELTA_F16 = false;
+  const isDeltaProj = (name) => name.includes('linear_attn.in_proj') || name.includes('linear_attn.out_proj');
+  const isQuantWeight = (name) => (DELTA_F16 && isDeltaProj(name)) ? false : QUANT_SUFFIX.some(s => name.endsWith(s));
   // Precision-sensitive small params kept as raw f32 (kernels read them as f32).
   const isF32Raw = (name) => name.endsWith('conv1d.weight') || name.endsWith('.A_log') || name.endsWith('.dt_bias');
   // Vision tower + multi-token-prediction head: not used for text generation.
@@ -1529,11 +1533,33 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   function bf16ToF32arr(u16) { const out = new Float32Array(u16.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
     for (let i = 0; i < u16.length; i++) { ti[0] = u16[i] << 16; out[i] = t[0]; } return out; }
 
+  const OPFS_FILE = 'q35-model.safetensors';   // OPFS cache (GB-scale quota, unlike Cache Storage)
+  async function opfsRead(onProgress) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle(OPFS_FILE);   // throws if absent
+      const f = await fh.getFile();
+      if (f.size < 1e9) return null;                    // partial/corrupt
+      onProgress && onProgress({ phase: 'cache', pct: 100 });
+      return await f.arrayBuffer();
+    } catch (_) { return null; }
+  }
+  async function opfsWrite(u8) {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle(OPFS_FILE, { create: true });
+      const w = await fh.createWritable();
+      const CH = 64 * 1024 * 1024;   // 64MB chunks (single 1.75GB write fails silently)
+      for (let off = 0; off < u8.length; off += CH) {
+        await w.write({ type: 'write', position: off, data: u8.subarray(off, Math.min(off + CH, u8.length)) });
+      }
+      await w.close();
+    } catch (e) { try { console.warn('[q35] opfsWrite failed', e); } catch (_) {} }
+  }
   async function fetchModelBytes(onProgress) {
-    const url = MODEL_ROOT + MODEL_FILE;
-    let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
-    if (cache) { const hit = await cache.match(url); if (hit) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await hit.arrayBuffer(); } }
-    const resp = await fetch(url);
+    const cached = await opfsRead(onProgress);
+    if (cached) return cached;
+    const resp = await fetch(MODEL_ROOT + MODEL_FILE);
     const total = +(resp.headers.get('content-length') || 0);
     const reader = resp.body.getReader(); const chunks = []; let recv = 0;
     for (;;) {
@@ -1542,7 +1568,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
     }
     const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
-    if (cache) { try { await cache.put(url, new Response(out, { headers: { 'content-length': String(recv) } })); } catch (_) {} }
+    await opfsWrite(out);
     return out.buffer;
   }
 
@@ -1619,6 +1645,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const LP = CONFIG.weightPrefix;        // 'model.language_model.'
   let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
   let _DBGLAYERS = false, _layerDbg = null;   // per-layer hidden-state norm capture (debug)
+  let _qScaleOn = true;     // apply 1/sqrt(dK) to q after l2norm (debug toggle)
+  let _gnormEps = 1e-6;     // gated-RMSNorm eps (debug toggle)
+  let _skipDelta = false, _skipAttn = false, _ropeMode = 'partial';   // debug isolation toggles
+  let _swapAB = false, _noConv = false, _noL2 = false;   // debug delta-path toggles
   let _kv = null;          // per full-attn layer: {k,v} sized MAX_SEQ ; null for delta layers
   let _convState = null;   // per delta layer: [convDim*(K-1)] causal-conv ring ; null for attn
   let _deltaS = null;      // per delta layer: [deltaHeads*valDim*keyDim] recurrent state
@@ -1679,6 +1709,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       qn: scrBuf(DVAL, 'qn'), kn: scrBuf(DVAL, 'kn'),
       aD: scrBuf(dH, 'aD'), bD: scrBuf(dH, 'bD'), zD: scrBuf(DVAL, 'zD'),
       gb: scrBuf(dH * 2, 'gb'), core: scrBuf(DVAL, 'core'), gnorm: scrBuf(DVAL, 'gnorm'),
+      dout: scrBuf(H, 'dout'),                  // delta out_proj output (then residual-added)
       convBias: scrBuf(CONV_DIM, 'convBias'),   // Qwen3.5 conv1d has NO bias → kept zero
       // MLP + head
       swi: scrBuf(C.intermediate, 'swi'),
@@ -1705,7 +1736,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const _t0 = _PERF ? performance.now() : 0;
     const C = CONFIG, H = C.hidden, hd = C.headDim, nHq = C.nHeads, nKv = C.nKvHeads, I = C.intermediate;
     const dH = C.deltaHeads, dK = C.deltaKeyDim, dV = C.deltaValDim;
-    const S = pos + 1, qScale = 1 / Math.sqrt(dK);
+    const S = pos + 1, qScale = _qScaleOn ? (1 / Math.sqrt(dK)) : 1.0;
     ensureState(); ensureScratch();
     if (_DBGLAYERS) _layerDbg = [];
     const W   = (n) => _weights[LP + n].buf;   // f16/f32 raw buffer
@@ -1719,35 +1750,43 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, 1, H, C.rmsEps);
-      if (C.layerFullAttn[l]) {
+      if (C.layerFullAttn[l] && !_skipAttn) {
         const a = p + 'self_attn.';
+        const rotDim = _ropeMode === 'none' ? 0 : (_ropeMode === 'full' ? hd : C.rotaryDim);
         await linearQ(s.normed, Wq(a + 'q_proj.weight'), s.qproj, 1, nHq * 2 * hd, H);   // [nHq, query|gate]
         await linearQ(s.normed, Wq(a + 'k_proj.weight'), s.kf, 1, nKv * hd, H);
         await linearQ(s.normed, Wq(a + 'v_proj.weight'), s.vf, 1, nKv * hd, H);
         // q reads the query-half of qproj (stride 2*hd); both get qnorm + partial RoPE.
-        await ropeQKNorm35(s.qproj, W(a + 'q_norm.weight'), s.qr, 1, nHq, hd, 2 * hd, C.rotaryDim, pos, C.ropeTheta, C.rmsEps);
-        await ropeQKNorm35(s.kf, W(a + 'k_norm.weight'), s.kr, 1, nKv, hd, hd, C.rotaryDim, pos, C.ropeTheta, C.rmsEps);
+        await ropeQKNorm35(s.qproj, W(a + 'q_norm.weight'), s.qr, 1, nHq, hd, 2 * hd, rotDim, pos, C.ropeTheta, C.rmsEps);
+        await ropeQKNorm35(s.kf, W(a + 'k_norm.weight'), s.kr, 1, nKv, hd, hd, rotDim, pos, C.ropeTheta, C.rmsEps);
         copyRange(s.kr, _kv[l].k, pos * nKv * hd, nKv * hd);
         copyRange(s.vf, _kv[l].v, pos * nKv * hd, nKv * hd);
         await attention(s.qr, _kv[l].k, _kv[l].v, s.attnO, 1, S, nHq, nKv, hd);
         await applyGate35(s.attnO, s.qproj, s.gatedO, nHq, hd);                          // out *= sigmoid(gate)
         await linearQ(s.gatedO, Wq(a + 'o_proj.weight'), s.x, 1, H, nHq * hd, true);     // residual
-      } else {
+      } else if (!C.layerFullAttn[l] && !_skipDelta) {
         const d = p + 'linear_attn.';
-        await linearQ(s.normed, Wq(d + 'in_proj_qkv.weight'), s.qkv, 1, CONV_DIM, H);
-        await conv1dDecode(s.qkv, W(d + 'conv1d.weight'), s.convBias, _convState[l], s.qkvc, CONV_DIM);  // +silu, advances ring
+        // DeltaNet projections in f16 (gemv) — int4 noise corrupts the tiny recurrence signal.
+        const dproj = (n, y, N) => DELTA_F16 ? gemv(s.normed, W(d + n), y, N, H) : linearQ(s.normed, Wq(d + n), y, 1, N, H);
+        await dproj('in_proj_qkv.weight', s.qkv, CONV_DIM);
+        if (_noConv) { E.copyBuffer(s.qkv, 0, s.qkvc, 0, CONV_DIM * 4); }                 // debug: bypass conv
+        else await conv1dDecode(s.qkv, W(d + 'conv1d.weight'), s.convBias, _convState[l], s.qkvc, CONV_DIM);  // +silu, advances ring
         E.copyBuffer(s.qkvc, 0, s.qd, 0, DVAL * 4);          // split q|k|v (each 16×128)
         E.copyBuffer(s.qkvc, DVAL * 4, s.kd, 0, DVAL * 4);
         E.copyBuffer(s.qkvc, 2 * DVAL * 4, s.vd, 0, DVAL * 4);
-        await linearQ(s.normed, Wq(d + 'in_proj_a.weight'), s.aD, 1, dH, H);
-        await linearQ(s.normed, Wq(d + 'in_proj_b.weight'), s.bD, 1, dH, H);
-        await linearQ(s.normed, Wq(d + 'in_proj_z.weight'), s.zD, 1, DVAL, H);
-        await gbeta(s.aD, s.bD, W(d + 'A_log'), W(d + 'dt_bias'), s.gb, dH);             // expg, beta
-        await l2normHeads(s.qd, s.qn, dH, dK, C.rmsEps, qScale);                          // q L2-normed then *1/sqrt(dK)
-        await l2normHeads(s.kd, s.kn, dH, dK, C.rmsEps, 1.0);
-        await deltaRecur(s.qn, s.kn, s.vd, s.gb, _deltaS[l], s.core, dH, dK);             // recurrence (updates S)
-        await gatedRMSNorm(s.core, s.zD, W(d + 'norm.weight'), s.gnorm, dH, dV, C.rmsEps);
-        await linearQ(s.gnorm, Wq(d + 'out_proj.weight'), s.x, 1, H, DVAL, true);         // residual
+        await dproj('in_proj_a.weight', s.aD, dH);
+        await dproj('in_proj_b.weight', s.bD, dH);
+        await dproj('in_proj_z.weight', s.zD, DVAL);
+        if (_swapAB) await gbeta(s.bD, s.aD, W(d + 'A_log'), W(d + 'dt_bias'), s.gb, dH);  // debug: swap a/b
+        else await gbeta(s.aD, s.bD, W(d + 'A_log'), W(d + 'dt_bias'), s.gb, dH);          // expg, beta
+        let qIn = s.qn, kIn = s.kn;
+        if (_noL2) { qIn = s.qd; kIn = s.kd; }                                            // debug: skip l2norm
+        else { await l2normHeads(s.qd, s.qn, dH, dK, C.rmsEps, qScale);                   // q L2-normed then *1/sqrt(dK)
+               await l2normHeads(s.kd, s.kn, dH, dK, C.rmsEps, 1.0); }
+        await deltaRecur(qIn, kIn, s.vd, s.gb, _deltaS[l], s.core, dH, dK);               // recurrence (updates S)
+        await gatedRMSNorm(s.core, s.zD, W(d + 'norm.weight'), s.gnorm, dH, dV, _gnormEps);
+        if (DELTA_F16) { await gemv(s.gnorm, W(d + 'out_proj.weight'), s.dout, H, DVAL); await addInPlace(s.x, s.dout, H); }  // residual
+        else await linearQ(s.gnorm, Wq(d + 'out_proj.weight'), s.x, 1, H, DVAL, true);    // residual
       }
       // shared post-attention RMSNorm + SwiGLU MLP
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, 1, H, C.rmsEps);
@@ -1843,9 +1882,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     __reset: () => resetState(),
     _setDbgLayers: (b) => { _DBGLAYERS = !!b; }, _layerDbg: () => _layerDbg,
+    _setQScale: (b) => { _qScaleOn = !!b; }, _setGnormEps: (v) => { _gnormEps = v; },
+    _setSkip: (delta, attn) => { _skipDelta = !!delta; _skipAttn = !!attn; }, _setRope: (m) => { _ropeMode = m; },
+    _setSwapAB: (b) => { _swapAB = !!b; }, _setNoConv: (b) => { _noConv = !!b; }, _setNoL2: (b) => { _noL2 = !!b; },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
     _dbgState: async (l, n) => E.readF32(_deltaS[l], n || 64),
-    _weightStat: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return 'missing'; if (w.f32) return Array.from(await E.readF32(w.buf, n||8)); if (w.int4) return 'int4 ' + JSON.stringify(w.shape); return 'f16 ' + JSON.stringify(w.shape); },
+    _weightStat: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return 'missing'; if (w.f32) return Array.from(await E.readF32(w.buf, n||8)); if (w.int4) return 'int4 ' + JSON.stringify(w.shape); return Array.from(await readF16(w.buf, n||8)); },
     _dbg: {
       weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
