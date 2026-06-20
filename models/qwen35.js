@@ -437,6 +437,46 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, p], [nHeads, 1, 1]);
   }
 
+  // ============================================================
+  // CAUSAL DEPTHWISE conv1d (kernel=4) + SiLU, decode step (1 token).
+  // Mixed q|k|v are conv'd along the sequence before the recurrence.
+  // PyTorch causal Conv1d (left-pad K-1, groups=conv_dim) at the last pos:
+  //   out[c] = silu( Σ_{j=0..K-1} w[c][j] * window[j] (+ bias[c]) )
+  //   window = [x_{t-3}, x_{t-2}, x_{t-1}, x_t]   (newest last)
+  // State = last K-1 inputs per channel, kept across decode steps (per layer);
+  // this kernel ALSO advances the state (shift left, append x_t). One thread/ch.
+  // ============================================================
+  const CONV_K = 4;
+  const CONV_WGSL = `
+struct P { convDim:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       x     : array<f32>;   // [convDim]   current input x_t
+@group(0) @binding(1) var<storage, read>       w     : array<f32>;   // [convDim*K] weights, row-major [c][j], j newest last
+@group(0) @binding(2) var<storage, read>       bias  : array<f32>;   // [convDim]   (zeros if no bias)
+@group(0) @binding(3) var<storage, read_write> state : array<f32>;   // [convDim*(K-1)] last K-1 inputs, oldest first
+@group(0) @binding(4) var<storage, read_write> outv  : array<f32>;   // [convDim]
+@group(0) @binding(5) var<uniform>             p     : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let c = gid.x; if (c >= p.convDim) { return; }
+  let K = ${CONV_K}u; let Km1 = K - 1u;
+  let sbase = c*Km1; let wbase = c*K;
+  // window[0..K-2] = state (oldest..newest), window[K-1] = x_t
+  var acc : f32 = bias[c];
+  for (var j:u32=0u; j<Km1; j=j+1u) { acc = acc + w[wbase+j]*state[sbase+j]; }
+  let xt = x[c];
+  acc = acc + w[wbase+Km1]*xt;
+  // SiLU
+  outv[c] = acc / (1.0 + exp(-acc));
+  // advance state: shift left, append x_t
+  for (var j:u32=0u; j<Km1-1u; j=j+1u) { state[sbase+j] = state[sbase+j+1u]; }
+  state[sbase+Km1-1u] = xt;
+}`;
+  function conv1dDecode(xBuf, wBuf, biasBuf, stateBuf, outBuf, convDim) {
+    const pipe = E.getPipeline('q35.conv', CONV_WGSL);
+    const p = uniform(new Uint32Array([convDim, 0, 0, 0]));
+    return E.dispatch(pipe, [xBuf, wBuf, biasBuf, stateBuf, outBuf, p], [Math.ceil(convDim / 64), 1, 1]);
+  }
+
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
   const MATVECQ_WGSL = `
 enable f16;
@@ -969,6 +1009,33 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         } }
       check('deltaRecur', Math.max(maxAbs(gotOut,cOut), maxAbs(gotS,St)), 1e-3);
       [qb,kb,vb,gbb,Sb,ob].forEach(b=>b.destroy());
+    }
+    // --- conv1dDecode (causal depthwise conv1d k=4 + silu + ring state) vs CPU ---
+    {
+      const C=10, K=CONV_K, T=5;             // channels, kernel, decode steps
+      const w=new Float32Array(C*K), bias=new Float32Array(C);
+      const xs=[]; for(let t=0;t<T;t++){ const x=new Float32Array(C); for(let c=0;c<C;c++) x[c]=Math.sin(t*0.7+c*0.3); xs.push(x); }
+      for(let c=0;c<C;c++){ bias[c]=0.05*c-0.2; for(let j=0;j<K;j++) w[c*K+j]=Math.cos(c*0.4+j*0.9)*0.5; }
+      const silu=a=>a/(1+Math.exp(-a));
+      // CPU ref: full causal conv with left-pad K-1 zeros, take each step's output
+      const cpuOut=[];
+      for(let t=0;t<T;t++){ const o=new Float32Array(C);
+        for(let c=0;c<C;c++){ let acc=bias[c];
+          for(let j=0;j<K;j++){ const ti=t-(K-1)+j; const xv=ti>=0?xs[ti][c]:0; acc+=w[c*K+j]*xv; }
+          o[c]=silu(acc); } cpuOut.push(o); }
+      // GPU: step the kernel T times, state buffer starts at zero
+      const wb=f32buf(w), bb=f32buf(bias);
+      const stb=E.createBuffer(C*(K-1)*4, ST(),'st');  // zero-init
+      const ob=E.createBuffer(C*4, ST(),'o');
+      let maxe=0;
+      for(let t=0;t<T;t++){ const xb=f32buf(xs[t]);
+        await conv1dDecode(xb, wb, bb, stb, ob, C);
+        const got=await E.readF32(ob, C);
+        maxe=Math.max(maxe, maxAbs(got, cpuOut[t]));
+        xb.destroy();
+      }
+      check('conv1dDecode', maxe, 1e-3);
+      [wb,bb,stb,ob].forEach(b=>b.destroy());
     }
     return out;
   }
