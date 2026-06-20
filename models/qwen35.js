@@ -90,7 +90,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   loop { if (stride==0u){break;} if (lid.x<stride){red[lid.x]=red[lid.x]+red[lid.x+stride];} workgroupBarrier(); stride=stride/2u; }
   let inv = inverseSqrt(red[0]/f32(H) + p.eps);
   i = lid.x;
-  loop { if (i >= H) { break; } y[base+i] = x[base+i]*inv*f32(w[i]); i = i + ${WG_H}u; }
+  loop { if (i >= H) { break; } y[base+i] = x[base+i]*inv*(1.0 + f32(w[i])); i = i + ${WG_H}u; }   // Qwen3.5 RMSNorm: *(1+weight)
 }`;
   function rmsnorm(xBuf, wBuf, yBuf, T, H, eps) {
     const pipe = E.getPipeline('q3.rmsnorm', RMSNORM_WGSL);
@@ -763,7 +763,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   var stride=${WG_HD}u/2u;
   loop{ if(stride==0u){break;} if(j<stride){red[j]=red[j]+red[j+stride];} workgroupBarrier(); stride=stride/2u; }
   let inv=inverseSqrt(red[0]/f32(hd)+p.eps);
-  if(j<hd){ nrm[j]=v*inv*f32(normW[j]); }
+  if(j<hd){ nrm[j]=v*inv*(1.0 + f32(normW[j])); }   // Qwen3.5 q/k-norm: *(1+weight)
   workgroupBarrier();
   if(j>=hd){ return; }
   let rotDim=p.rotDim;
@@ -984,7 +984,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const xb=f32buf(x), wb=f16buf(w), yb=E.createBuffer(T*H*4, ST(),'y');
       await rmsnorm(xb,wb,yb,T,H,eps);
       const got=await E.readF32(yb,T*H);
-      for(let t=0;t<T;t++){let ss=0;for(let i=0;i<H;i++)ss+=x[t*H+i]**2;const inv=1/Math.sqrt(ss/H+eps);for(let i=0;i<H;i++)y[t*H+i]=x[t*H+i]*inv*wR[i];}
+      for(let t=0;t<T;t++){let ss=0;for(let i=0;i<H;i++)ss+=x[t*H+i]**2;const inv=1/Math.sqrt(ss/H+eps);for(let i=0;i<H;i++)y[t*H+i]=x[t*H+i]*inv*(1+wR[i]);}
       check('rmsnorm', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
     }
@@ -1285,7 +1285,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const bi=t*nH*inStride+h*inStride, bo=t*nH*hd+h*hd;
         let ss=0; for(let j=0;j<hd;j++){ const v=inp[bi+j]; ss+=v*v; }
         const inv=1/Math.sqrt(ss/hd+eps);
-        const nrm=new Float32Array(hd); for(let j=0;j<hd;j++) nrm[j]=inp[bi+j]*inv*nwR[j];
+        const nrm=new Float32Array(hd); for(let j=0;j<hd;j++) nrm[j]=inp[bi+j]*inv*(1+nwR[j]);
         const pos=posBase+t;
         for(let j=0;j<hd;j++){
           if(j>=rotDim){ ref[bo+j]=nrm[j]; continue; }
@@ -1520,8 +1520,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const QUANT_SUFFIX = ['q_proj.weight','k_proj.weight','v_proj.weight','o_proj.weight',
     'gate_proj.weight','up_proj.weight','down_proj.weight',
     'in_proj_qkv.weight','in_proj_a.weight','in_proj_b.weight','in_proj_z.weight','out_proj.weight'];
-  // DeltaNet projections: int4 (DELTA_F16=false) or f16 (true). f16 was tested as a
-  // fix for the coherence bug — it made NO difference, so kept int4 (saves ~266MB).
+  // DeltaNet projections: int4 (DELTA_F16=false) or f16 (true). int4 for production.
   const DELTA_F16 = false;
   const isDeltaProj = (name) => name.includes('linear_attn.in_proj') || name.includes('linear_attn.out_proj');
   const isQuantWeight = (name) => (DELTA_F16 && isDeltaProj(name)) ? false : QUANT_SUFFIX.some(s => name.endsWith(s));
@@ -1649,6 +1648,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _gnormEps = 1e-6;     // gated-RMSNorm eps (debug toggle)
   let _skipDelta = false, _skipAttn = false, _ropeMode = 'partial';   // debug isolation toggles
   let _swapAB = false, _noConv = false, _noL2 = false;   // debug delta-path toggles
+  let _dbgLayer = -1, _dbgCap = {};   // snapshot one delta layer's intermediates (CPU-ref debug)
+  let _swapQK = false, _deltaMaxLayer = 999;   // debug: swap q/k in recurrence; limit active delta layers
   let _kv = null;          // per full-attn layer: {k,v} sized MAX_SEQ ; null for delta layers
   let _convState = null;   // per delta layer: [convDim*(K-1)] causal-conv ring ; null for attn
   let _deltaS = null;      // per delta layer: [deltaHeads*valDim*keyDim] recurrent state
@@ -1764,7 +1765,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         await attention(s.qr, _kv[l].k, _kv[l].v, s.attnO, 1, S, nHq, nKv, hd);
         await applyGate35(s.attnO, s.qproj, s.gatedO, nHq, hd);                          // out *= sigmoid(gate)
         await linearQ(s.gatedO, Wq(a + 'o_proj.weight'), s.x, 1, H, nHq * hd, true);     // residual
-      } else if (!C.layerFullAttn[l] && !_skipDelta) {
+      } else if (!C.layerFullAttn[l] && !_skipDelta && l <= _deltaMaxLayer) {
         const d = p + 'linear_attn.';
         // DeltaNet projections in f16 (gemv) — int4 noise corrupts the tiny recurrence signal.
         const dproj = (n, y, N) => DELTA_F16 ? gemv(s.normed, W(d + n), y, N, H) : linearQ(s.normed, Wq(d + n), y, 1, N, H);
@@ -1783,9 +1784,17 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         if (_noL2) { qIn = s.qd; kIn = s.kd; }                                            // debug: skip l2norm
         else { await l2normHeads(s.qd, s.qn, dH, dK, C.rmsEps, qScale);                   // q L2-normed then *1/sqrt(dK)
                await l2normHeads(s.kd, s.kn, dH, dK, C.rmsEps, 1.0); }
-        await deltaRecur(qIn, kIn, s.vd, s.gb, _deltaS[l], s.core, dH, dK);               // recurrence (updates S)
+        if (_swapQK) await deltaRecur(kIn, qIn, s.vd, s.gb, _deltaS[l], s.core, dH, dK);   // debug: q/k swapped
+        else await deltaRecur(qIn, kIn, s.vd, s.gb, _deltaS[l], s.core, dH, dK);           // recurrence (updates S)
         await gatedRMSNorm(s.core, s.zD, W(d + 'norm.weight'), s.gnorm, dH, dV, _gnormEps);
-        if (DELTA_F16) { await gemv(s.gnorm, W(d + 'out_proj.weight'), s.dout, H, DVAL); await addInPlace(s.x, s.dout, H); }  // residual
+        if (l === _dbgLayer) {   // snapshot stage outputs for CPU-reference comparison
+          const grab = (nm, buf, n) => { if (!_dbgCap[nm]) _dbgCap[nm] = scrBuf(n, 'cap_' + nm); E.copyBuffer(buf, 0, _dbgCap[nm], 0, n * 4); };
+          grab('normed', s.normed, H); grab('qkv', s.qkv, CONV_DIM); grab('qkvc', s.qkvc, CONV_DIM);
+          grab('qn', s.qn, DVAL); grab('kn', s.kn, DVAL); grab('vd', s.vd, DVAL);
+          grab('aD', s.aD, dH); grab('bD', s.bD, dH); grab('zD', s.zD, DVAL);
+          grab('gb', s.gb, dH * 2); grab('core', s.core, DVAL); grab('gnorm', s.gnorm, DVAL);
+        }
+        if (DELTA_F16) { await gemv(s.gnorm, W(d + 'out_proj.weight'), s.dout, H, DVAL); if (l === _dbgLayer) { if(!_dbgCap.dout) _dbgCap.dout=scrBuf(H,'cap_dout'); E.copyBuffer(s.dout,0,_dbgCap.dout,0,H*4);} await addInPlace(s.x, s.dout, H); }  // residual
         else await linearQ(s.gnorm, Wq(d + 'out_proj.weight'), s.x, 1, H, DVAL, true);    // residual
       }
       // shared post-attention RMSNorm + SwiGLU MLP
@@ -1885,6 +1894,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setQScale: (b) => { _qScaleOn = !!b; }, _setGnormEps: (v) => { _gnormEps = v; },
     _setSkip: (delta, attn) => { _skipDelta = !!delta; _skipAttn = !!attn; }, _setRope: (m) => { _ropeMode = m; },
     _setSwapAB: (b) => { _swapAB = !!b; }, _setNoConv: (b) => { _noConv = !!b; }, _setNoL2: (b) => { _noL2 = !!b; },
+    _setDbgLayer: (l) => { _dbgLayer = l; }, _dbgCapRead: async (nm, n) => _dbgCap[nm] ? Array.from(await E.readF32(_dbgCap[nm], n)) : null,
+    _setSwapQK: (b) => { _swapQK = !!b; }, _setDeltaMaxLayer: (l) => { _deltaMaxLayer = l; },
+    _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
     _dbgState: async (l, n) => E.readF32(_deltaS[l], n || 64),
     _weightStat: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return 'missing'; if (w.f32) return Array.from(await E.readF32(w.buf, n||8)); if (w.int4) return 'int4 ' + JSON.stringify(w.shape); return Array.from(await readF16(w.buf, n||8)); },
