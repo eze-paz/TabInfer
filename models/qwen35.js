@@ -250,8 +250,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 
   // ---- INT4 decode GEMV (T=1), GEMVQ_NR rows/workgroup (activation reused) ----
   const GEMVQ_NR = 8;
-  const GEMVQ_WGSL = `
-enable f16;
+  // Reduction is capability-conditional: subgroupAdd on desktop GPUs that support
+  // subgroups (faster), portable shared-mem tree reduction elsewhere (mobile).
+  const gemvqWgsl = (sub) => `
+enable f16;${sub ? '\nenable subgroups;' : ''}
 struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused residual)
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [K/4]
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles
@@ -261,7 +263,7 @@ struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused
 var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
+        @builtin(num_workgroups) nwg:vec3<u32>${sub ? ',\n        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32' : ''}) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GEMVQ_NR}u;
   if (rowBase >= d.N) { return; }
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
@@ -282,6 +284,19 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
+` + (sub ? `
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { let ss = subgroupAdd(acc[r]); if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; } }
+  workgroupBarrier();
+  if (lid.x < ${GEMVQ_NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.N) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
+      y[row] = select(0.0, y[row], d.acc != 0u) + t;
+    }
+  }
+}` : `
   for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { part[r*${GEMV_WG}u + lid.x] = acc[r]; }
   workgroupBarrier();
   var stride = ${GEMV_WG}u/2u;
@@ -290,9 +305,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     let row = rowBase + lid.x;
     if (row < d.N) { y[row] = select(0.0, y[row], d.acc != 0u) + part[lid.x*${GEMV_WG}u]; }
   }
-}`;
+}`);
   function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
-    const pipe = E.getPipeline('q3.gemvQ', GEMVQ_WGSL);
+    const sub = _useSub();
+    const pipe = E.getPipeline(sub ? 'q3.gemvQ.sub' : 'q3.gemvQ', gemvqWgsl(sub));
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
     const nWG = Math.ceil(N / GEMVQ_NR);
     const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
@@ -304,8 +320,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // dequant-dots it against BOTH gate and up weights; one fewer pass barrier ×2
   // per layer (the matmuls) plus the swiglu pass removed.
   const GUSQ_NR = 4;
-  const GATEUPQ_WGSL = `
-enable f16;
+  const gateupqWgsl = (sub) => `
+enable f16;${sub ? '\nenable subgroups;' : ''}
 struct D { I:u32, H:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [H/4]
 @group(0) @binding(1) var<storage, read>       gW : array<u32>;
@@ -318,7 +334,7 @@ var<workgroup> pg : array<f32, ${GUSQ_NR * GEMV_WG}>;
 var<workgroup> pu : array<f32, ${GUSQ_NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
+        @builtin(num_workgroups) nwg:vec3<u32>${sub ? ',\n        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32' : ''}) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GUSQ_NR}u;
   if (rowBase >= d.I) { return; }
   let words = d.H / 8u; let gpr = d.H / ${QGROUP}u;
@@ -342,6 +358,20 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
+` + (sub ? `
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) { let g=subgroupAdd(ga[r]); let u=subgroupAdd(ua[r]); if (sgi==0u) { pg[r*${GEMV_WG}u + sgIdx]=g; pu[r*${GEMV_WG}u + sgIdx]=u; } }
+  workgroupBarrier();
+  if (lid.x < ${GUSQ_NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.I) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var g:f32=0.0; var u:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ g=g+pg[lid.x*${GEMV_WG}u+i]; u=u+pu[lid.x*${GEMV_WG}u+i]; }
+      let silu = g / (1.0 + exp(-g));
+      swi[row] = silu * u;
+    }
+  }
+}` : `
   for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) { pg[r*${GEMV_WG}u + lid.x] = ga[r]; pu[r*${GEMV_WG}u + lid.x] = ua[r]; }
   workgroupBarrier();
   var stride = ${GEMV_WG}u/2u;
@@ -354,9 +384,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       swi[row] = silu * u;
     }
   }
-}`;
+}`);
   function gateUpSiluQ(xBuf, gRec, uRec, swiBuf, I, H) {
-    const pipe = E.getPipeline('q3.gateupQ', GATEUPQ_WGSL);
+    const sub = _useSub();
+    const pipe = E.getPipeline(sub ? 'q3.gateupQ.sub' : 'q3.gateupQ', gateupqWgsl(sub));
     const d = uniform(new Uint32Array([I, H, 0, 0]));
     const nWG = Math.ceil(I / GUSQ_NR);
     const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
@@ -1626,6 +1657,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _swapAB = false, _noConv = false, _noL2 = false;   // debug delta-path toggles
   let _dbgLayer = -1, _dbgCap = {};   // snapshot one delta layer's intermediates (CPU-ref debug)
   let _swapQK = false, _deltaMaxLayer = 999;   // debug: swap q/k in recurrence; limit active delta layers
+  let _subOverride = null;   // GEMV reduction: null=auto (subgroups if supported), true/false to force
+  function _useSub() { return _subOverride !== null ? _subOverride : !!(E.caps && E.caps() && E.caps().hasSubgroups); }
   let _kv = null;          // per full-attn layer: {k,v} sized MAX_SEQ ; null for delta layers
   let _convState = null;   // per delta layer: [convDim*(K-1)] causal-conv ring ; null for attn
   let _deltaS = null;      // per delta layer: [deltaHeads*valDim*keyDim] recurrent state
@@ -1883,6 +1916,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setSwapAB: (b) => { _swapAB = !!b; }, _setNoConv: (b) => { _noConv = !!b; }, _setNoL2: (b) => { _noL2 = !!b; },
     _setDbgLayer: (l) => { _dbgLayer = l; }, _dbgCapRead: async (nm, n) => _dbgCap[nm] ? Array.from(await E.readF32(_dbgCap[nm], n)) : null,
     _setSwapQK: (b) => { _swapQK = !!b; }, _setDeltaMaxLayer: (l) => { _deltaMaxLayer = l; },
+    _setSub: (b) => { _subOverride = b; }, _caps: () => (E.caps ? E.caps() : null),
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
     _dbgState: async (l, n) => E.readF32(_deltaS[l], n || 64),
