@@ -393,6 +393,50 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [xBuf, gRec.pack, gRec.scales, uRec.pack, uRec.scales, swiBuf, d], [gx, gy, 1]);
   }
 
+  // ============================================================
+  // Qwen3.5 — Gated DeltaNet recurrent step (decode, 1 token). THE crux kernel.
+  // Per head: S[key][val] state. Inputs q,k (L2-normed), v, and per-head expg
+  // (decay = exp(-exp(A_log)*softplus(a+dt_bias))) + beta (sigmoid(b)). Exact ref
+  // (HF Qwen3NextGatedDeltaNet torch_recurrent_gated_delta_rule):
+  //   S = S*expg ; kv[val]=Σ_key S[key][val]*k[key] ; δ[val]=(v[val]-kv[val])*beta
+  //   S[key][val] += k[key]*δ[val] ; out[val]=Σ_key S[key][val]*q[key]
+  // STATE STORED TRANSPOSED St[head][val][key] so thread=val owns a contiguous row.
+  // One workgroup per head; DELTA_DIM threads (val index). g/beta/L2-norm computed
+  // upstream (separate kernels, TODO); this kernel is the recurrence proper.
+  // ============================================================
+  const DELTA_DIM = 128;   // key_head_dim == value_head_dim
+  const DELTA_WGSL = `
+struct P { nHeads:u32, dim:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       q  : array<f32>;   // [nHeads*dim] L2-normed
+@group(0) @binding(1) var<storage, read>       k  : array<f32>;   // [nHeads*dim] L2-normed
+@group(0) @binding(2) var<storage, read>       v  : array<f32>;   // [nHeads*dim]
+@group(0) @binding(3) var<storage, read>       gb : array<f32>;   // [nHeads*2]: expg, beta per head
+@group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] transposed [head][val][key]
+@group(0) @binding(5) var<storage, read_write> outv : array<f32>; // [nHeads*dim]
+@group(0) @binding(6) var<uniform>             p  : P;
+var<workgroup> ksh : array<f32, ${DELTA_DIM}>;
+var<workgroup> qsh : array<f32, ${DELTA_DIM}>;
+@compute @workgroup_size(${DELTA_DIM},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let h = wg.x; let vi = lid.x; let dim = p.dim; let base = h*dim;
+  if (vi < dim) { ksh[vi] = k[base+vi]; qsh[vi] = q[base+vi]; }
+  workgroupBarrier();
+  if (vi >= dim) { return; }
+  let expg = gb[h*2u]; let beta = gb[h*2u + 1u];
+  let row = h*dim*dim + vi*dim;          // St[h][vi][*]
+  var kv : f32 = 0.0;
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let s = S[row+kk]*expg; S[row+kk] = s; kv = kv + s*ksh[kk]; }
+  let delta = (v[base+vi] - kv) * beta;
+  var o : f32 = 0.0;
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let s = S[row+kk] + ksh[kk]*delta; S[row+kk] = s; o = o + s*qsh[kk]; }
+  outv[base+vi] = o;
+}`;
+  function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim) {
+    const pipe = E.getPipeline('q35.delta', DELTA_WGSL);
+    const p = uniform(new Uint32Array([nHeads, dim, 0, 0]));
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, p], [nHeads, 1, 1]);
+  }
+
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
   const MATVECQ_WGSL = `
 enable f16;
@@ -900,6 +944,31 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await st.mapAsync(GPUMapMode.READ); const idx=new Uint32Array(st.getMappedRange())[0]; st.unmap(); st.destroy();
       check('argmax', idx===3712?0:1);
       [ab,ob].forEach(b=>b.destroy());
+    }
+    // --- deltaRecur (gated DeltaNet recurrent step) vs CPU reference ---
+    {
+      const H=3, dim=DELTA_DIM;              // heads, head_dim (=128, matches WG)
+      const q=new Float32Array(H*dim), k=new Float32Array(H*dim), v=new Float32Array(H*dim);
+      const gb=new Float32Array(H*2), S0=new Float32Array(H*dim*dim);
+      for(let i=0;i<H*dim;i++){ q[i]=Math.sin(i*0.11); k[i]=Math.cos(i*0.07); v[i]=Math.sin(i*0.05+1); }
+      for(let h=0;h<H;h++){ gb[h*2]=0.6+0.1*h; gb[h*2+1]=0.3+0.2*h; }   // expg, beta
+      for(let i=0;i<S0.length;i++) S0[i]=Math.sin(i*0.013)*0.1;          // nonzero initial state
+      // GPU
+      const qb=f32buf(q),kb=f32buf(k),vb=f32buf(v),gbb=f32buf(gb);
+      const Sb=f32buf(S0), ob=E.createBuffer(H*dim*4, ST(),'o');
+      await deltaRecur(qb,kb,vb,gbb,Sb,ob,H,dim);
+      const gotOut=await E.readF32(ob,H*dim); const gotS=await E.readF32(Sb,H*dim*dim);
+      // CPU ref — transposed state St[h][val][key], exact recurrence
+      const St=Float32Array.from(S0); const cOut=new Float32Array(H*dim);
+      for(let h=0;h<H;h++){ const expg=gb[h*2], beta=gb[h*2+1], base=h*dim;
+        for(let vi=0;vi<dim;vi++){ const row=h*dim*dim+vi*dim;
+          let kv=0; for(let kk=0;kk<dim;kk++){ const s=St[row+kk]*expg; St[row+kk]=s; kv+=s*k[base+kk]; }
+          const delta=(v[base+vi]-kv)*beta;
+          let o=0; for(let kk=0;kk<dim;kk++){ const s=St[row+kk]+k[base+kk]*delta; St[row+kk]=s; o+=s*q[base+kk]; }
+          cOut[base+vi]=o;
+        } }
+      check('deltaRecur', Math.max(maxAbs(gotOut,cOut), maxAbs(gotS,St)), 1e-3);
+      [qb,kb,vb,gbb,Sb,ob].forEach(b=>b.destroy());
     }
     return out;
   }
