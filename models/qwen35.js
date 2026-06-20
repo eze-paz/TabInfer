@@ -40,7 +40,8 @@ const SandpieQwen35 = (function () {
     // gated-DeltaNet (linear-attention) layers:
     deltaHeads: 16, deltaKeyDim: 128, deltaValDim: 128, convKernel: 4,
     intermediate: 3584, vocab: 248320,
-    ropeTheta: 1000000, rmsEps: 1e-6,
+    ropeTheta: 10000000, rotaryDim: 64,   // partial_rotary_factor 0.25 × head_dim 256
+    rmsEps: 1e-6,
     tieEmbeddings: true,
     layerFullAttn: LAYER_FULL_ATTN,
     weightPrefix: 'model.language_model.',
@@ -483,7 +484,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
   // One workgroup per head, ${DELTA_DIM} threads, shared-mem sum reduction.
   // ============================================================
   const L2_WGSL = `
-struct P { nHeads:u32, dim:u32, eps:f32, _a:u32 };
+struct P { nHeads:u32, dim:u32, eps:f32, scale:f32 };
 @group(0) @binding(0) var<storage, read>       x   : array<f32>;
 @group(0) @binding(1) var<storage, read_write> outv: array<f32>;
 @group(0) @binding(2) var<uniform>             p   : P;
@@ -499,13 +500,14 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if (i < stride) { red[i] = red[i] + red[i+stride]; }
     workgroupBarrier(); stride = stride / 2u; }
   if (i >= dim) { return; }
-  let inv = 1.0 / sqrt(red[0] + p.eps);
+  let inv = (1.0 / sqrt(red[0] + p.eps)) * p.scale;
   outv[base+i] = x[base+i] * inv;
 }`;
-  function l2normHeads(inBuf, outBuf, nHeads, dim, eps) {
+  function l2normHeads(inBuf, outBuf, nHeads, dim, eps, scale) {
     const pipe = E.getPipeline('q35.l2', L2_WGSL);
     const u = new Uint32Array(4); const du = new DataView(u.buffer);
-    du.setUint32(0, nHeads, true); du.setUint32(4, dim, true); du.setFloat32(8, eps, true);
+    du.setUint32(0, nHeads, true); du.setUint32(4, dim, true);
+    du.setFloat32(8, eps, true); du.setFloat32(12, scale == null ? 1.0 : scale, true);
     const p = uniform(u);
     return E.dispatch(pipe, [inBuf, outBuf, p], [nHeads, 1, 1]);
   }
@@ -542,8 +544,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
   }
 
   // ============================================================
-  // Gated RMSNorm (Qwen3NextRMSNormGated), per-head over value head_dim:
-  //   t = x * silu(z) ; out = t * rsqrt(mean(t²)+eps) * weight
+  // Gated RMSNorm (Qwen3NextRMSNormGated), per-head over value head_dim.
+  // EXACT HF order: variance from the UN-gated x, normalize, weight, THEN silu(z):
+  //   v = mean(x²) ; out = x * rsqrt(v+eps) * weight * silu(z)
   // weight is [dim], shared across heads. 1 workgroup/head, ${DELTA_DIM} threads.
   // ============================================================
   const GRMS_WGSL = `
@@ -558,9 +561,8 @@ var<workgroup> red : array<f32, ${DELTA_DIM}>;
 @compute @workgroup_size(${DELTA_DIM},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let h = wg.x; let i = lid.x; let dim = p.dim; let base = h*dim;
-  var t : f32 = 0.0;
-  if (i < dim) { let zg = z[base+i]; let s = zg / (1.0 + exp(-zg)); t = x[base+i] * s; }
-  red[i] = t*t;
+  let xv = select(0.0, x[base+i], i < dim);
+  red[i] = xv*xv;                       // variance from UN-gated x
   workgroupBarrier();
   var stride = ${DELTA_DIM}u / 2u;
   loop { if (stride == 0u) { break; }
@@ -568,7 +570,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     workgroupBarrier(); stride = stride / 2u; }
   if (i >= dim) { return; }
   let inv = inverseSqrt(red[0] / f32(dim) + p.eps);
-  outv[base+i] = t * inv * f32(w[i]);
+  let zg = z[base+i]; let sz = zg / (1.0 + exp(-zg));   // silu(z), applied LAST
+  outv[base+i] = xv * inv * f32(w[i]) * sz;
 }`;
   function gatedRMSNorm(xBuf, zBuf, wBuf, outBuf, nHeads, dim, eps) {
     const pipe = E.getPipeline('q35.grms', GRMS_WGSL);
@@ -730,6 +733,87 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
 
   // ============================================================
+  // Qwen3.5 full-attention RoPE + per-head QK-norm (head_dim 256, PARTIAL rotary).
+  // - per-head RMSNorm over the full hd (256), * normW[hd]
+  // - rotate only the first rotDim (64) dims (NeoX half-split within the 64-block);
+  //   dims [rotDim,hd) pass through. theta=1e7. (mRoPE reduces to standard RoPE for
+  //   text-only since all 3 position components equal the text position.)
+  // - input head stride `inStride` lets q read from the gated q_proj output
+  //   ([nH, 2*hd] interleaved query|gate → take the first hd) while k uses inStride=hd.
+  // One workgroup per (t,head), WG_HD threads (= hd).
+  // ============================================================
+  const WG_HD = 256;
+  const ROPEQK35_WGSL = `
+enable f16;
+struct P { T:u32, nH:u32, hd:u32, inStride:u32, rotDim:u32, posBase:u32, theta:f32, eps:f32 };
+@group(0) @binding(0) var<storage, read>       inp  : array<f32>;
+@group(0) @binding(1) var<storage, read>       normW: array<f16>;
+@group(0) @binding(2) var<storage, read_write> out  : array<f32>;
+@group(0) @binding(3) var<uniform>             p    : P;
+var<workgroup> red : array<f32, ${WG_HD}>;
+var<workgroup> nrm : array<f32, ${WG_HD}>;
+@compute @workgroup_size(${WG_HD},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hd=p.hd; let j=lid.x;
+  let unit=wg.x; let t=unit/p.nH; let head=unit%p.nH;
+  let baseIn  = t*(p.nH*p.inStride) + head*p.inStride;
+  let baseOut = t*(p.nH*hd) + head*hd;
+  var v:f32=0.0; if(j<hd){ v=inp[baseIn+j]; }
+  red[j]=select(0.0, v*v, j<hd); workgroupBarrier();
+  var stride=${WG_HD}u/2u;
+  loop{ if(stride==0u){break;} if(j<stride){red[j]=red[j]+red[j+stride];} workgroupBarrier(); stride=stride/2u; }
+  let inv=inverseSqrt(red[0]/f32(hd)+p.eps);
+  if(j<hd){ nrm[j]=v*inv*f32(normW[j]); }
+  workgroupBarrier();
+  if(j>=hd){ return; }
+  let rotDim=p.rotDim;
+  if(j>=rotDim){ out[baseOut+j]=nrm[j]; return; }   // pass-through (no rotation)
+  let half=rotDim/2u;
+  let pos=f32(p.posBase+t);
+  let freqIdx = select(j-half, j, j<half);
+  let invFreq = pow(p.theta, -2.0*f32(freqIdx)/f32(rotDim));
+  let ang=pos*invFreq; let c=cos(ang); let s=sin(ang);
+  let xj=nrm[j];
+  let partner = select(nrm[j-half], nrm[j+half], j<half);
+  let rot = select(partner, -partner, j<half);
+  out[baseOut+j] = xj*c + rot*s;
+}`;
+  function ropeQKNorm35(inBuf, normWBuf, outBuf, T, nH, hd, inStride, rotDim, posBase, theta, eps) {
+    if (inBuf === outBuf) throw new Error('ropeQKNorm35: in-place not allowed');
+    const pipe = E.getPipeline('q35.ropeqk', ROPEQK35_WGSL);
+    const u = new Uint32Array(8); const dv = new DataView(u.buffer);
+    dv.setUint32(0,T,true); dv.setUint32(4,nH,true); dv.setUint32(8,hd,true); dv.setUint32(12,inStride,true);
+    dv.setUint32(16,rotDim,true); dv.setUint32(20,posBase,true); dv.setFloat32(24,theta,true); dv.setFloat32(28,eps,true);
+    const p = uniform(u);
+    return E.dispatch(pipe, [inBuf, normWBuf, outBuf, p], [T*nH, 1, 1]);
+  }
+
+  // ============================================================
+  // Qwen3.5 attention output gate. q_proj output is [nH, 2*hd] = query|gate
+  // interleaved per head; after attention, out *= sigmoid(gate). This kernel reads
+  // the gate half straight from qproj (stride 2*hd, offset hd) and applies it.
+  //   gated[h*hd+d] = attn[h*hd+d] * sigmoid(qproj[h*2*hd + hd + d])
+  // ============================================================
+  const GATE35_WGSL = `
+struct P { nH:u32, hd:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       attn  : array<f32>;   // [nH*hd]
+@group(0) @binding(1) var<storage, read>       qproj : array<f32>;   // [nH*2*hd]
+@group(0) @binding(2) var<storage, read_write> outv  : array<f32>;   // [nH*hd]
+@group(0) @binding(3) var<uniform>             p     : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let i=gid.x; let total=p.nH*p.hd; if(i>=total){return;}
+  let h=i/p.hd; let d=i%p.hd;
+  let g=qproj[h*2u*p.hd + p.hd + d];
+  outv[i] = attn[i] * (1.0/(1.0+exp(-g)));
+}`;
+  function applyGate35(attnBuf, qprojBuf, outBuf, nH, hd) {
+    const pipe = E.getPipeline('q35.gate', GATE35_WGSL);
+    const p = uniform(new Uint32Array([nH, hd, 0, 0]));
+    return E.dispatch(pipe, [attnBuf, qprojBuf, outBuf, p], [Math.ceil((nH*hd)/64), 1, 1]);
+  }
+
+  // ============================================================
   // Kernel 5 — GQA causal attention.
   // Q[T, nHq*hd], K[S, nKv*hd], V[S, nKv*hd] → O[T, nHq*hd].
   // q-head h uses kv-head h/(nHq/nKv). Causal: key s attends iff s <= (S-T)+t
@@ -744,7 +828,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   //   • output: hd threads (one per dim) each sum over keys → O[d]
   // Scores live in shared mem (capacity ATTN_MAXK = MAX_SEQ). hd ≤ ATTN_WG.
   // ============================================================
-  const ATTN_WG = 128;
+  const ATTN_WG = 256;      // ≥ head_dim (Qwen3.5 full-attn hd=256); one thread per output dim
   const ATTN_MAXK = 2048;   // = MAX_SEQ; scores buffer size in shared memory
   const ATTN_WGSL = `
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
@@ -1178,12 +1262,57 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const got=await E.readF32(ob, H*dim);
       const silu=a=>a/(1+Math.exp(-a));
       const ref=new Float32Array(H*dim);
-      for(let h=0;h<H;h++){ const t=new Float32Array(dim); let ss=0;
-        for(let i=0;i<dim;i++){ t[i]=x[h*dim+i]*silu(z[h*dim+i]); ss+=t[i]*t[i]; }
+      for(let h=0;h<H;h++){ let ss=0;
+        for(let i=0;i<dim;i++){ const xv=x[h*dim+i]; ss+=xv*xv; }
         const inv=1/Math.sqrt(ss/dim+eps);
-        for(let i=0;i<dim;i++) ref[h*dim+i]=t[i]*inv*wR[i]; }
+        for(let i=0;i<dim;i++) ref[h*dim+i]=x[h*dim+i]*inv*wR[i]*silu(z[h*dim+i]); }
       check('gatedRMSNorm', maxAbs(got,ref), 1e-2);
       [xb,zb,wb,ob].forEach(b=>b.destroy());
+    }
+    // --- ropeQKNorm35 (qnorm hd256 + partial rotary 64, gated input stride) vs CPU ---
+    {
+      const T=2, nH=2, hd=8, rotDim=4, inStride=2*hd, eps=1e-6, theta=1e7, posBase=3;
+      const inp=new Float32Array(T*nH*inStride), nw=new Float32Array(hd);
+      for(let i=0;i<inp.length;i++) inp[i]=Math.sin(i*0.13)*1.5;
+      for(let i=0;i<hd;i++) nw[i]=0.7+0.3*Math.cos(i);
+      const nwR=roundF16(nw);
+      const ib=f32buf(inp), wb=f16buf(nw), ob=E.createBuffer(T*nH*hd*4,ST(),'o');
+      await ropeQKNorm35(ib, wb, ob, T, nH, hd, inStride, rotDim, posBase, theta, eps);
+      const got=await E.readF32(ob, T*nH*hd);
+      // CPU ref
+      const ref=new Float32Array(T*nH*hd); const half=rotDim/2;
+      for(let t=0;t<T;t++) for(let h=0;h<nH;h++){
+        const bi=t*nH*inStride+h*inStride, bo=t*nH*hd+h*hd;
+        let ss=0; for(let j=0;j<hd;j++){ const v=inp[bi+j]; ss+=v*v; }
+        const inv=1/Math.sqrt(ss/hd+eps);
+        const nrm=new Float32Array(hd); for(let j=0;j<hd;j++) nrm[j]=inp[bi+j]*inv*nwR[j];
+        const pos=posBase+t;
+        for(let j=0;j<hd;j++){
+          if(j>=rotDim){ ref[bo+j]=nrm[j]; continue; }
+          const freqIdx = j<half ? j : j-half;
+          const invF = Math.pow(theta, -2*freqIdx/rotDim);
+          const ang=pos*invF, c=Math.cos(ang), s=Math.sin(ang);
+          const partner = j<half ? nrm[j+half] : nrm[j-half];
+          const rot = j<half ? -partner : partner;
+          ref[bo+j]=nrm[j]*c+rot*s;
+        }
+      }
+      check('ropeQKNorm35', maxAbs(got,ref), 1e-2);
+      [ib,wb,ob].forEach(b=>b.destroy());
+    }
+    // --- applyGate35 (attn * sigmoid(gate-half of qproj)) vs CPU ---
+    {
+      const nH=3, hd=8;
+      const attn=new Float32Array(nH*hd), qproj=new Float32Array(nH*2*hd);
+      for(let i=0;i<attn.length;i++) attn[i]=Math.sin(i*0.2);
+      for(let i=0;i<qproj.length;i++) qproj[i]=Math.cos(i*0.15);
+      const ab=f32buf(attn), qb=f32buf(qproj), ob=E.createBuffer(nH*hd*4,ST(),'o');
+      await applyGate35(ab, qb, ob, nH, hd);
+      const got=await E.readF32(ob, nH*hd);
+      const ref=new Float32Array(nH*hd);
+      for(let h=0;h<nH;h++) for(let d=0;d<hd;d++){ const g=qproj[h*2*hd+hd+d]; ref[h*hd+d]=attn[h*hd+d]/(1+Math.exp(-g)); }
+      check('applyGate35', maxAbs(got,ref), 1e-5);
+      [ab,qb,ob].forEach(b=>b.destroy());
     }
     return out;
   }
@@ -1194,7 +1323,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // byte-level encode → rank-ordered BPE merges → vocab ids. Specials spliced
   // directly. Loaded from tokenizer.json (vocab + merges + added_tokens).
   // ============================================================
-  const SPECIAL = { endoftext: 151643, im_start: 151644, im_end: 151645, think: 151667, think_end: 151668 };
+  // Qwen3.5 special ids (resolved from the loaded vocab by content in TOK.load;
+  // these defaults are the known Qwen3.5-0.8B ids in case resolution is skipped).
+  const SPECIAL = { endoftext: 248044, im_start: 248045, im_end: 248046, think: 248068, think_end: 248069 };
   // JS port of the Qwen pre_tokenizer Split regex ((?i:'s|…) expanded to case classes).
   const PRETOK_RE = /(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
 
@@ -1223,6 +1354,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       vocab = j.model.vocab;                       // token string -> id
       idToTok = {}; for (const k in vocab) idToTok[vocab[k]] = k;
       for (const a of (j.added_tokens || [])) { vocab[a.content] = a.id; idToTok[a.id] = a.content; }
+      // Resolve special-token ids from the actual vocab (robust across vocab sizes).
+      const sp = (c, d) => (vocab[c] != null ? vocab[c] : d);
+      SPECIAL.endoftext = sp('<|endoftext|>', SPECIAL.endoftext);
+      SPECIAL.im_start  = sp('<|im_start|>',  SPECIAL.im_start);
+      SPECIAL.im_end    = sp('<|im_end|>',    SPECIAL.im_end);
+      SPECIAL.think     = sp('<think>',       SPECIAL.think);
+      SPECIAL.think_end = sp('</think>',      SPECIAL.think_end);
       bpeRanks = new Map();
       const merges = j.model.merges || [];
       for (let i = 0; i < merges.length; i++) {
