@@ -33,6 +33,14 @@ const SandpieQwen35 = (function () {
   // full_attention_interval=4 → every 4th layer (index%4==3) is full attention.
   const LAYER_FULL_ATTN = Array.from({ length: 24 }, (_, i) => (i % 4) === 3);
 
+  // Qwen3.5 variants — architecturally identical except hidden_size & intermediate_size
+  // (same 24 layers, head_dim 256, DeltaNet 16×128, vocab 248320, rotary). So switching
+  // models is purely a config + URL change; no kernel changes.
+  const VARIANTS = {
+    '0.8B': { hidden: 1024, intermediate: 3584, repo: 'Qwen3.5-0.8B' },
+    '2B':   { hidden: 2048, intermediate: 6144, repo: 'Qwen3.5-2B' },
+  };
+  let _variant = '0.8B';
   const CONFIG = {
     numLayers: 24, hidden: 1024,
     // full-attention layers:
@@ -671,6 +679,33 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
     return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1]);
   }
+  // int4 embedding gather — dequantizes row ids[idOff+t] from the tied int4 embed
+  // (so we don't keep a separate f16 embed copy; the same int4 weight also feeds
+  // the lm_head). Saves ~0.5GB (0.8B) / ~1GB (2B) of GPU memory.
+  const EMBEDQ_WGSL = `
+enable f16;
+struct P { T:u32, H:u32, idOff:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       ids : array<u32>;
+@group(0) @binding(1) var<storage, read>       W   : array<u32>;     // [vocab*H/8] packed nibbles
+@group(0) @binding(2) var<storage, read>       sc  : array<f16>;     // [vocab*H/QGROUP] scales
+@group(0) @binding(3) var<storage, read_write> y   : array<f32>;
+@group(0) @binding(4) var<uniform>             p   : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let idx=gid.x; let total=p.T*p.H; if(idx>=total){return;}
+  let t=idx/p.H; let h=idx%p.H;
+  let id=ids[p.idOff + t];
+  let words=p.H/8u; let gpr=p.H/${QGROUP}u;
+  let word=W[id*words + h/8u];
+  let nib=(word >> (4u*(h%8u))) & 0xFu;
+  let s=f32(sc[id*gpr + h/${QGROUP}u]);
+  y[idx]=(f32(nib)-8.0)*s;
+}`;
+  function embedGatherQ(idsBuf, packBuf, scBuf, yBuf, T, H, idOff) {
+    const pipe = E.getPipeline('q35.embedQ', EMBEDQ_WGSL);
+    const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
+    return E.dispatch(pipe, [idsBuf, packBuf, scBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1]);
+  }
 
   // ============================================================
   // Kernel 4 — RoPE + per-head QK-norm (fused), for one tensor (q or k).
@@ -1124,6 +1159,20 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       check('gemvQ', maxAbs(got,y), 1e-2);
       [xb,pb,sb,yb].forEach(b=>b.destroy());
     }
+    // --- embedGatherQ (int4 embedding gather) vs CPU dequant ---
+    {
+      const V=20,H=64,T=4;
+      const Ef=new Float32Array(V*H); for(let i=0;i<Ef.length;i++)Ef[i]=Math.sin(i*0.017);
+      const {pack,scales}=quantizeInt4Bf16(f32ToBf16(Ef),V,H);
+      const Edq=dequantInt4(pack,scales,V,H);
+      const ids=new Uint32Array([3,0,19,7]);
+      const ib=u32buf(ids),pb=qbuf(pack),sb=sbuf(scales),yb=E.createBuffer(T*H*4,ST(),'y');
+      await embedGatherQ(ib,pb,sb,yb,T,H,0);
+      const got=await E.readF32(yb,T*H); const y=new Float32Array(T*H);
+      for(let t=0;t<T;t++)for(let h=0;h<H;h++)y[t*H+h]=Edq[ids[t]*H+h];
+      check('embedGatherQ', maxAbs(got,y), 1e-3);
+      [ib,pb,sb,yb].forEach(b=>b.destroy());
+    }
     // --- matvecQ (int4 batched) vs CPU dequant ---
     {
       const T=5,N=96,K=128;
@@ -1432,9 +1481,18 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Kernels read array<f16> and convert to f32 for the math (activations stay f32).
   // bf16→f16 goes via f32 (different exponent widths). Cached in Cache Storage.
   // ============================================================
-  const MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/';
-  const MODEL_FILE = 'model.safetensors-00001-of-00001.safetensors';   // single shard (odd name)
-  const CACHE_NAME = 'sandpie-webgpu-models-q35';
+  let MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/';
+  const MODEL_FILE = 'model.safetensors-00001-of-00001.safetensors';   // single shard, same name both variants
+  // Select the active variant (call before loadModel). Mutates CONFIG dims + the model
+  // URL + the OPFS cache key. If a different variant is already loaded, unload first.
+  function selectModel(v) {
+    if (!VARIANTS[v]) throw new Error('unknown variant ' + v);
+    if (_loaded && v !== _variant) unload();
+    _variant = v;
+    CONFIG.hidden = VARIANTS[v].hidden;
+    CONFIG.intermediate = VARIANTS[v].intermediate;
+    MODEL_ROOT = 'https://huggingface.co/Qwen/' + VARIANTS[v].repo + '/resolve/main/';
+  }
   let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
 
@@ -1527,11 +1585,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   function bf16ToF32arr(u16) { const out = new Float32Array(u16.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
     for (let i = 0; i < u16.length; i++) { ti[0] = u16[i] << 16; out[i] = t[0]; } return out; }
 
-  const OPFS_FILE = 'q35-model.safetensors';   // OPFS cache (GB-scale quota, unlike Cache Storage)
+  const opfsFile = () => 'q35-' + _variant + '-model.safetensors';   // per-variant OPFS cache (GB-scale quota)
   async function opfsRead(onProgress) {
     try {
       const root = await navigator.storage.getDirectory();
-      const fh = await root.getFileHandle(OPFS_FILE);   // throws if absent
+      const fh = await root.getFileHandle(opfsFile());   // throws if absent
       const f = await fh.getFile();
       if (f.size < 1e9) return null;                    // partial/corrupt
       onProgress && onProgress({ phase: 'cache', pct: 100 });
@@ -1541,7 +1599,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   async function opfsWrite(u8) {
     try {
       const root = await navigator.storage.getDirectory();
-      const fh = await root.getFileHandle(OPFS_FILE, { create: true });
+      const fh = await root.getFileHandle(opfsFile(), { create: true });
       const w = await fh.createWritable();
       const CH = 64 * 1024 * 1024;   // 64MB chunks (single 1.75GB write fails silently)
       for (let off = 0; off < u8.length; off += CH) {
@@ -1550,9 +1608,27 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await w.close();
     } catch (e) { try { console.warn('[q35] opfsWrite failed', e); } catch (_) {} }
   }
+  // A byte source with readRange(start,len) → fresh Uint8Array. Backed either by a
+  // single ArrayBuffer (small / cached models) or by the raw download chunks (large
+  // models, since a single ArrayBuffer can't exceed ~4GB in the browser — 2B is 4.5GB).
+  function srcFromAB(ab) { return { byteLength: ab.byteLength, readRange: (s, n) => new Uint8Array(ab.slice(s, s + n)) }; }
+  function srcFromChunks(chunks) {
+    const offs = new Array(chunks.length + 1); offs[0] = 0;
+    for (let i = 0; i < chunks.length; i++) offs[i + 1] = offs[i] + chunks[i].length;
+    const find = (pos) => { let lo = 0, hi = chunks.length - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (offs[m + 1] <= pos) lo = m + 1; else hi = m; } return lo; };
+    return {
+      byteLength: offs[chunks.length],
+      readRange(start, len) {
+        const out = new Uint8Array(len); let written = 0, pos = start, ci = find(start);
+        while (written < len) { const c = chunks[ci], inOff = pos - offs[ci], take = Math.min(c.length - inOff, len - written);
+          out.set(c.subarray(inOff, inOff + take), written); written += take; pos += take; ci++; }
+        return out;
+      },
+    };
+  }
   async function fetchModelBytes(onProgress) {
     const cached = await opfsRead(onProgress);
-    if (cached) return cached;
+    if (cached) return srcFromAB(cached);
     const resp = await fetch(MODEL_ROOT + MODEL_FILE);
     const total = +(resp.headers.get('content-length') || 0);
     const reader = resp.body.getReader(); const chunks = []; let recv = 0;
@@ -1561,20 +1637,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       chunks.push(value); recv += value.length;
       if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
     }
-    const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
-    await opfsWrite(out);
-    return out.buffer;
+    // Cache + single-buffer path only when it fits one ArrayBuffer (<4GB); else stream from chunks.
+    if (recv < 4_000_000_000) {
+      const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+      await opfsWrite(out);
+      return srcFromAB(out.buffer);
+    }
+    return srcFromChunks(chunks);
   }
 
-  async function loadModel({ onProgress } = {}) {
+  async function loadModel({ onProgress, variant } = {}) {
+    if (variant) selectModel(variant);   // may unload a different already-loaded variant
     if (_loaded) return;
     await E.init();
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
-    const ab = await fetchModelBytes(onProgress);
+    const src = await fetchModelBytes(onProgress);
     onProgress && onProgress({ phase: 'parse', pct: 0 });
-    const headerLen = Number(new DataView(ab, 0, 8).getBigUint64(0, true));
-    const header = JSON.parse(dec_(new Uint8Array(ab, 8, headerLen)));
+    const headerLen = Number(new DataView(src.readRange(0, 8).buffer).getBigUint64(0, true));
+    const header = JSON.parse(dec_(src.readRange(8, headerLen)));
     const dataStart = 8 + headerLen;
     _weights = {};
     const names = Object.keys(header).filter(n => n !== '__metadata__' && !isSkip(n));
@@ -1584,7 +1665,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const name = names[i], info = header[name];
       const [begin, end] = info.data_offsets;
       const numel = info.shape.reduce((a, b) => a * b, 1);
-      const raw = new Uint8Array(ab, dataStart + begin, end - begin);
+      const raw = src.readRange(dataStart + begin, end - begin);
       if (isQuantWeight(name)) {
         if (info.dtype !== 'BF16') throw new Error('quant path expects BF16 for ' + name);
         const N = info.shape[0], K = info.shape[1];
@@ -1602,6 +1683,18 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const buf = E.createBuffer(numel * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
         E.device().queue.writeBuffer(buf, 0, f32);
         _weights[name] = { buf, f32: true, shape: info.shape, numel };
+      } else if (name.endsWith('embed_tokens.weight')) {
+        // Tied embedding: store ONLY an int4 copy. It serves BOTH the embedding gather
+        // (embedGatherQ dequantizes a row) AND the lm_head matmul. No f16 copy → saves
+        // ~0.5GB (0.8B) / ~1GB (2B) of GPU memory and a redundant buffer.
+        if (info.dtype !== 'BF16') throw new Error('embed expects BF16');
+        const N = info.shape[0], K = info.shape[1];
+        const { pack, scales } = quantizeInt4Bf16(aligned(raw, Uint16Array), N, K);
+        const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'embed.pack');
+        const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'embed.sc');
+        E.device().queue.writeBuffer(packBuf, 0, pack);
+        E.device().queue.writeBuffer(scBuf, 0, scales);
+        _weights['__embed_int4'] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
       } else {
         let f16bits;
         if (info.dtype === 'BF16') f16bits = bf16ToF16bits(aligned(raw, Uint16Array));
@@ -1611,18 +1704,6 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
         E.device().queue.writeBuffer(buf, 0, f16bits);
         _weights[name] = { buf, shape: info.shape, numel };
-        // Tied lm_head: also build an int4 copy of the embedding. The f16 248K-vocab
-        // matmul was ~46% of decode GPU time (~17ms); int4 cuts it ~6x (~3ms). The f16
-        // copy is kept for the embedding GATHER (which reads f16 rows).
-        if (name.endsWith('embed_tokens.weight') && info.dtype === 'BF16') {
-          const N = info.shape[0], K = info.shape[1];
-          const { pack, scales } = quantizeInt4Bf16(aligned(raw, Uint16Array), N, K);
-          const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'lmhead.pack');
-          const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'lmhead.sc');
-          E.device().queue.writeBuffer(packBuf, 0, pack);
-          E.device().queue.writeBuffer(scBuf, 0, scales);
-          _weights['__lmhead_int4'] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
-        }
       }
       if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
     }
@@ -1665,6 +1746,19 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _scr = null;
   let _idsBuf = null, _idsCap = 0;
   let _tokHist = null;     // GPU token history: argmax of pos P writes [P+1].
+
+  // Free all GPU buffers + reset state (so a different variant can load fresh).
+  function unload() {
+    const free = (b) => { if (b && b.destroy) b.destroy(); };
+    if (_weights) { for (const k in _weights) { const w = _weights[k]; free(w.buf); free(w.pack); free(w.scales); } _weights = null; }
+    if (_kv) { for (const l of _kv) { if (l) { free(l.k); free(l.v); } } _kv = null; }
+    if (_convState) { for (const b of _convState) free(b); _convState = null; }
+    if (_deltaS) { for (const b of _deltaS) free(b); _deltaS = null; }
+    if (_scr) { for (const k in _scr) free(_scr[k]); _scr = null; }
+    free(_tokHist); _tokHist = null;
+    free(_idsBuf); _idsBuf = null; _idsCap = 0;
+    _loaded = false;
+  }
 
   function scrBuf(n, label) { return E.createBuffer(n * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, label); }
   function zeroBuf(buf, bytes) { const enc = E.device().createCommandEncoder(); enc.clearBuffer(buf, 0, bytes); E.device().queue.submit([enc.finish()]); }
@@ -1756,7 +1850,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     E.beginBatch();
     const embIds = chain ? _tokHist : setIds([tokenId]);
     const embOff = chain ? pos : 0;
-    await embedGather(embIds, W('embed_tokens.weight'), s.x, 1, H, embOff);
+    const emb = _weights['__embed_int4'];
+    await embedGatherQ(embIds, emb.pack, emb.scales, s.x, 1, H, embOff);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, 1, H, C.rmsEps);
@@ -1818,7 +1913,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
     }
     await rmsnorm(s.x, W('norm.weight'), s.normed, 1, H, C.rmsEps);
-    await linearQ(s.normed, _weights['__lmhead_int4'], s.logits, 1, C.vocab, H);          // tied lm_head (int4; ~6x less bandwidth than f16)
+    await linearQ(s.normed, _weights['__embed_int4'], s.logits, 1, C.vocab, H);           // tied lm_head (same int4 embed buffer)
     await argmaxKernel(s.logits, _tokHist, C.vocab, pos + 1);
     const _t1 = _PERF ? performance.now() : 0;
     const drain = E.endBatch();
@@ -1907,6 +2002,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
+    selectModel, unload, variant: () => _variant, VARIANTS,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     __reset: () => resetState(),
