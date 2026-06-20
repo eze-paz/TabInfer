@@ -1988,31 +1988,19 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // (CPU encode, no drain wait) BEFORE reading the current token, so encode(N+1)
   // overlaps GPU-run(N) — un-doing the serialization batching introduced.
   const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
+  let _genBatch = 8;   // tokens per GPU-resident decode batch (1 readback per batch); tunable for A/B
 
-  // Greedy generate. Prefill feeds the prompt token-by-token (the DeltaNet recurrence
-  // is sequential, so every position — prompt and generated — runs as a single-token
-  // forward). Then decode loops, feeding back each predicted token.
-  async function generate(prompt, { maxTokens = 64, onToken, signal, system } = {}) {
-    await loadModel({});
-    resetState();
-    const msgs = [];
-    if (system) msgs.push({ role: 'system', content: system });
-    msgs.push({ role: 'user', content: prompt });
-    const ids = TOK.encodeChat(msgs);
+  // Core greedy decode over a prepared prompt id list. Prefill feeds the prompt
+  // token-by-token (the DeltaNet recurrence is sequential), then a batched GPU-resident
+  // decode loop chains GEN_BATCH forwards per readback. onToken(piece) gets each decoded
+  // token. Caller must resetState() + loadModel() first. Returns the output token ids.
+  async function _streamIds(ids, { maxTokens = 256, onToken, signal } = {}) {
     const L = ids.length;
     let tok = 0;
-    for (let i = 0; i < L; i++) {                 // prefill; last call predicts position L
-      if (signal && signal.aborted) return '';
-      tok = await forward(ids[i], i);
-    }
+    for (let i = 0; i < L; i++) { if (signal && signal.aborted) return []; tok = await forward(ids[i], i); }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
-    if (!emit(tok)) return TOK.decode(outIds);   // tok = _tokHist[L] (token at position L)
-    // Batched GPU-resident decode: chain GEN_BATCH forwards back-to-back via the GPU
-    // token history (forward at pos reads _tokHist[pos], writes _tokHist[pos+1]) with
-    // NO readback between them, then read the whole batch in ONE mapAsync. The K CPU
-    // encodes overlap the K GPU runs and the per-token readback sync is amortized K×.
-    // The conv/recurrent/KV state updates in place; in-order submits keep it correct.
+    if (!emit(tok)) return outIds;
     while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
       if (signal && signal.aborted) break;
       const K = Math.min(_genBatch, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
@@ -2020,13 +2008,103 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
       const toks = await readU32Range(_tokHist, pos + 1, K);   // one readback for the whole batch
       pos += K;
-      let brk = false;
-      for (let k = 0; k < K; k++) { if (!emit(toks[k])) { brk = true; break; } }
+      let brk = false; for (let k = 0; k < K; k++) { if (!emit(toks[k])) { brk = true; break; } }
       if (brk) break;
     }
+    return outIds;
+  }
+
+  // Simple chat generate (single user turn). Returns the full decoded string.
+  async function generate(prompt, { maxTokens = 64, onToken, signal, system } = {}) {
+    await loadModel({});
+    resetState();
+    const msgs = [];
+    if (system) msgs.push({ role: 'system', content: system });
+    msgs.push({ role: 'user', content: prompt });
+    const outIds = await _streamIds(TOK.encodeChat(msgs), { maxTokens, onToken, signal });
     return TOK.decode(outIds);
   }
-  let _genBatch = 8;   // tokens per GPU-resident decode batch (1 readback per batch); tunable for A/B
+
+  // Incremental splitter for Qwen3.5's "<think>…</think>answer" output: text inside the
+  // think tags → onReason (live Thinking box), the rest → onContent. Holds an 8-char
+  // tail so a tag split across token pieces is still detected.
+  function makeThinkSplitter(onReason, onContent) {
+    let buf = '', inThink = false; const acc = { content: '', reasoning: '' };
+    const out = (text) => { if (!text) return; if (inThink) { acc.reasoning += text; onReason(text); } else { acc.content += text; onContent(text); } };
+    const step = () => {
+      for (;;) { const needle = inThink ? '</think>' : '<think>'; const idx = buf.indexOf(needle);
+        if (idx === -1) break; out(buf.slice(0, idx)); buf = buf.slice(idx + needle.length); inThink = !inThink; }
+      if (buf.length > 8) { out(buf.slice(0, buf.length - 8)); buf = buf.slice(buf.length - 8); }   // keep a tag-length guard tail
+    };
+    return { push(t) { buf += t; step(); }, flush() { out(buf); buf = ''; }, get content() { return acc.content; }, get reasoning() { return acc.reasoning; } };
+  }
+
+  // ============================================================
+  // Host contract — selectable backend in sandpie (see providers.js / conversations.js).
+  // Single-turn chat (no tool-calling yet; the small hybrid models are weak at it).
+  // ============================================================
+  const DEFAULT_N_CTX = MAX_SEQ;
+  const DEFAULT_MODELS = [
+    { id: '0.8B',   modelId: '0.8B',   label: 'Qwen3.5-0.8B int4 (hybrid DeltaNet, ~1.75GB DL)' },
+    { id: '2B-AWQ', modelId: '2B-AWQ', label: 'Qwen3.5-2B int4 (pre-quantized, ~2.5GB DL — recommended)' },
+    { id: '2B',     modelId: '2B',     label: 'Qwen3.5-2B (bf16→int4 in-browser, ~4.5GB DL)' },
+  ];
+  // Delete the OPFS-cached model files (called by the Settings "clear local models" button).
+  async function clearCache() {
+    try { const root = await navigator.storage.getDirectory();
+      for (const v of Object.keys(VARIANTS)) { try { await root.removeEntry('q35-' + v + '-model.safetensors'); } catch (_) {} } } catch (_) {}
+  }
+
+  // Page-side agent run (mirrors the wllama/litertlm/transformers.js contract). Streams
+  // the same event protocol conversations.js expects. Chat-only: one round, no tools.
+  async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
+    // Single active local backend: free the OTHER local LLMs' GPU/WASM contexts first.
+    try { await window.SandpieWllama?.unload?.(); } catch (_) {}
+    try { await window.SandpieTransformersJS?.unload?.(); } catch (_) {}
+    try { await window.SandpieLiteRTLM?.unload?.(); } catch (_) {}
+    const variant = (provider && provider.endpoint) || '0.8B';
+    const maxTokens = (provider && (provider.maxTokens | 0)) || 512;
+    try {
+      emit({ type: 'info', message: 'Loading Qwen3.5 (' + variant + ') locally (WebGPU)… first run downloads the weights.' });
+      let lastPct = -1;
+      await loadModel({ variant, onProgress: (p) => {
+        if (!p) return;
+        if (p.phase === 'download') { if (p.pct === lastPct) return; lastPct = p.pct; emit({ type: 'info', message: `Downloading… ${p.pct}% (${(p.recv / 1e9).toFixed(2)}GB)` }); }
+        else if (p.phase === 'cache') emit({ type: 'info', message: 'Loading from cache…' });
+        else if (p.phase === 'parse') emit({ type: 'info', message: 'Quantizing… ' + (p.pct || 0) + '%' });
+      } });
+    } catch (e) {
+      emit({ type: 'info', message: null });
+      if (e && e.name === 'AbortError') throw e;
+      emit({ type: 'error', message: 'webgpu: ' + ((e && e.message) || e) }); emit({ type: 'agent_done' }); return;
+    }
+    try {
+      const sys = (systemPrompt && typeof systemPrompt === 'object') ? (systemPrompt.content || '') : (systemPrompt || '');
+      const msgs = [];
+      if (sys) msgs.push({ role: 'system', content: sys });
+      for (const m of (messages || [])) { if (m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')) msgs.push({ role: m.role, content: typeof m.content === 'string' ? m.content : '' }); }
+      resetState();
+      emit({ type: 'round_start' });
+      let firstTok = false;
+      const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
+      const split = makeThinkSplitter(
+        (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },
+        (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },
+      );
+      await _streamIds(TOK.encodeChat(msgs), { maxTokens, signal, onToken: (piece) => split.push(piece) });
+      split.flush();
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      emit({ type: 'info', message: null });
+      const content = split.content;
+      emit({ type: 'round_end', content });
+      emit({ type: 'message_added', message: { role: 'assistant', content } });
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      emit({ type: 'info', message: null });
+      emit({ type: 'error', message: 'webgpu: ' + ((e && e.message) || e) });
+    }
+    emit({ type: 'agent_done' });
+  }
 
   return {
     CONFIG,
@@ -2034,6 +2112,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
     selectModel, unload, variant: () => _variant, VARIANTS,
+    // host contract (sandpie backend):
+    DEFAULT_MODELS, DEFAULT_N_CTX, runConversation, clearCache,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     __reset: () => resetState(),
