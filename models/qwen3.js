@@ -308,6 +308,75 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
   }
 
+  // ---- FUSED int4 gate+up+SwiGLU (T=1): swi[i] = silu(gate·x)*(up·x) ----
+  // 3 decode passes (gate gemv, up gemv, swiglu) → 1. Reads x once per chunk and
+  // dequant-dots it against BOTH gate and up weights; one fewer pass barrier ×2
+  // per layer (the matmuls) plus the swiglu pass removed.
+  const GUSQ_NR = 4;
+  const GATEUPQ_WGSL = `
+enable f16;
+enable subgroups;
+struct D { I:u32, H:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [H/4]
+@group(0) @binding(1) var<storage, read>       gW : array<u32>;
+@group(0) @binding(2) var<storage, read>       gS : array<f16>;
+@group(0) @binding(3) var<storage, read>       uW : array<u32>;
+@group(0) @binding(4) var<storage, read>       uS : array<f16>;
+@group(0) @binding(5) var<storage, read_write> swi: array<f32>;          // [I]
+@group(0) @binding(6) var<uniform>             d  : D;
+var<workgroup> pg : array<f32, ${GUSQ_NR * GEMV_WG}>;
+var<workgroup> pu : array<f32, ${GUSQ_NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${GUSQ_NR}u;
+  if (rowBase >= d.I) { return; }
+  let words = d.H / 8u; let gpr = d.H / ${QGROUP}u;
+  var ga : array<f32, ${GUSQ_NR}>; var ua : array<f32, ${GUSQ_NR}>;
+  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) { ga[r]=0.0; ua[r]=0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = x[2u*w]; let xb = x[2u*w + 1u];
+    let grp = (w*8u)/${QGROUP}u;
+    for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
+      let row = rowBase + r; let wi = row*words + w; let si = row*gpr + grp;
+      let gp = gW[wi]; let gsc = f32(gS[si]);
+      let glo = vec4<f32>(unpack4xU8(gp & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      let ghi = vec4<f32>(unpack4xU8((gp >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      ga[r] = ga[r] + gsc*( dot(vec4<f32>(glo.x,ghi.x,glo.y,ghi.y), xa) + dot(vec4<f32>(glo.z,ghi.z,glo.w,ghi.w), xb) );
+      let up = uW[wi]; let usc = f32(uS[si]);
+      let ulo = vec4<f32>(unpack4xU8(up & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      let uhi = vec4<f32>(unpack4xU8((up >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      ua[r] = ua[r] + usc*( dot(vec4<f32>(ulo.x,uhi.x,ulo.y,uhi.y), xa) + dot(vec4<f32>(ulo.z,uhi.z,ulo.w,uhi.w), xb) );
+    }
+    w = w + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
+    let g = subgroupAdd(ga[r]); let u = subgroupAdd(ua[r]);
+    if (sgi == 0u) { pg[r*${GEMV_WG}u + sgIdx] = g; pu[r*${GEMV_WG}u + sgIdx] = u; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${GUSQ_NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.I) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var g:f32=0.0; var u:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ g=g+pg[lid.x*${GEMV_WG}u+i]; u=u+pu[lid.x*${GEMV_WG}u+i]; }
+      let silu = g / (1.0 + exp(-g));
+      swi[row] = silu * u;
+    }
+  }
+}`;
+  function gateUpSiluQ(xBuf, gRec, uRec, swiBuf, I, H) {
+    const pipe = E.getPipeline('q3.gateupQ', GATEUPQ_WGSL);
+    const d = uniform(new Uint32Array([I, H, 0, 0]));
+    const nWG = Math.ceil(I / GUSQ_NR);
+    const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [xBuf, gRec.pack, gRec.scales, uRec.pack, uRec.scales, swiBuf, d], [gx, gy, 1]);
+  }
+
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
   const MATVECQ_WGSL = `
 enable f16;
@@ -790,6 +859,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       check('matvecQ', maxAbs(got,y), 1e-2);
       [xb,pb,sb,yb].forEach(b=>b.destroy());
     }
+    // --- gateUpSiluQ (fused int4 gate+up+silu, T=1) vs CPU dequant ---
+    {
+      const I=130,H=256;
+      const x=new Float32Array(H),gf=new Float32Array(I*H),uf=new Float32Array(I*H);
+      for(let i=0;i<H;i++)x[i]=Math.sin(i*0.2);
+      for(let i=0;i<gf.length;i++){gf[i]=Math.cos(i*0.013);uf[i]=Math.sin(i*0.009);}
+      const gq=quantizeInt4Bf16(f32ToBf16(gf),I,H), uq=quantizeInt4Bf16(f32ToBf16(uf),I,H);
+      const gdq=dequantInt4(gq.pack,gq.scales,I,H), udq=dequantInt4(uq.pack,uq.scales,I,H);
+      const xb=f32buf(x), gW=qbuf(gq.pack), gS=sbuf(gq.scales), uW=qbuf(uq.pack), uS=sbuf(uq.scales), yb=E.createBuffer(I*4,ST(),'y');
+      await gateUpSiluQ(xb, {pack:gW,scales:gS}, {pack:uW,scales:uS}, yb, I, H);
+      const got=await E.readF32(yb,I); const y=new Float32Array(I);
+      for(let i=0;i<I;i++){let g=0,u=0;for(let k=0;k<H;k++){g+=x[k]*gdq[i*H+k];u+=x[k]*udq[i*H+k];}const silu=g/(1+Math.exp(-g));y[i]=silu*u;}
+      check('gateUpSiluQ', maxAbs(got,y), 1e-2);
+      [xb,gW,gS,uW,uS,yb].forEach(b=>b.destroy());
+    }
     // --- argmax ---
     {
       const N=5000; const a=new Float32Array(N);
@@ -1148,9 +1232,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
       await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
-      await linearQ(s.normed, Wq(p + 'mlp.up_proj.weight'), s.up, T, I, H);
-      await swiglu(s.gate, s.up, s.swi, T * I);
+      if (T === 1) {
+        await gateUpSiluQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), Wq(p + 'mlp.up_proj.weight'), s.swi, I, H);  // fused gate+up+silu (3 passes→1)
+      } else {
+        await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+        await linearQ(s.normed, Wq(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+        await swiglu(s.gate, s.up, s.swi, T * I);
+      }
       await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);              // fused residual: x += down_proj
     }
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
