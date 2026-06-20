@@ -541,6 +541,43 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     return E.dispatch(pipe, [aBuf, bBuf, ALogBuf, dtBiasBuf, gbBuf, p], [Math.ceil(nHeads / 64), 1, 1]);
   }
 
+  // ============================================================
+  // Gated RMSNorm (Qwen3NextRMSNormGated), per-head over value head_dim:
+  //   t = x * silu(z) ; out = t * rsqrt(mean(t²)+eps) * weight
+  // weight is [dim], shared across heads. 1 workgroup/head, ${DELTA_DIM} threads.
+  // ============================================================
+  const GRMS_WGSL = `
+enable f16;
+struct P { nHeads:u32, dim:u32, eps:f32, _a:u32 };
+@group(0) @binding(0) var<storage, read>       x   : array<f32>;   // [nHeads*dim]
+@group(0) @binding(1) var<storage, read>       z   : array<f32>;   // [nHeads*dim] gate
+@group(0) @binding(2) var<storage, read>       w   : array<f16>;   // [dim] shared weight
+@group(0) @binding(3) var<storage, read_write> outv: array<f32>;   // [nHeads*dim]
+@group(0) @binding(4) var<uniform>             p   : P;
+var<workgroup> red : array<f32, ${DELTA_DIM}>;
+@compute @workgroup_size(${DELTA_DIM},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let h = wg.x; let i = lid.x; let dim = p.dim; let base = h*dim;
+  var t : f32 = 0.0;
+  if (i < dim) { let zg = z[base+i]; let s = zg / (1.0 + exp(-zg)); t = x[base+i] * s; }
+  red[i] = t*t;
+  workgroupBarrier();
+  var stride = ${DELTA_DIM}u / 2u;
+  loop { if (stride == 0u) { break; }
+    if (i < stride) { red[i] = red[i] + red[i+stride]; }
+    workgroupBarrier(); stride = stride / 2u; }
+  if (i >= dim) { return; }
+  let inv = inverseSqrt(red[0] / f32(dim) + p.eps);
+  outv[base+i] = t * inv * f32(w[i]);
+}`;
+  function gatedRMSNorm(xBuf, zBuf, wBuf, outBuf, nHeads, dim, eps) {
+    const pipe = E.getPipeline('q35.grms', GRMS_WGSL);
+    const u = new Uint32Array(4); const du = new DataView(u.buffer);
+    du.setUint32(0, nHeads, true); du.setUint32(4, dim, true); du.setFloat32(8, eps, true);
+    const p = uniform(u);
+    return E.dispatch(pipe, [xBuf, zBuf, wBuf, outBuf, p], [nHeads, 1, 1]);
+  }
+
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
   const MATVECQ_WGSL = `
 enable f16;
@@ -1128,6 +1165,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for(let h=0;h<H;h++){ ref[h*2]=Math.exp(-Math.exp(Al[h])*sp(a[h]+dtb[h])); ref[h*2+1]=1/(1+Math.exp(-b[h])); }
       check('gbeta', maxAbs(got,ref), 1e-5);
       [ab,bb,alb,dtbb,gbb].forEach(x=>x.destroy());
+    }
+    // --- gatedRMSNorm (Qwen3NextRMSNormGated) vs CPU ---
+    {
+      const H=4, dim=DELTA_DIM, eps=1e-6;
+      const x=new Float32Array(H*dim), z=new Float32Array(H*dim), w=new Float32Array(dim);
+      for(let i=0;i<H*dim;i++){ x[i]=Math.sin(i*0.07)*2; z[i]=Math.cos(i*0.05); }
+      for(let i=0;i<dim;i++) w[i]=0.8+0.4*Math.sin(i*0.11);
+      const wR=roundF16(w);
+      const xb=f32buf(x), zb=f32buf(z), wb=f16buf(w), ob=E.createBuffer(H*dim*4,ST(),'o');
+      await gatedRMSNorm(xb, zb, wb, ob, H, dim, eps);
+      const got=await E.readF32(ob, H*dim);
+      const silu=a=>a/(1+Math.exp(-a));
+      const ref=new Float32Array(H*dim);
+      for(let h=0;h<H;h++){ const t=new Float32Array(dim); let ss=0;
+        for(let i=0;i<dim;i++){ t[i]=x[h*dim+i]*silu(z[h*dim+i]); ss+=t[i]*t[i]; }
+        const inv=1/Math.sqrt(ss/dim+eps);
+        for(let i=0;i<dim;i++) ref[h*dim+i]=t[i]*inv*wR[i]; }
+      check('gatedRMSNorm', maxAbs(got,ref), 1e-2);
+      [xb,zb,wb,ob].forEach(b=>b.destroy());
     }
     return out;
   }
