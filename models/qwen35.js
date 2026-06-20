@@ -1452,8 +1452,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       return ids;
     }
 
-    // Build the Qwen3 ChatML prompt with special ids spliced in.
-    function encodeChat(messages, { addGenerationPrompt = true } = {}) {
+    // Hermes-style tool preamble Qwen3.5 expects, appended to the system message.
+    function toolsPreamble(tools) {
+      let s = '# Tools\n\nYou may call one or more functions to assist with the user query.\n\n' +
+        'You are provided with function signatures within <tools></tools> XML tags:\n<tools>';
+      for (const t of tools) s += '\n' + JSON.stringify(t);
+      s += '\n</tools>\n\nFor each function call, return a json object with function name and arguments within ' +
+        '<tool_call></tool_call> XML tags:\n<tool_call>\n{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>';
+      return s;
+    }
+
+    // Build the Qwen3 ChatML prompt with special ids spliced in. With `tools`, injects
+    // the Hermes tool block into the system turn, renders assistant tool_calls as
+    // <tool_call>{json}</tool_call>, and groups consecutive tool results into one
+    // <|im_start|>user … <tool_response>…</tool_response> turn (the Qwen template shape).
+    function encodeChat(messages, { addGenerationPrompt = true, tools = null } = {}) {
       const ids = [];
       const seg = (role, content) => {
         ids.push(SPECIAL.im_start);
@@ -1461,7 +1474,36 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         ids.push(SPECIAL.im_end);
         ids.push(...encodeText('\n'));
       };
-      for (const m of messages) seg(m.role, typeof m.content === 'string' ? m.content : '');
+      let i = 0;
+      const hasSys = messages.length && messages[0].role === 'system';
+      const sysContent = hasSys ? (messages[0].content || '') : '';
+      if (hasSys) i = 1;
+      if (tools && tools.length) {
+        seg('system', (sysContent ? sysContent + '\n\n' : '') + toolsPreamble(tools));
+      } else if (hasSys) {
+        seg('system', sysContent);
+      }
+      for (; i < messages.length; i++) {
+        const m = messages[i];
+        if (m.role === 'tool') {                                  // group consecutive tool results
+          const parts = []; let j = i;
+          while (j < messages.length && messages[j].role === 'tool') {
+            parts.push('<tool_response>\n' + (messages[j].content || '') + '\n</tool_response>'); j++;
+          }
+          seg('user', parts.join('\n')); i = j - 1; continue;
+        }
+        if (m.role === 'assistant' && m.tool_calls && m.tool_calls.length) {
+          let body = m.content || '';
+          for (const tc of m.tool_calls) {
+            const name = (tc.function && tc.function.name) || tc.name || '';
+            let a = (tc.function && tc.function.arguments != null) ? tc.function.arguments : tc.arguments;
+            if (typeof a !== 'string') a = JSON.stringify(a || {});
+            body += (body ? '\n' : '') + '<tool_call>\n{"name": "' + name + '", "arguments": ' + a + '}\n</tool_call>';
+          }
+          seg('assistant', body); continue;
+        }
+        seg(m.role, typeof m.content === 'string' ? m.content : '');
+      }
       if (addGenerationPrompt) { ids.push(SPECIAL.im_start); ids.push(...encodeText('assistant\n')); }
       return ids;
     }
@@ -1769,6 +1811,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _dbgLayer = -1, _dbgCap = {};   // snapshot one delta layer's intermediates (CPU-ref debug)
   let _swapQK = false, _deltaMaxLayer = 999;   // debug: swap q/k in recurrence; limit active delta layers
   let _subOverride = null;   // GEMV reduction: null=auto (subgroups if supported), true/false to force
+  let _prefillSerial = false;   // debug A/B: force the old token-by-token (drain-every-token) prefill
   let _awqXor = false;       // compressed-tensors packs offset-binary (q+8) = OUR format → read direct, no transcode.
                              // (Toggle exists only for hypothetical two's-complement repos.)
   function _useSub() { return _subOverride !== null ? _subOverride : !!(E.caps && E.caps() && E.caps().hasSubgroups); }
@@ -2036,10 +2079,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // token-by-token (the DeltaNet recurrence is sequential), then a batched GPU-resident
   // decode loop chains GEN_BATCH forwards per readback. onToken(piece) gets each decoded
   // token. Caller must resetState() + loadModel() first. Returns the output token ids.
+  const PF_BATCH = 16;   // prefill: submit this many forwards before draining (bounds queue depth)
   async function _streamIds(ids, { maxTokens = 256, onToken, signal } = {}) {
     const L = ids.length;
     let tok = 0;
-    for (let i = 0; i < L; i++) { if (signal && signal.aborted) return []; tok = await forward(ids[i], i); }
+    // PIPELINED PREFILL: the DeltaNet recurrence is sequential so we still run one forward
+    // per prompt token, but only DRAIN every PF_BATCH tokens (and the last). Issuing the
+    // rest submitOnly overlaps CPU-encode(i+1) with GPU-run(i) instead of stalling on each
+    // token's readback — the same pipelining win the decode loop already gets. The wasted
+    // per-token argmax into _tokHist is harmless: prefill embeds via setIds(ids[i]), not chain.
+    for (let i = 0; i < L; i++) {
+      if (signal && signal.aborted) return [];
+      const sync = _prefillSerial || (i === L - 1) || ((i + 1) % PF_BATCH === 0);
+      if (sync) tok = await forward(ids[i], i);
+      else await forward(ids[i], i, { submitOnly: true });
+    }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok)) return outIds;
@@ -2081,9 +2135,43 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { push(t) { buf += t; step(); }, flush() { out(buf); buf = ''; }, get content() { return acc.content; }, get reasoning() { return acc.reasoning; } };
   }
 
+  // Streaming parser for a tool-calling round. Three states: normal text → onContent,
+  // <think>…</think> → onReason, <tool_call>…</tool_call> → buffered into toolCalls[]
+  // (NOT streamed — the JSON is machine payload, not user-visible). Holds a 12-char guard
+  // tail (longest needle is "</tool_call>") so a tag split across token pieces is detected.
+  function makeRoundParser(onReason, onContent) {
+    let buf = '', state = 'normal', cur = '';   // state ∈ normal|think|tool
+    const acc = { content: '', reasoning: '', toolCalls: [] };
+    const NEEDLES = { normal: ['<think>', '<tool_call>'], think: ['</think>'], tool: ['</tool_call>'] };
+    const out = (text) => {
+      if (!text) return;
+      if (state === 'think') { acc.reasoning += text; onReason(text); }
+      else if (state === 'tool') { cur += text; }
+      else { acc.content += text; onContent(text); }
+    };
+    const step = () => {
+      for (;;) {
+        let bi = -1, bn = null;
+        for (const n of NEEDLES[state]) { const idx = buf.indexOf(n); if (idx !== -1 && (bi === -1 || idx < bi)) { bi = idx; bn = n; } }
+        if (bi === -1) break;
+        out(buf.slice(0, bi)); buf = buf.slice(bi + bn.length);
+        if (bn === '<think>') state = 'think';
+        else if (bn === '</think>') state = 'normal';
+        else if (bn === '<tool_call>') { state = 'tool'; cur = ''; }
+        else if (bn === '</tool_call>') { state = 'normal'; if (cur.trim()) acc.toolCalls.push(cur.trim()); cur = ''; }
+      }
+      if (buf.length > 12) { out(buf.slice(0, buf.length - 12)); buf = buf.slice(buf.length - 12); }
+    };
+    return {
+      push(t) { buf += t; step(); },
+      flush() { out(buf); buf = ''; if (state === 'tool' && cur.trim()) acc.toolCalls.push(cur.trim()); },
+      get content() { return acc.content; }, get reasoning() { return acc.reasoning; }, get toolCalls() { return acc.toolCalls; },
+    };
+  }
+
   // ============================================================
   // Host contract — selectable backend in sandpie (see providers.js / conversations.js).
-  // Single-turn chat (no tool-calling yet; the small hybrid models are weak at it).
+  // Chat + agentic tool-calling (Hermes-style <tool_call>); see runConversation.
   // ============================================================
   const DEFAULT_N_CTX = MAX_SEQ;
   const DEFAULT_MODELS = [
@@ -2098,7 +2186,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   // Page-side agent run (mirrors the wllama/litertlm/transformers.js contract). Streams
-  // the same event protocol conversations.js expects. Chat-only: one round, no tools.
+  // the same event protocol conversations.js expects. Supports the agentic tool loop:
+  // stream a round → if the model emitted <tool_call>s, run them via ./sandpie-tool →
+  // append results → re-prefill the whole history and stream again, up to MAX_ROUNDS.
+  // (The small hybrid models are unreliable tool-callers — 2B is the realistic floor.)
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
     // Single active local backend: free the OTHER local LLMs' GPU/WASM contexts first.
     try { await window.SandpieWllama?.unload?.(); } catch (_) {}
@@ -2120,26 +2211,77 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       if (e && e.name === 'AbortError') throw e;
       emit({ type: 'error', message: 'webgpu: ' + ((e && e.message) || e) }); emit({ type: 'agent_done' }); return;
     }
+
+    const toolList = Array.isArray(tools) ? tools : [];
+    // Flatten content to a string (arrays of text parts → joined) but keep tool_calls /
+    // tool_call_id so the agentic loop can replay them through encodeChat.
+    const norm = (m) => {
+      let c = m.content;
+      if (Array.isArray(c)) c = c.filter(p => p && p.type === 'text').map(p => p.text || '').join('\n');
+      else if (c != null && typeof c !== 'string') c = String(c);
+      const o = { role: m.role, content: c == null ? '' : c };
+      if (m.tool_calls) o.tool_calls = m.tool_calls;
+      if (m.tool_call_id) o.tool_call_id = m.tool_call_id;
+      return o;
+    };
+    const sys = (systemPrompt && typeof systemPrompt === 'object') ? (systemPrompt.content || '') : (systemPrompt || '');
+    const work = [];
+    if (sys) work.push({ role: 'system', content: sys });
+    for (const m of (messages || [])) { if (m && m.role) work.push(norm(m)); }
+
+    const MAX_ROUNDS = toolList.length ? 8 : 1;
     try {
-      const sys = (systemPrompt && typeof systemPrompt === 'object') ? (systemPrompt.content || '') : (systemPrompt || '');
-      const msgs = [];
-      if (sys) msgs.push({ role: 'system', content: sys });
-      for (const m of (messages || [])) { if (m && (m.role === 'user' || m.role === 'assistant' || m.role === 'system')) msgs.push({ role: m.role, content: typeof m.content === 'string' ? m.content : '' }); }
-      resetState();
-      emit({ type: 'round_start' });
-      let firstTok = false;
-      const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
-      const split = makeThinkSplitter(
-        (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },
-        (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },
-      );
-      await _streamIds(TOK.encodeChat(msgs), { maxTokens, signal, onToken: (piece) => split.push(piece) });
-      split.flush();
-      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-      emit({ type: 'info', message: null });
-      const content = split.content;
-      emit({ type: 'round_end', content });
-      emit({ type: 'message_added', message: { role: 'assistant', content } });
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        resetState();   // no incremental KV reuse across rounds — re-prefill the full history
+        emit({ type: 'round_start' });
+        let firstTok = false;
+        const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
+        const parser = makeRoundParser(
+          (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },
+          (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },
+        );
+        const ids = TOK.encodeChat(work, { tools: toolList.length ? toolList : null });
+        await _streamIds(ids, { maxTokens, signal, onToken: (piece) => parser.push(piece) });
+        parser.flush();
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        emit({ type: 'info', message: null });
+
+        const content = parser.content.replace(/^\s+/, '');
+        const toolCalls = [];
+        parser.toolCalls.forEach((raw, k) => {
+          try { const o = JSON.parse(raw); if (o && o.name) toolCalls.push({ id: 'call_' + round + '_' + k, type: 'function', function: { name: o.name, arguments: JSON.stringify(o.arguments || {}) } }); } catch (_) {}
+        });
+
+        emit({ type: 'round_end', content });
+        const asst = { role: 'assistant', content };
+        if (toolCalls.length) asst.tool_calls = toolCalls;
+        work.push(asst);
+        emit({ type: 'message_added', message: asst });
+        if (!toolCalls.length) break;   // no tools → turn complete
+
+        for (const tc of toolCalls) {
+          if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+          emit({ type: 'tool_started', tc });
+          let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (_) {}
+          let out;
+          try {
+            const res = await fetch('./sandpie-tool', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: tc.function.name, args, conversation_file_name: convId }), signal,
+            });
+            out = res.ok ? await res.json() : { result: 'Error: tool endpoint ' + res.status + ' — service worker not ready (reload once).' };
+          } catch (e) {
+            if (e && e.name === 'AbortError') throw e;
+            out = { result: 'Error: ' + ((e && e.message) || e) };
+          }
+          const toolResult = (out && out.result != null) ? out.result : '';
+          emit({ type: 'tool_result', id: tc.id, result: toolResult, artifacts: out && out.artifacts });
+          const toolMsg = { role: 'tool', tool_call_id: tc.id, content: toolResult };
+          work.push(toolMsg);
+          emit({ type: 'message_added', message: toolMsg });
+        }
+      }
     } catch (e) {
       if (e && e.name === 'AbortError') throw e;
       emit({ type: 'info', message: null });
@@ -2166,6 +2308,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setDbgLayer: (l) => { _dbgLayer = l; }, _dbgCapRead: async (nm, n) => _dbgCap[nm] ? Array.from(await E.readF32(_dbgCap[nm], n)) : null,
     _setSwapQK: (b) => { _swapQK = !!b; }, _setDeltaMaxLayer: (l) => { _deltaMaxLayer = l; },
     _setSub: (b) => { _subOverride = b; }, _caps: () => (E.caps ? E.caps() : null),
+    _setPrefillSerial: (b) => { _prefillSerial = !!b; },
     _probeSubgroups: async () => { _subProbed = false; await E.init(); await probeSubgroups(); return { subOverride: _subOverride, useSub: _useSub() }; },
     _setGenBatch: (k) => { _genBatch = k; }, _setAwqXor: (b) => { _awqXor = !!b; },
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
