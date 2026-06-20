@@ -412,7 +412,7 @@ struct P { nHeads:u32, dim:u32, _a:u32, _b:u32 };
 @group(0) @binding(1) var<storage, read>       k  : array<f32>;   // [nHeads*dim] L2-normed
 @group(0) @binding(2) var<storage, read>       v  : array<f32>;   // [nHeads*dim]
 @group(0) @binding(3) var<storage, read>       gb : array<f32>;   // [nHeads*2]: expg, beta per head
-@group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] transposed [head][val][key]
+@group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] layout [head][key][val] (val contiguous → coalesced across threads)
 @group(0) @binding(5) var<storage, read_write> outv : array<f32>; // [nHeads*dim]
 @group(0) @binding(6) var<uniform>             p  : P;
 var<workgroup> ksh : array<f32, ${DELTA_DIM}>;
@@ -424,12 +424,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   workgroupBarrier();
   if (vi >= dim) { return; }
   let expg = gb[h*2u]; let beta = gb[h*2u + 1u];
-  let row = h*dim*dim + vi*dim;          // St[h][vi][*]
+  let sbase = h*dim*dim + vi;            // S[h][kk][vi] = S[sbase + kk*dim] — coalesced across vi
   var kv : f32 = 0.0;
-  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let s = S[row+kk]*expg; S[row+kk] = s; kv = kv + s*ksh[kk]; }
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i]*expg; S[i] = s; kv = kv + s*ksh[kk]; }
   let delta = (v[base+vi] - kv) * beta;
   var o : f32 = 0.0;
-  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let s = S[row+kk] + ksh[kk]*delta; S[row+kk] = s; o = o + s*qsh[kk]; }
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i] + ksh[kk]*delta; S[i] = s; o = o + s*qsh[kk]; }
   outv[base+vi] = o;
 }`;
   function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim) {
@@ -1178,13 +1178,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const Sb=f32buf(S0), ob=E.createBuffer(H*dim*4, ST(),'o');
       await deltaRecur(qb,kb,vb,gbb,Sb,ob,H,dim);
       const gotOut=await E.readF32(ob,H*dim); const gotS=await E.readF32(Sb,H*dim*dim);
-      // CPU ref — transposed state St[h][val][key], exact recurrence
+      // CPU ref — state layout [head][key][val] (matches the coalesced GPU kernel), exact recurrence
       const St=Float32Array.from(S0); const cOut=new Float32Array(H*dim);
       for(let h=0;h<H;h++){ const expg=gb[h*2], beta=gb[h*2+1], base=h*dim;
-        for(let vi=0;vi<dim;vi++){ const row=h*dim*dim+vi*dim;
-          let kv=0; for(let kk=0;kk<dim;kk++){ const s=St[row+kk]*expg; St[row+kk]=s; kv+=s*k[base+kk]; }
+        for(let vi=0;vi<dim;vi++){
+          let kv=0; for(let kk=0;kk<dim;kk++){ const i=h*dim*dim+kk*dim+vi; const s=St[i]*expg; St[i]=s; kv+=s*k[base+kk]; }
           const delta=(v[base+vi]-kv)*beta;
-          let o=0; for(let kk=0;kk<dim;kk++){ const s=St[row+kk]+k[base+kk]*delta; St[row+kk]=s; o+=s*q[base+kk]; }
+          let o=0; for(let kk=0;kk<dim;kk++){ const i=h*dim*dim+kk*dim+vi; const s=St[i]+k[base+kk]*delta; St[i]=s; o+=s*q[base+kk]; }
           cOut[base+vi]=o;
         } }
       check('deltaRecur', Math.max(maxAbs(gotOut,cOut), maxAbs(gotS,St)), 1e-3);
@@ -1889,7 +1889,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // The conv/recurrent/KV state updates in place; in-order submits keep it correct.
     while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
       if (signal && signal.aborted) break;
-      const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
+      const K = Math.min(_genBatch, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
       if (K <= 0) break;
       for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
       const toks = await readU32Range(_tokHist, pos + 1, K);   // one readback for the whole batch
@@ -1900,7 +1900,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     return TOK.decode(outIds);
   }
-  const GEN_BATCH = 8;   // tokens per GPU-resident decode batch (1 readback per batch)
+  let _genBatch = 8;   // tokens per GPU-resident decode batch (1 readback per batch); tunable for A/B
 
   return {
     CONFIG,
@@ -1917,6 +1917,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setDbgLayer: (l) => { _dbgLayer = l; }, _dbgCapRead: async (nm, n) => _dbgCap[nm] ? Array.from(await E.readF32(_dbgCap[nm], n)) : null,
     _setSwapQK: (b) => { _swapQK = !!b; }, _setDeltaMaxLayer: (l) => { _deltaMaxLayer = l; },
     _setSub: (b) => { _subOverride = b; }, _caps: () => (E.caps ? E.caps() : null),
+    _setGenBatch: (k) => { _genBatch = k; },
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
     _dbgState: async (l, n) => E.readF32(_deltaS[l], n || 64),
