@@ -1580,6 +1580,18 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
         E.device().queue.writeBuffer(buf, 0, f16bits);
         _weights[name] = { buf, shape: info.shape, numel };
+        // Tied lm_head: also build an int4 copy of the embedding. The f16 248K-vocab
+        // matmul was ~46% of decode GPU time (~17ms); int4 cuts it ~6x (~3ms). The f16
+        // copy is kept for the embedding GATHER (which reads f16 rows).
+        if (name.endsWith('embed_tokens.weight') && info.dtype === 'BF16') {
+          const N = info.shape[0], K = info.shape[1];
+          const { pack, scales } = quantizeInt4Bf16(aligned(raw, Uint16Array), N, K);
+          const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'lmhead.pack');
+          const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'lmhead.sc');
+          E.device().queue.writeBuffer(packBuf, 0, pack);
+          E.device().queue.writeBuffer(scBuf, 0, scales);
+          _weights['__lmhead_int4'] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
+        }
       }
       if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
     }
@@ -1773,7 +1785,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
     }
     await rmsnorm(s.x, W('norm.weight'), s.normed, 1, H, C.rmsEps);
-    await gemv(s.normed, W('embed_tokens.weight'), s.logits, C.vocab, H);                 // tied lm_head (f16 embed)
+    await linearQ(s.normed, _weights['__lmhead_int4'], s.logits, 1, C.vocab, H);          // tied lm_head (int4; ~6x less bandwidth than f16)
     await argmaxKernel(s.logits, _tokHist, C.vocab, pos + 1);
     const _t1 = _PERF ? performance.now() : 0;
     const drain = E.endBatch();
@@ -1836,15 +1848,26 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
-    if (!emit(tok)) return TOK.decode(outIds);
+    if (!emit(tok)) return TOK.decode(outIds);   // tok = _tokHist[L] (token at position L)
+    // Batched GPU-resident decode: chain GEN_BATCH forwards back-to-back via the GPU
+    // token history (forward at pos reads _tokHist[pos], writes _tokHist[pos+1]) with
+    // NO readback between them, then read the whole batch in ONE mapAsync. The K CPU
+    // encodes overlap the K GPU runs and the per-token readback sync is amortized K×.
+    // The conv/recurrent/KV state updates in place; in-order submits keep it correct.
     while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
       if (signal && signal.aborted) break;
-      tok = await forward(tok, pos);             // process token at `pos`, predict pos+1
-      pos++;
-      if (!emit(tok)) break;
+      const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
+      if (K <= 0) break;
+      for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
+      const toks = await readU32Range(_tokHist, pos + 1, K);   // one readback for the whole batch
+      pos += K;
+      let brk = false;
+      for (let k = 0; k < K; k++) { if (!emit(toks[k])) { brk = true; break; } }
+      if (brk) break;
     }
     return TOK.decode(outIds);
   }
+  const GEN_BATCH = 8;   // tokens per GPU-resident decode batch (1 readback per batch)
 
   return {
     CONFIG,
