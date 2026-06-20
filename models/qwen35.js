@@ -1515,10 +1515,22 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     return { pack, scales };
   }
-  const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight';
+  // Big matrices → int4 (all have K%32==0). NB in_proj_a/b are tiny [16,1024] but
+  // still K%32==0, so int4 is fine and keeps the path uniform.
+  const QUANT_SUFFIX = ['q_proj.weight','k_proj.weight','v_proj.weight','o_proj.weight',
+    'gate_proj.weight','up_proj.weight','down_proj.weight',
+    'in_proj_qkv.weight','in_proj_a.weight','in_proj_b.weight','in_proj_z.weight','out_proj.weight'];
+  const isQuantWeight = (name) => QUANT_SUFFIX.some(s => name.endsWith(s));
+  // Precision-sensitive small params kept as raw f32 (kernels read them as f32).
+  const isF32Raw = (name) => name.endsWith('conv1d.weight') || name.endsWith('.A_log') || name.endsWith('.dt_bias');
+  // Vision tower + multi-token-prediction head: not used for text generation.
+  const isSkip = (name) => name.startsWith('model.visual.') || name.startsWith('mtp.');
+  // bf16 bits → f32 (lossless: bf16 is the top 16 bits of f32).
+  function bf16ToF32arr(u16) { const out = new Float32Array(u16.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+    for (let i = 0; i < u16.length; i++) { ti[0] = u16[i] << 16; out[i] = t[0]; } return out; }
 
   async function fetchModelBytes(onProgress) {
-    const url = MODEL_ROOT + 'model.safetensors';
+    const url = MODEL_ROOT + MODEL_FILE;
     let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
     if (cache) { const hit = await cache.match(url); if (hit) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await hit.arrayBuffer(); } }
     const resp = await fetch(url);
@@ -1545,27 +1557,36 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const header = JSON.parse(dec_(new Uint8Array(ab, 8, headerLen)));
     const dataStart = 8 + headerLen;
     _weights = {};
-    const names = Object.keys(header).filter(n => n !== '__metadata__');
+    const names = Object.keys(header).filter(n => n !== '__metadata__' && !isSkip(n));
+    // Aligned byte-copy of a tensor's raw bytes → a typed array of the given ctor.
+    const aligned = (raw, Ctor) => { const a = new Ctor(raw.byteLength / Ctor.BYTES_PER_ELEMENT); new Uint8Array(a.buffer).set(raw); return a; };
     for (let i = 0; i < names.length; i++) {
       const name = names[i], info = header[name];
       const [begin, end] = info.data_offsets;
       const numel = info.shape.reduce((a, b) => a * b, 1);
       const raw = new Uint8Array(ab, dataStart + begin, end - begin);
-      if (info.dtype !== 'BF16' && isQuantWeight(name)) throw new Error('quant path expects BF16 for ' + name);
       if (isQuantWeight(name)) {
-        // INT4: [N,K] = shape. Pack + scales.
+        if (info.dtype !== 'BF16') throw new Error('quant path expects BF16 for ' + name);
         const N = info.shape[0], K = info.shape[1];
-        const { pack, scales } = quantizeInt4Bf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
+        const { pack, scales } = quantizeInt4Bf16(aligned(raw, Uint16Array), N, K);
         const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.pack');
         const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.sc');
         E.device().queue.writeBuffer(packBuf, 0, pack);
         E.device().queue.writeBuffer(scBuf, 0, scales);
         _weights[name] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
+      } else if (isF32Raw(name)) {
+        let f32;
+        if (info.dtype === 'BF16') f32 = bf16ToF32arr(aligned(raw, Uint16Array));
+        else if (info.dtype === 'F32') f32 = aligned(raw, Float32Array);
+        else throw new Error('f32-raw path expects BF16/F32 for ' + name);
+        const buf = E.createBuffer(numel * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
+        E.device().queue.writeBuffer(buf, 0, f32);
+        _weights[name] = { buf, f32: true, shape: info.shape, numel };
       } else {
         let f16bits;
-        if (info.dtype === 'BF16') f16bits = bf16ToF16bits(new Uint16Array(raw.buffer, raw.byteOffset, numel));
-        else if (info.dtype === 'F16') f16bits = new Uint16Array(raw.buffer, raw.byteOffset, numel);
-        else if (info.dtype === 'F32') f16bits = f32ToF16bits(new Float32Array(raw.buffer, raw.byteOffset, numel));
+        if (info.dtype === 'BF16') f16bits = bf16ToF16bits(aligned(raw, Uint16Array));
+        else if (info.dtype === 'F16') f16bits = aligned(raw, Uint16Array);
+        else if (info.dtype === 'F32') f16bits = f32ToF16bits(aligned(raw, Float32Array));
         else throw new Error('unsupported dtype ' + info.dtype + ' for ' + name);
         const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
         E.device().queue.writeBuffer(buf, 0, f16bits);
@@ -1595,36 +1616,75 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Forward graph + KV cache + generate
   // ============================================================
   const MAX_SEQ = 2048;
+  const LP = CONFIG.weightPrefix;        // 'model.language_model.'
   let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
-  let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
-  let _scr = null;    // scratch buffers, sized to _scrT rows
-  let _scrT = 0;
+  let _DBGLAYERS = false, _layerDbg = null;   // per-layer hidden-state norm capture (debug)
+  let _kv = null;          // per full-attn layer: {k,v} sized MAX_SEQ ; null for delta layers
+  let _convState = null;   // per delta layer: [convDim*(K-1)] causal-conv ring ; null for attn
+  let _deltaS = null;      // per delta layer: [deltaHeads*valDim*keyDim] recurrent state
+  let _scr = null;
   let _idsBuf = null, _idsCap = 0;
-  let _tokHist = null;   // GPU token history: argmax of pos P writes [P+1]; decode embed at pos P reads [P]. Enables GPU-resident chaining (no per-token CPU readback in the loop).
+  let _tokHist = null;     // GPU token history: argmax of pos P writes [P+1].
 
   function scrBuf(n, label) { return E.createBuffer(n * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, label); }
-  function ensureKv() {
+  function zeroBuf(buf, bytes) { const enc = E.device().createCommandEncoder(); enc.clearBuffer(buf, 0, bytes); E.device().queue.submit([enc.finish()]); }
+
+  const CONV_DIM = 3 * CONFIG.deltaHeads * CONFIG.deltaKeyDim;   // q|k|v concatenated = 6144
+  const DVAL = CONFIG.deltaHeads * CONFIG.deltaValDim;           // 2048
+
+  // Persistent per-layer state (allocated once). Full-attn layers get a KV cache;
+  // DeltaNet layers get a conv ring + a recurrent matrix state.
+  function ensureState() {
     if (_kv) return;
-    const { numLayers, nKvHeads, headDim } = CONFIG;
-    const per = MAX_SEQ * nKvHeads * headDim;
-    _kv = [];
-    for (let l = 0; l < numLayers; l++) _kv.push({ k: scrBuf(per, 'k' + l), v: scrBuf(per, 'v' + l) });
+    const C = CONFIG, Km1 = C.convKernel - 1;
+    _kv = []; _convState = []; _deltaS = [];
+    for (let l = 0; l < C.numLayers; l++) {
+      if (C.layerFullAttn[l]) {
+        const per = MAX_SEQ * C.nKvHeads * C.headDim;
+        _kv.push({ k: scrBuf(per, 'k' + l), v: scrBuf(per, 'v' + l) });
+        _convState.push(null); _deltaS.push(null);
+      } else {
+        _kv.push(null);
+        _convState.push(scrBuf(CONV_DIM * Km1, 'conv' + l));
+        _deltaS.push(scrBuf(C.deltaHeads * C.deltaValDim * C.deltaKeyDim, 'S' + l));
+      }
+    }
     _tokHist = E.createBuffer(MAX_SEQ * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'tokHist');
   }
-  function ensureScratch(T) {
-    if (_scr && _scrT >= T) return;
-    if (_scr) for (const b of Object.values(_scr)) b.destroy && b.destroy();
-    const { hidden: H, nHeads, nKvHeads, headDim, intermediate: I } = CONFIG;
+  // Zero conv + recurrent state for a fresh sequence (KV cache need not be cleared:
+  // attention only reads positions [0, pos]).
+  function resetState() {
+    ensureState();
+    const C = CONFIG, Km1 = C.convKernel - 1;
+    for (let l = 0; l < C.numLayers; l++) {
+      if (!C.layerFullAttn[l]) {
+        zeroBuf(_convState[l], CONV_DIM * Km1 * 4);
+        zeroBuf(_deltaS[l], C.deltaHeads * C.deltaValDim * C.deltaKeyDim * 4);
+      }
+    }
+  }
+  // Scratch buffers (single-token decode; T=1 everywhere — prefill loops token-by-token
+  // because the DeltaNet recurrence is inherently sequential).
+  function ensureScratch() {
+    if (_scr) return;
+    const C = CONFIG, H = C.hidden, hd = C.headDim, nHq = C.nHeads, nKv = C.nKvHeads, dH = C.deltaHeads, dK = C.deltaKeyDim;
     _scr = {
-      x: scrBuf(T * H, 'x'), normed: scrBuf(T * H, 'normed'),
-      q: scrBuf(T * nHeads * headDim, 'q'), k: scrBuf(T * nKvHeads * headDim, 'k'), v: scrBuf(T * nKvHeads * headDim, 'v'),
-      qr: scrBuf(T * nHeads * headDim, 'qr'), kr: scrBuf(T * nKvHeads * headDim, 'kr'),
-      attn: scrBuf(T * nHeads * headDim, 'attn'), oproj: scrBuf(T * H, 'oproj'),
-      gate: scrBuf(T * I, 'gate'), up: scrBuf(T * I, 'up'), swi: scrBuf(T * I, 'swi'), down: scrBuf(T * H, 'down'),
-      last: scrBuf(H, 'last'), logits: scrBuf(CONFIG.vocab, 'logits'),
-      tok: scrBuf(1, 'tok'),   // 4 bytes — GPU argmax result (u32 token id)
+      x: scrBuf(H, 'x'), normed: scrBuf(H, 'normed'),
+      // full-attention
+      qproj: scrBuf(nHq * 2 * hd, 'qproj'), kf: scrBuf(nKv * hd, 'kf'), vf: scrBuf(nKv * hd, 'vf'),
+      qr: scrBuf(nHq * hd, 'qr'), kr: scrBuf(nKv * hd, 'kr'), attnO: scrBuf(nHq * hd, 'attnO'), gatedO: scrBuf(nHq * hd, 'gatedO'),
+      // DeltaNet
+      qkv: scrBuf(CONV_DIM, 'qkv'), qkvc: scrBuf(CONV_DIM, 'qkvc'),
+      qd: scrBuf(DVAL, 'qd'), kd: scrBuf(DVAL, 'kd'), vd: scrBuf(DVAL, 'vd'),
+      qn: scrBuf(DVAL, 'qn'), kn: scrBuf(DVAL, 'kn'),
+      aD: scrBuf(dH, 'aD'), bD: scrBuf(dH, 'bD'), zD: scrBuf(DVAL, 'zD'),
+      gb: scrBuf(dH * 2, 'gb'), core: scrBuf(DVAL, 'core'), gnorm: scrBuf(DVAL, 'gnorm'),
+      convBias: scrBuf(CONV_DIM, 'convBias'),   // Qwen3.5 conv1d has NO bias → kept zero
+      // MLP + head
+      swi: scrBuf(C.intermediate, 'swi'),
+      logits: scrBuf(C.vocab, 'logits'),
     };
-    _scrT = T;
+    zeroBuf(_scr.convBias, CONV_DIM * 4);
   }
   function copyRange(src, dst, dstFloatOffset, floatCount) {
     E.copyBuffer(src, 0, dst, dstFloatOffset * 4, floatCount * 4);   // batch-aware
@@ -1635,64 +1695,80 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return _idsBuf;
   }
 
-  // Run the transformer over T tokens at absolute positions [posBase, posBase+T).
-  // Updates the KV cache; returns logits (Float32Array[vocab]) for the LAST token.
-  // chain=true: embed reads the GPU token-history at posBase (no CPU-set ids) so
-  //   the loop runs GPU-resident. submitOnly=true: submit the batch but DON'T await
-  //   the drain or read back — lets the caller pipeline (encode N+1 while GPU runs N).
-  async function forward(idsArray, posBase, opts) {
+  // Single-token forward at absolute position `pos`. Processes token `tokenId`,
+  // updates all per-layer state (KV cache / conv ring / recurrent state), writes
+  // the greedy next-token into _tokHist[pos+1], and returns it.
+  // Hybrid: each layer is full_attention or gated-DeltaNet (config layer_types);
+  // the post-attention RMSNorm + SwiGLU MLP block is identical for both.
+  async function forward(tokenId, pos, opts) {
     const chain = !!(opts && opts.chain), submitOnly = !!(opts && opts.submitOnly);
     const _t0 = _PERF ? performance.now() : 0;
-    const C = CONFIG, H = C.hidden, nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim, I = C.intermediate;
-    const T = chain ? 1 : idsArray.length, S = posBase + T;
-    ensureKv(); ensureScratch(T);
-    const W = (n) => _weights[n].buf;      // f16 weight buffer (embed/norms)
-    const Wq = (n) => _weights[n];         // int4 record (projections/lm_head)
+    const C = CONFIG, H = C.hidden, hd = C.headDim, nHq = C.nHeads, nKv = C.nKvHeads, I = C.intermediate;
+    const dH = C.deltaHeads, dK = C.deltaKeyDim, dV = C.deltaValDim;
+    const S = pos + 1, qScale = 1 / Math.sqrt(dK);
+    ensureState(); ensureScratch();
+    if (_DBGLAYERS) _layerDbg = [];
+    const W   = (n) => _weights[LP + n].buf;   // f16/f32 raw buffer
+    const Wq  = (n) => _weights[LP + n];        // int4 record
     const s = _scr;
-    // embed source: prefill/normal → CPU-set ids buffer; chain → GPU token history at posBase.
-    const embIds = chain ? _tokHist : setIds(idsArray);
-    const embOff = chain ? posBase : 0;
-    uniformReset();   // pooled uniforms get stable buffers per call-site → bind-group cache hits
-    E.beginBatch();   // record the whole forward into ONE command buffer (1 submit vs ~364)
-    await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
+    uniformReset();
+    E.beginBatch();
+    const embIds = chain ? _tokHist : setIds([tokenId]);
+    const embOff = chain ? pos : 0;
+    await embedGather(embIds, W('embed_tokens.weight'), s.x, 1, H, embOff);
     for (let l = 0; l < C.numLayers; l++) {
-      const p = 'model.layers.' + l + '.';
-      await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linearQ(s.normed, Wq(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
-      await linearQ(s.normed, Wq(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
-      await linearQ(s.normed, Wq(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
-      // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
-      // read and a read_write binding is undefined behavior in WebGPU (miscompiles
-      // on Intel). Write rope output to a separate buffer.
-      await ropeQK(s.q, W(p + 'self_attn.q_norm.weight'), s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
-      await ropeQK(s.k, W(p + 'self_attn.k_norm.weight'), s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
-      copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
-      copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
-      await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
-      await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
-      await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      if (T === 1) {
-        await gateUpSiluQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), Wq(p + 'mlp.up_proj.weight'), s.swi, I, H);  // fused gate+up+silu (3 passes→1)
+      const p = 'layers.' + l + '.';
+      await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, 1, H, C.rmsEps);
+      if (C.layerFullAttn[l]) {
+        const a = p + 'self_attn.';
+        await linearQ(s.normed, Wq(a + 'q_proj.weight'), s.qproj, 1, nHq * 2 * hd, H);   // [nHq, query|gate]
+        await linearQ(s.normed, Wq(a + 'k_proj.weight'), s.kf, 1, nKv * hd, H);
+        await linearQ(s.normed, Wq(a + 'v_proj.weight'), s.vf, 1, nKv * hd, H);
+        // q reads the query-half of qproj (stride 2*hd); both get qnorm + partial RoPE.
+        await ropeQKNorm35(s.qproj, W(a + 'q_norm.weight'), s.qr, 1, nHq, hd, 2 * hd, C.rotaryDim, pos, C.ropeTheta, C.rmsEps);
+        await ropeQKNorm35(s.kf, W(a + 'k_norm.weight'), s.kr, 1, nKv, hd, hd, C.rotaryDim, pos, C.ropeTheta, C.rmsEps);
+        copyRange(s.kr, _kv[l].k, pos * nKv * hd, nKv * hd);
+        copyRange(s.vf, _kv[l].v, pos * nKv * hd, nKv * hd);
+        await attention(s.qr, _kv[l].k, _kv[l].v, s.attnO, 1, S, nHq, nKv, hd);
+        await applyGate35(s.attnO, s.qproj, s.gatedO, nHq, hd);                          // out *= sigmoid(gate)
+        await linearQ(s.gatedO, Wq(a + 'o_proj.weight'), s.x, 1, H, nHq * hd, true);     // residual
       } else {
-        await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
-        await linearQ(s.normed, Wq(p + 'mlp.up_proj.weight'), s.up, T, I, H);
-        await swiglu(s.gate, s.up, s.swi, T * I);
+        const d = p + 'linear_attn.';
+        await linearQ(s.normed, Wq(d + 'in_proj_qkv.weight'), s.qkv, 1, CONV_DIM, H);
+        await conv1dDecode(s.qkv, W(d + 'conv1d.weight'), s.convBias, _convState[l], s.qkvc, CONV_DIM);  // +silu, advances ring
+        E.copyBuffer(s.qkvc, 0, s.qd, 0, DVAL * 4);          // split q|k|v (each 16×128)
+        E.copyBuffer(s.qkvc, DVAL * 4, s.kd, 0, DVAL * 4);
+        E.copyBuffer(s.qkvc, 2 * DVAL * 4, s.vd, 0, DVAL * 4);
+        await linearQ(s.normed, Wq(d + 'in_proj_a.weight'), s.aD, 1, dH, H);
+        await linearQ(s.normed, Wq(d + 'in_proj_b.weight'), s.bD, 1, dH, H);
+        await linearQ(s.normed, Wq(d + 'in_proj_z.weight'), s.zD, 1, DVAL, H);
+        await gbeta(s.aD, s.bD, W(d + 'A_log'), W(d + 'dt_bias'), s.gb, dH);             // expg, beta
+        await l2normHeads(s.qd, s.qn, dH, dK, C.rmsEps, qScale);                          // q L2-normed then *1/sqrt(dK)
+        await l2normHeads(s.kd, s.kn, dH, dK, C.rmsEps, 1.0);
+        await deltaRecur(s.qn, s.kn, s.vd, s.gb, _deltaS[l], s.core, dH, dK);             // recurrence (updates S)
+        await gatedRMSNorm(s.core, s.zD, W(d + 'norm.weight'), s.gnorm, dH, dV, C.rmsEps);
+        await linearQ(s.gnorm, Wq(d + 'out_proj.weight'), s.x, 1, H, DVAL, true);         // residual
       }
-      await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);              // fused residual: x += down_proj
+      // shared post-attention RMSNorm + SwiGLU MLP
+      await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, 1, H, C.rmsEps);
+      await gateUpSiluQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), Wq(p + 'mlp.up_proj.weight'), s.swi, I, H);
+      await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.x, 1, H, I, true);           // residual
+      if (_DBGLAYERS) {
+        await E.endBatch(); const xn = await E.readF32(s.x, H);
+        let ss = 0, mx = 0; for (const v of xn) { ss += v * v; if (Math.abs(v) > mx) mx = Math.abs(v); }
+        _layerDbg.push({ l, t: C.layerFullAttn[l] ? 'A' : 'D', xnorm: +Math.sqrt(ss).toFixed(2), xmax: +mx.toFixed(3) });
+        E.beginBatch();
+      }
     }
-    await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
-    // last token row → its own [H] buffer, then lm_head
-    E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
-    await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
-    // GPU-side greedy argmax → write the predicted token straight into the token
-    // history at the NEXT position (posBase+T), so the next forward's embed reads it.
-    await argmaxKernel(s.logits, _tokHist, C.vocab, posBase + T);
-    const _t1 = _PERF ? performance.now() : 0;   // all commands recorded
-    const drain = E.endBatch();                   // single submit (returns the drain promise)
-    if (submitOnly) return undefined;             // pipelined: caller doesn't wait here
+    await rmsnorm(s.x, W('norm.weight'), s.normed, 1, H, C.rmsEps);
+    await gemv(s.normed, W('embed_tokens.weight'), s.logits, C.vocab, H);                 // tied lm_head (f16 embed)
+    await argmaxKernel(s.logits, _tokHist, C.vocab, pos + 1);
+    const _t1 = _PERF ? performance.now() : 0;
+    const drain = E.endBatch();
+    if (submitOnly) return undefined;
     await drain;
     const _t2 = _PERF ? performance.now() : 0;
-    const tok = await readU32At(_tokHist, posBase + T);   // the token just predicted
+    const tok = await readU32At(_tokHist, pos + 1);
     if (_PERF) _perfData = { encode_ms: +(_t1 - _t0).toFixed(2), gpu_drain_ms: +(_t2 - _t1).toFixed(2), map_ms: +(performance.now() - _t2).toFixed(2) };
     return tok;
   }
@@ -1729,51 +1805,31 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // (CPU encode, no drain wait) BEFORE reading the current token, so encode(N+1)
   // overlaps GPU-run(N) — un-doing the serialization batching introduced.
   const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
-  const GEN_BATCH = 8;   // tokens generated per GPU-resident batch (1 readback per batch)
-  // Batched GPU-resident greedy decode. Submit GEN_BATCH chained forwards back to
-  // back (no readback between — they chain through _tokHist on the GPU), so the K
-  // CPU encodes overlap the K GPU runs, then read all K tokens in ONE mapAsync.
-  // Removes the per-token readback sync that was capping the pipeline.
-  // ============================================================
-  // DeltaNet (gated linear attention) — THE net-new work. STUB.
-  // ============================================================
-  // Per linear-attention layer, for the current token (decode):
-  //   qkv = in_proj_qkv(x); split into q,k,v (16 heads × 128)
-  //   causal conv1d (kernel=4) over q,k,v along the sequence (needs a per-layer
-  //     conv state buffer of the last 3 tokens)
-  //   a = in_proj_a(x); b = in_proj_b(x); z = in_proj_z(x)  (gates / decay inputs)
-  //   gated-delta recurrence: update a per-head matrix state S (key_dim×val_dim)
-  //     S = S * exp(-softplus(a)*exp(A_log)) + outer(k, v*β)   [Mamba2/GDN form]
-  //     out_head = S · q  (+ dt_bias, norm, z-gate)
-  //   y = out_proj( norm(out) * silu(z) )
-  // Needs: (1) a conv1d kernel + per-layer ring state, (2) a recurrent state-update
-  // kernel holding S[16 heads][128×128] per layer in a persistent GPU buffer.
-  // NEITHER exists. This is the hard kernel; reference math = HF Qwen3.5/Qwen3-Next
-  // modeling_qwen3_next GatedDeltaNet. Until written, the model cannot run.
-  function deltaNet() { throw new Error('Qwen3.5 deltaNet linear-attention not implemented (scaffold only)'); }
 
-  async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
-    throw new Error('SandpieQwen35 is a SCAFFOLD — gated-DeltaNet kernels (18/24 layers) + conv1d are not implemented yet, and the loader/forward still use the inherited Qwen3 graph. See deltaNet() and the header for the remaining work.');
-    /* eslint-disable no-unreachable */
+  // Greedy generate. Prefill feeds the prompt token-by-token (the DeltaNet recurrence
+  // is sequential, so every position — prompt and generated — runs as a single-token
+  // forward). Then decode loops, feeding back each predicted token.
+  async function generate(prompt, { maxTokens = 64, onToken, signal, system } = {}) {
     await loadModel({});
-    const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
+    resetState();
+    const msgs = [];
+    if (system) msgs.push({ role: 'system', content: system });
+    msgs.push({ role: 'user', content: prompt });
+    const ids = TOK.encodeChat(msgs);
     const L = ids.length;
-    const tok0 = await forward(ids, 0);          // prefill → _tokHist[L]=token0
+    let tok = 0;
+    for (let i = 0; i < L; i++) {                 // prefill; last call predicts position L
+      if (signal && signal.aborted) return '';
+      tok = await forward(ids[i], i);
+    }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
-    if (!emit(tok0)) return TOK.decode(outIds);
+    if (!emit(tok)) return TOK.decode(outIds);
     while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
       if (signal && signal.aborted) break;
-      const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
-      if (K <= 0) break;
-      // K chained forwards, GPU-resident: forward(pos+k) reads _tokHist[pos+k],
-      // writes _tokHist[pos+k+1]. submitOnly → CPU encodes ahead while GPU runs.
-      for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
-      const toks = await readU32Range(_tokHist, pos + 1, K);   // one readback for the batch
-      pos += K;
-      let brk = false;
-      for (let k = 0; k < K; k++) { if (!emit(toks[k]) || outIds.length >= maxTokens) { brk = true; break; } }
-      if (brk) break;
+      tok = await forward(tok, pos);             // process token at `pos`, predict pos+1
+      pos++;
+      if (!emit(tok)) break;
     }
     return TOK.decode(outIds);
   }
@@ -1785,6 +1841,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
+    __reset: () => resetState(),
+    _setDbgLayers: (b) => { _DBGLAYERS = !!b; }, _layerDbg: () => _layerDbg,
+    _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
+    _dbgState: async (l, n) => E.readF32(_deltaS[l], n || 64),
+    _weightStat: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return 'missing'; if (w.f32) return Array.from(await E.readF32(w.buf, n||8)); if (w.int4) return 'int4 ' + JSON.stringify(w.shape); return 'f16 ' + JSON.stringify(w.shape); },
     _dbg: {
       weight: async (name, n) => readF16(_weights[name].buf, n || _weights[name].numel),
       weightInfo: (name) => ({ shape: _weights[name].shape, numel: _weights[name].numel }),
