@@ -32,15 +32,22 @@
   <span id="status" class="hi"></span>
 </div>
 
-<h2 style="font-size:0.95rem; color:#8b949e;">Chat (Qwen3-0.6B, int4, runs entirely in this tab)</h2>
+<h2 style="font-size:0.95rem; color:#8b949e;">Chat (int4, runs entirely in this tab)</h2>
 <div>
-  <textarea id="prompt" rows="2" style="width:100%; background:#161b22; color:#c9d1d9; border:1px solid #30363d; border-radius:8px; padding:0.6rem; font:inherit;">What is the capital of France?</textarea>
+  <textarea id="prompt" rows="2" style="width:100%; background:#161b22; color:#c9d1d9; border:1px solid #30363d; border-radius:8px; padding:0.6rem; font:inherit;">What is the capital of France? Answer in one word.</textarea>
   <div style="margin:0.4rem 0;">
+    <label style="color:#8b949e; font-size:0.85rem;">model
+      <select id="model" style="background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:0.2rem;">
+        <option value="qwen35">Qwen3.5-0.8B (hybrid DeltaNet, ~1.75GB)</option>
+        <option value="qwen3">Qwen3-0.6B (~1.5GB)</option>
+      </select>
+    </label>
     <button id="gen">Load model &amp; generate</button>
     <label style="color:#8b949e; font-size:0.85rem;">max tokens <input id="maxtok" type="number" value="80" style="width:4rem; background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;"></label>
     <span id="genstat" class="hi"></span>
     <span id="tps" class="ok" style="margin-left:0.6rem;"></span>
   </div>
+  <p style="color:#6e7681;font-size:0.78rem;margin:0.2rem 0;">First run downloads the weights (cached after). Qwen3.5 emits its reasoning in <code>&lt;think&gt;…&lt;/think&gt;</code> before the answer.</p>
   <pre id="out" style="min-height:3rem;">—</pre>
 </div>
 
@@ -58,8 +65,9 @@
 <pre id="bench">—</pre>
 
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
-<script src="../modules/webgpu-engine.js?v=30"></script>
-<script src="../modules/webgpu-qwen3.js?v=30"></script>
+<script src="../modules/webgpu-engine.js?v=31"></script>
+<script src="../modules/webgpu-qwen3.js?v=31"></script>
+<script src="../modules/webgpu-qwen35.js?v=31"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -137,13 +145,14 @@
   });
 
   $('gen').addEventListener('click', async () => {
-    const Q = window.SandpieQwen3;
+    const Q = $('model').value === 'qwen35' ? window.SandpieQwen35 : window.SandpieQwen3;
     $('gen').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
     try {
       if (!Q.isLoaded()) {
-        $('genstat').textContent = 'loading model (first run downloads ~1.5GB, cached after)…';
+        $('genstat').textContent = 'loading model (first run downloads weights, cached after)…';
         await Q.loadModel({ onProgress: (p) => {
           if (p.phase === 'download') $('genstat').textContent = `downloading ${p.pct}%`;
+          else if (p.phase === 'cache') $('genstat').textContent = 'loading from cache…';
           else if (p.phase === 'parse') $('genstat').textContent = `quantizing ${p.pct}%`;
         }});
       }
