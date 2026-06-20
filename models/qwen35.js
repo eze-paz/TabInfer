@@ -36,9 +36,12 @@ const SandpieQwen35 = (function () {
   // Qwen3.5 variants — architecturally identical except hidden_size & intermediate_size
   // (same 24 layers, head_dim 256, DeltaNet 16×128, vocab 248320, rotary). So switching
   // models is purely a config + URL change; no kernel changes.
+  // repo = full HF "author/name"; file = the safetensors shard; compressed = pre-quantized
+  // compressed-tensors (pack-quantized int4, group 32, symmetric — matches our scheme).
   const VARIANTS = {
-    '0.8B': { hidden: 1024, intermediate: 3584, repo: 'Qwen3.5-0.8B' },
-    '2B':   { hidden: 2048, intermediate: 6144, repo: 'Qwen3.5-2B' },
+    '0.8B':   { hidden: 1024, intermediate: 3584, repo: 'Qwen/Qwen3.5-0.8B', file: 'model.safetensors-00001-of-00001.safetensors' },
+    '2B':     { hidden: 2048, intermediate: 6144, repo: 'Qwen/Qwen3.5-2B',   file: 'model.safetensors-00001-of-00001.safetensors' },
+    '2B-AWQ': { hidden: 2048, intermediate: 6144, repo: 'cyankiwi/Qwen3.5-2B-AWQ-4bit', file: 'model-00001-of-00001.safetensors', compressed: true },
   };
   let _variant = '0.8B';
   const CONFIG = {
@@ -1482,7 +1485,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // bf16→f16 goes via f32 (different exponent widths). Cached in Cache Storage.
   // ============================================================
   let MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/';
-  const MODEL_FILE = 'model.safetensors-00001-of-00001.safetensors';   // single shard, same name both variants
+  let MODEL_FILE = 'model.safetensors-00001-of-00001.safetensors';
+  let _compressed = false;   // true → safetensors is pre-quantized compressed-tensors (weight_packed)
   // Select the active variant (call before loadModel). Mutates CONFIG dims + the model
   // URL + the OPFS cache key. If a different variant is already loaded, unload first.
   function selectModel(v) {
@@ -1491,7 +1495,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _variant = v;
     CONFIG.hidden = VARIANTS[v].hidden;
     CONFIG.intermediate = VARIANTS[v].intermediate;
-    MODEL_ROOT = 'https://huggingface.co/Qwen/' + VARIANTS[v].repo + '/resolve/main/';
+    MODEL_ROOT = 'https://huggingface.co/' + VARIANTS[v].repo + '/resolve/main/';
+    MODEL_FILE = VARIANTS[v].file;
+    _compressed = !!VARIANTS[v].compressed;
   }
   let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
@@ -1637,11 +1643,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       chunks.push(value); recv += value.length;
       if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
     }
-    // Cache + single-buffer path only when it fits one ArrayBuffer (<4GB); else stream from chunks.
+    // Try the single-buffer + OPFS-cache path (concat). It needs a contiguous alloc
+    // the same size as the data, on top of the chunks already in RAM, so it can fail
+    // under memory pressure well before the 4GB ArrayBuffer cap — fall back to streaming.
     if (recv < 4_000_000_000) {
-      const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
-      await opfsWrite(out);
-      return srcFromAB(out.buffer);
+      try {
+        const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
+        await opfsWrite(out);
+        return srcFromAB(out.buffer);
+      } catch (e) { try { console.warn('[q35] concat/cache failed (', e.message, ') — streaming from chunks'); } catch (_) {} }
     }
     return srcFromChunks(chunks);
   }
@@ -1661,8 +1671,27 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const names = Object.keys(header).filter(n => n !== '__metadata__' && !isSkip(n));
     // Aligned byte-copy of a tensor's raw bytes → a typed array of the given ctor.
     const aligned = (raw, Ctor) => { const a = new Ctor(raw.byteLength / Ctor.BYTES_PER_ELEMENT); new Uint8Array(a.buffer).set(raw); return a; };
+    const readT = (inf) => src.readRange(dataStart + inf.data_offsets[0], inf.data_offsets[1] - inf.data_offsets[0]);
     for (let i = 0; i < names.length; i++) {
       const name = names[i], info = header[name];
+      // compressed-tensors: scale/shape are consumed alongside their weight_packed
+      if (name.endsWith('.weight_scale') || name.endsWith('.weight_shape')) continue;
+      if (name.endsWith('.weight_packed')) {
+        // pre-quantized int4 (group 32, symmetric) — same scheme as ours, but two's-complement
+        // nibbles; XOR 0x88888888 flips bit-3 of each nibble → our offset-binary (q+8) encoding.
+        const base = name.slice(0, -'.weight_packed'.length);
+        const N = info.shape[0], K = info.shape[1] * 8;   // weight_packed is [N, K/8]
+        const pk = aligned(readT(info), Uint32Array);
+        if (_awqXor) { for (let j = 0; j < pk.length; j++) pk[j] = pk[j] ^ 0x88888888; }
+        const scF16 = bf16ToF16bits(aligned(readT(header[base + '.weight_scale']), Uint16Array));
+        const packBuf = E.createBuffer(pk.byteLength, ST(), base + '.pk');
+        const scBuf = E.createBuffer(scF16.byteLength, ST(), base + '.sc');
+        E.device().queue.writeBuffer(packBuf, 0, pk);
+        E.device().queue.writeBuffer(scBuf, 0, scF16);
+        _weights[base + '.weight'] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: [N, K], numel: N * K };
+        if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
+        continue;
+      }
       const [begin, end] = info.data_offsets;
       const numel = info.shape.reduce((a, b) => a * b, 1);
       const raw = src.readRange(dataStart + begin, end - begin);
@@ -1739,6 +1768,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _dbgLayer = -1, _dbgCap = {};   // snapshot one delta layer's intermediates (CPU-ref debug)
   let _swapQK = false, _deltaMaxLayer = 999;   // debug: swap q/k in recurrence; limit active delta layers
   let _subOverride = null;   // GEMV reduction: null=auto (subgroups if supported), true/false to force
+  let _awqXor = false;       // compressed-tensors packs offset-binary (q+8) = OUR format → read direct, no transcode.
+                             // (Toggle exists only for hypothetical two's-complement repos.)
   function _useSub() { return _subOverride !== null ? _subOverride : !!(E.caps && E.caps() && E.caps().hasSubgroups); }
   let _kv = null;          // per full-attn layer: {k,v} sized MAX_SEQ ; null for delta layers
   let _convState = null;   // per delta layer: [convDim*(K-1)] causal-conv ring ; null for attn
@@ -2013,7 +2044,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _setDbgLayer: (l) => { _dbgLayer = l; }, _dbgCapRead: async (nm, n) => _dbgCap[nm] ? Array.from(await E.readF32(_dbgCap[nm], n)) : null,
     _setSwapQK: (b) => { _swapQK = !!b; }, _setDeltaMaxLayer: (l) => { _deltaMaxLayer = l; },
     _setSub: (b) => { _subOverride = b; }, _caps: () => (E.caps ? E.caps() : null),
-    _setGenBatch: (k) => { _genBatch = k; },
+    _setGenBatch: (k) => { _genBatch = k; }, _setAwqXor: (b) => { _awqXor = !!b; },
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
     _dbgState: async (l, n) => E.readF32(_deltaS[l], n || 64),

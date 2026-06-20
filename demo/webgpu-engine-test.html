@@ -39,7 +39,8 @@
     <label style="color:#8b949e; font-size:0.85rem;">model
       <select id="model" style="background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:0.2rem;">
         <option value="qwen35">Qwen3.5-0.8B (hybrid DeltaNet, ~1.75GB)</option>
-        <option value="qwen35-2b">Qwen3.5-2B (hybrid DeltaNet, ~4.5GB DL)</option>
+        <option value="qwen35-2b">Qwen3.5-2B (bf16 weights, ~4.5GB DL)</option>
+        <option value="qwen35-2b-awq">Qwen3.5-2B AWQ-int4 (pre-quantized, ~2.5GB DL)</option>
         <option value="qwen3">Qwen3-0.6B (~1.5GB)</option>
       </select>
     </label>
@@ -66,9 +67,9 @@
 <pre id="bench">—</pre>
 
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
-<script src="../modules/webgpu-engine.js?v=36"></script>
-<script src="../modules/webgpu-qwen3.js?v=36"></script>
-<script src="../modules/webgpu-qwen35.js?v=36"></script>
+<script src="../modules/webgpu-engine.js?v=39"></script>
+<script src="../modules/webgpu-qwen3.js?v=39"></script>
+<script src="../modules/webgpu-qwen35.js?v=39"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -148,7 +149,7 @@
   $('gen').addEventListener('click', async () => {
     const sel = $('model').value;
     const Q = sel === 'qwen3' ? window.SandpieQwen3 : window.SandpieQwen35;
-    const variant = sel === 'qwen35-2b' ? '2B' : (sel === 'qwen35' ? '0.8B' : undefined);
+    const variant = sel === 'qwen35-2b-awq' ? '2B-AWQ' : (sel === 'qwen35-2b' ? '2B' : (sel === 'qwen35' ? '0.8B' : undefined));
     $('gen').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
     try {
       // (re)load if not loaded, or if the selected Qwen3.5 variant differs from the loaded one
