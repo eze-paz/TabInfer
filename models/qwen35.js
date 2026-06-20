@@ -1634,32 +1634,70 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let i = 0; i < u16.length; i++) { ti[0] = u16[i] << 16; out[i] = t[0]; } return out; }
 
   const opfsFile = () => 'q35-' + _variant + '-model.safetensors';   // per-variant OPFS cache (GB-scale quota)
-  async function opfsRead(onProgress) {
+  const OPFS_SLICE = 256 * 1024 * 1024;   // read/return the cached file in ≤256MB pieces (never one GB-scale alloc)
+  // Read the cached model back as an ARRAY OF CHUNKS (File.slice per piece). Avoids a single
+  // 1.75GB+ ArrayBuffer alloc (which fails under memory pressure / on mobile). null if absent.
+  async function opfsReadChunks(onProgress) {
     try {
       const root = await navigator.storage.getDirectory();
       const fh = await root.getFileHandle(opfsFile());   // throws if absent
       const f = await fh.getFile();
       if (f.size < 1e9) return null;                    // partial/corrupt
-      onProgress && onProgress({ phase: 'cache', pct: 100 });
-      return await f.arrayBuffer();
+      const chunks = [];
+      for (let off = 0; off < f.size; off += OPFS_SLICE) {
+        const end = Math.min(off + OPFS_SLICE, f.size);
+        chunks.push(new Uint8Array(await f.slice(off, end).arrayBuffer()));
+        onProgress && onProgress({ phase: 'cache', pct: Math.round(end / f.size * 100) });
+      }
+      return chunks;
     } catch (_) { return null; }
   }
-  async function opfsWrite(u8) {
+  // Stream the downloaded chunks straight to an OPFS file — NO 1.75GB concat buffer, and
+  // delete any stale/partial file first so createWritable doesn't copy-on-write double it
+  // (the QuotaExceededError culprit: 2×1.75GB > the ~3GB sandbox quota).
+  // Stream the download STRAIGHT into OPFS (write-through), without holding the whole
+  // model in the JS heap. That heap pressure (~1.75GB of chunks) is what was squeezing the
+  // dynamic storage quota and quota-failing the write — a fresh 1.75GB OPFS file writes fine
+  // when RAM is free. Returns true if fully cached. (Also fixes the mobile low-RAM failure.)
+  async function downloadToOpfs(onProgress) {
+    let root, writer;
     try {
-      const root = await navigator.storage.getDirectory();
-      const fh = await root.getFileHandle(opfsFile(), { create: true });
-      const w = await fh.createWritable();
-      const CH = 64 * 1024 * 1024;   // 64MB chunks (single 1.75GB write fails silently)
-      for (let off = 0; off < u8.length; off += CH) {
-        await w.write({ type: 'write', position: off, data: u8.subarray(off, Math.min(off + CH, u8.length)) });
+      root = await navigator.storage.getDirectory();
+      try { await root.removeEntry(opfsFile()); } catch (_) {}
+      writer = await (await root.getFileHandle(opfsFile(), { create: true })).createWritable();
+    } catch (_) { return false; }
+    try {
+      const resp = await fetch(MODEL_ROOT + MODEL_FILE);
+      const total = +(resp.headers.get('content-length') || 0);
+      const reader = resp.body.getReader(); let recv = 0;
+      for (;;) {
+        const { done, value } = await reader.read(); if (done) break;
+        await writer.write(value); recv += value.length;
+        if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
       }
-      await w.close();
-    } catch (e) { try { console.warn('[q35] opfsWrite failed', e); } catch (_) {} }
+      await writer.close();
+      return true;
+    } catch (e) {
+      try { console.warn('[q35] OPFS write-through failed (', (e && e.message) || e, ') — will stream from RAM', e); } catch (_) {}
+      try { await writer.close(); } catch (_) {}
+      try { await root.removeEntry(opfsFile()); } catch (_) {}   // drop the partial
+      return false;
+    }
   }
-  // A byte source with readRange(start,len) → fresh Uint8Array. Backed either by a
-  // single ArrayBuffer (small / cached models) or by the raw download chunks (large
-  // models, since a single ArrayBuffer can't exceed ~4GB in the browser — 2B is 4.5GB).
-  function srcFromAB(ab) { return { byteLength: ab.byteLength, readRange: (s, n) => new Uint8Array(ab.slice(s, s + n)) }; }
+  // Fallback: download into RAM chunks (uncached) when OPFS caching is impossible.
+  async function downloadToRam(onProgress) {
+    const resp = await fetch(MODEL_ROOT + MODEL_FILE);
+    const total = +(resp.headers.get('content-length') || 0);
+    const reader = resp.body.getReader(); const chunks = []; let recv = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      chunks.push(value); recv += value.length;
+      if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
+    }
+    return chunks;
+  }
+  // A byte source with readRange(start,len) → fresh Uint8Array, backed by an array of byte
+  // chunks (cached file read back in slices, or raw download chunks). No GB-scale alloc.
   function srcFromChunks(chunks) {
     const offs = new Array(chunks.length + 1); offs[0] = 0;
     for (let i = 0; i < chunks.length; i++) offs[i + 1] = offs[i] + chunks[i].length;
@@ -1675,27 +1713,16 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     };
   }
   async function fetchModelBytes(onProgress) {
-    const cached = await opfsRead(onProgress);
-    if (cached) return srcFromAB(cached);
-    const resp = await fetch(MODEL_ROOT + MODEL_FILE);
-    const total = +(resp.headers.get('content-length') || 0);
-    const reader = resp.body.getReader(); const chunks = []; let recv = 0;
-    for (;;) {
-      const { done, value } = await reader.read(); if (done) break;
-      chunks.push(value); recv += value.length;
-      if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
+    const cached = await opfsReadChunks(onProgress);
+    if (cached) return srcFromChunks(cached);
+    // First try write-through to OPFS (low peak RAM → the write actually fits the quota),
+    // then serve THIS session by reading the cache back in slices. If caching is impossible
+    // (quota/permission), fall back to an in-RAM download (uncached — re-downloads next time).
+    if (await downloadToOpfs(onProgress)) {
+      const back = await opfsReadChunks(onProgress);
+      if (back) return srcFromChunks(back);
     }
-    // Try the single-buffer + OPFS-cache path (concat). It needs a contiguous alloc
-    // the same size as the data, on top of the chunks already in RAM, so it can fail
-    // under memory pressure well before the 4GB ArrayBuffer cap — fall back to streaming.
-    if (recv < 4_000_000_000) {
-      try {
-        const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
-        await opfsWrite(out);
-        return srcFromAB(out.buffer);
-      } catch (e) { try { console.warn('[q35] concat/cache failed (', e.message, ') — streaming from chunks'); } catch (_) {} }
-    }
-    return srcFromChunks(chunks);
+    return srcFromChunks(await downloadToRam(onProgress));
   }
 
   async function loadModel({ onProgress, variant } = {}) {
