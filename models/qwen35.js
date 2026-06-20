@@ -1953,6 +1953,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // the post-attention RMSNorm + SwiGLU MLP block is identical for both.
   async function forward(tokenId, pos, opts) {
     const chain = !!(opts && opts.chain), submitOnly = !!(opts && opts.submitOnly);
+    // Prefill tokens 0..L-2 only need to UPDATE state (KV/conv/delta); their logits are
+    // never read. Skip the final norm + 248K-vocab lm_head + argmax for them — that matmul
+    // is ~35% of a prefill token's GPU time (the lm_head dominates gemvQ).
+    const noLmHead = !!(opts && opts.noLmHead);
     const _t0 = _PERF ? performance.now() : 0;
     const C = CONFIG, H = C.hidden, hd = C.headDim, nHq = C.nHeads, nKv = C.nKvHeads, I = C.intermediate;
     const dH = C.deltaHeads, dK = C.deltaKeyDim, dV = C.deltaValDim;
@@ -2028,14 +2032,17 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         E.beginBatch();
       }
     }
-    await rmsnorm(s.x, W('norm.weight'), s.normed, 1, H, C.rmsEps);
-    await linearQ(s.normed, _weights['__embed_int4'], s.logits, 1, C.vocab, H);           // tied lm_head (same int4 embed buffer)
-    await argmaxKernel(s.logits, _tokHist, C.vocab, pos + 1);
+    if (!noLmHead) {
+      await rmsnorm(s.x, W('norm.weight'), s.normed, 1, H, C.rmsEps);
+      await linearQ(s.normed, _weights['__embed_int4'], s.logits, 1, C.vocab, H);         // tied lm_head (same int4 embed buffer)
+      await argmaxKernel(s.logits, _tokHist, C.vocab, pos + 1);
+    }
     const _t1 = _PERF ? performance.now() : 0;
     const drain = E.endBatch();
     if (submitOnly) return undefined;
     await drain;
     const _t2 = _PERF ? performance.now() : 0;
+    if (noLmHead) return undefined;   // no logits computed — nothing to read
     const tok = await readU32At(_tokHist, pos + 1);
     if (_PERF) _perfData = { encode_ms: +(_t1 - _t0).toFixed(2), gpu_drain_ms: +(_t2 - _t1).toFixed(2), map_ms: +(performance.now() - _t2).toFixed(2) };
     return tok;
@@ -2090,9 +2097,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // per-token argmax into _tokHist is harmless: prefill embeds via setIds(ids[i]), not chain.
     for (let i = 0; i < L; i++) {
       if (signal && signal.aborted) return [];
-      const sync = _prefillSerial || (i === L - 1) || ((i + 1) % PF_BATCH === 0);
-      if (sync) tok = await forward(ids[i], i);
-      else await forward(ids[i], i, { submitOnly: true });
+      const last = i === L - 1;
+      const sync = _prefillSerial || last || ((i + 1) % PF_BATCH === 0);
+      const opts = { noLmHead: !last, submitOnly: !sync };   // only the LAST prefill token needs logits
+      if (sync) tok = await forward(ids[i], i, opts);   // for `last`, returns the first generated token
+      else await forward(ids[i], i, opts);
     }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
