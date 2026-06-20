@@ -477,6 +477,70 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     return E.dispatch(pipe, [xBuf, wBuf, biasBuf, stateBuf, outBuf, p], [Math.ceil(convDim / 64), 1, 1]);
   }
 
+  // ============================================================
+  // Per-head L2 normalize: out[h][i] = x[h][i] / sqrt(Σ_i x[h][i]^2 + eps).
+  // q and k are L2-normed per head before the DeltaNet recurrence.
+  // One workgroup per head, ${DELTA_DIM} threads, shared-mem sum reduction.
+  // ============================================================
+  const L2_WGSL = `
+struct P { nHeads:u32, dim:u32, eps:f32, _a:u32 };
+@group(0) @binding(0) var<storage, read>       x   : array<f32>;
+@group(0) @binding(1) var<storage, read_write> outv: array<f32>;
+@group(0) @binding(2) var<uniform>             p   : P;
+var<workgroup> red : array<f32, ${DELTA_DIM}>;
+@compute @workgroup_size(${DELTA_DIM},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let h = wg.x; let i = lid.x; let dim = p.dim; let base = h*dim;
+  let v = select(0.0, x[base+i], i < dim);
+  red[i] = v*v;
+  workgroupBarrier();
+  var stride = ${DELTA_DIM}u / 2u;
+  loop { if (stride == 0u) { break; }
+    if (i < stride) { red[i] = red[i] + red[i+stride]; }
+    workgroupBarrier(); stride = stride / 2u; }
+  if (i >= dim) { return; }
+  let inv = 1.0 / sqrt(red[0] + p.eps);
+  outv[base+i] = x[base+i] * inv;
+}`;
+  function l2normHeads(inBuf, outBuf, nHeads, dim, eps) {
+    const pipe = E.getPipeline('q35.l2', L2_WGSL);
+    const u = new Uint32Array(4); const du = new DataView(u.buffer);
+    du.setUint32(0, nHeads, true); du.setUint32(4, dim, true); du.setFloat32(8, eps, true);
+    const p = uniform(u);
+    return E.dispatch(pipe, [inBuf, outBuf, p], [nHeads, 1, 1]);
+  }
+
+  // ============================================================
+  // g/beta precompute (per v-head). HF Qwen3NextGatedDeltaNet:
+  //   beta = sigmoid(b)
+  //   g    = -exp(A_log) * softplus(a + dt_bias)   ;  state decay = exp(g)
+  // Output gb[h*2]=expg=exp(g), gb[h*2+1]=beta. One thread per head.
+  // softplus(x) = log(1+exp(x)), numerically stable via max(x,0)+log1p(exp(-|x|)).
+  // ============================================================
+  const GBETA_WGSL = `
+struct P { nHeads:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       a      : array<f32>;   // [nHeads] in_proj_a
+@group(0) @binding(1) var<storage, read>       b      : array<f32>;   // [nHeads] in_proj_b
+@group(0) @binding(2) var<storage, read>       A_log  : array<f32>;   // [nHeads]
+@group(0) @binding(3) var<storage, read>       dt_bias: array<f32>;   // [nHeads]
+@group(0) @binding(4) var<storage, read_write> gb     : array<f32>;   // [nHeads*2]
+@group(0) @binding(5) var<uniform>             p      : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let h = gid.x; if (h >= p.nHeads) { return; }
+  let beta = 1.0 / (1.0 + exp(-b[h]));
+  let z = a[h] + dt_bias[h];
+  let sp = max(z, 0.0) + log(1.0 + exp(-abs(z)));   // softplus, stable
+  let g = -exp(A_log[h]) * sp;
+  gb[h*2u]      = exp(g);
+  gb[h*2u + 1u] = beta;
+}`;
+  function gbeta(aBuf, bBuf, ALogBuf, dtBiasBuf, gbBuf, nHeads) {
+    const pipe = E.getPipeline('q35.gbeta', GBETA_WGSL);
+    const p = uniform(new Uint32Array([nHeads, 0, 0, 0]));
+    return E.dispatch(pipe, [aBuf, bBuf, ALogBuf, dtBiasBuf, gbBuf, p], [Math.ceil(nHeads / 64), 1, 1]);
+  }
+
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
   const MATVECQ_WGSL = `
 enable f16;
@@ -1036,6 +1100,34 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
       check('conv1dDecode', maxe, 1e-3);
       [wb,bb,stb,ob].forEach(b=>b.destroy());
+    }
+    // --- l2normHeads (per-head L2 normalize) vs CPU ---
+    {
+      const H=4, dim=DELTA_DIM, eps=1e-6;
+      const x=new Float32Array(H*dim); for(let i=0;i<x.length;i++) x[i]=Math.sin(i*0.09)*(1+0.5*((i/dim)|0));
+      const xb=f32buf(x), ob=E.createBuffer(H*dim*4, ST(),'o');
+      await l2normHeads(xb, ob, H, dim, eps);
+      const got=await E.readF32(ob, H*dim);
+      const ref=new Float32Array(H*dim);
+      for(let h=0;h<H;h++){ let ss=0; for(let i=0;i<dim;i++){ const v=x[h*dim+i]; ss+=v*v; }
+        const inv=1/Math.sqrt(ss+eps); for(let i=0;i<dim;i++) ref[h*dim+i]=x[h*dim+i]*inv; }
+      check('l2normHeads', maxAbs(got,ref), 1e-4);
+      [xb,ob].forEach(b=>b.destroy());
+    }
+    // --- gbeta (decay + beta precompute) vs CPU ---
+    {
+      const H=16;
+      const a=new Float32Array(H), b=new Float32Array(H), Al=new Float32Array(H), dtb=new Float32Array(H);
+      for(let h=0;h<H;h++){ a[h]=Math.sin(h*0.3)*2; b[h]=Math.cos(h*0.2)*1.5; Al[h]=Math.sin(h*0.5)-0.5; dtb[h]=0.1*h-0.5; }
+      const ab=f32buf(a),bb=f32buf(b),alb=f32buf(Al),dtbb=f32buf(dtb);
+      const gbb=E.createBuffer(H*2*4, ST(),'gb');
+      await gbeta(ab,bb,alb,dtbb,gbb,H);
+      const got=await E.readF32(gbb, H*2);
+      const sp=z=>Math.max(z,0)+Math.log(1+Math.exp(-Math.abs(z)));
+      const ref=new Float32Array(H*2);
+      for(let h=0;h<H;h++){ ref[h*2]=Math.exp(-Math.exp(Al[h])*sp(a[h]+dtb[h])); ref[h*2+1]=1/(1+Math.exp(-b[h])); }
+      check('gbeta', maxAbs(got,ref), 1e-5);
+      [ab,bb,alb,dtbb,gbb].forEach(x=>x.destroy());
     }
     return out;
   }
