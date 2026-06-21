@@ -346,33 +346,99 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
   // These are CORRECTNESS-FIRST (one row/workgroup for gemv; one output/thread for gemm) —
   // the fork engine will graft in the tiled/register-blocked versions for speed.
   // ============================================================
-  const GEMVK_WG = 128;
+  // FAST gemv (decode, T=1) — mirrors the int4 gemvQ that hits ~40 tok/s:
+  //   • the row's per-block scale/min metadata is decoded ONCE into shared memory (not the
+  //     per-weight scale_min_k4 recompute that bottlenecked earlier versions),
+  //   • q4_K/q5_K read 8 weights per u32 word (unpack4xU8) and do vec4 dots vs vec4 of x,
+  //   • subgroup reduction (no shared-mem barrier tree).
+  // q6_K (the lm_head, ~1/3 of the model) pre-decodes its 16 int8 scales/block to shared and
+  // decodes per weight; q8_0 (tiny ssm tensors) stays simple. WG=128, one row per workgroup.
+  const GEMV_BODY = {
+    // q4_K — word-level: each u32 = 8 nibbles = 4 low-half + 4 high-half weights; shared sd/sm.
+    q4_K: `
+  let nbpr = d.K >> 8u; let nsub = d.K >> 5u; let rowBlk = row*nbpr;
+  for (var s=lid.x; s<nsub; s=s+128u) { let b=s>>3u; let ss=s&7u; let base=(rowBlk+b)*36u; let dd=unpack2x16float(W[base]); let m4=scale_min_k4(base,ss); sd[s]=dd.x*m4.x; sm[s]=dd.y*m4.y; }
+  workgroupBarrier();
+  let nwords = d.K >> 3u;
+  for (var qw=lid.x; qw<nwords; qw=qw+128u) {
+    let b=qw>>5u; let local=qw&31u; let c=local>>3u; let inner=local&7u;
+    let word=W[(rowBlk+b)*36u + 4u + local];
+    let subLo=b*8u+c*2u; let subHi=subLo+1u;
+    let loN=vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu));
+    let hiN=vec4<f32>(unpack4xU8((word>>4u) & 0x0F0F0F0Fu));
+    let kLo=b*256u + c*64u + inner*4u; let kHi=kLo+32u;
+    let xl=vec4<f32>(x[kLo],x[kLo+1u],x[kLo+2u],x[kLo+3u]);
+    let xh=vec4<f32>(x[kHi],x[kHi+1u],x[kHi+2u],x[kHi+3u]);
+    acc = acc + sd[subLo]*dot(loN,xl) - sm[subLo]*(xl.x+xl.y+xl.z+xl.w)
+              + sd[subHi]*dot(hiN,xh) - sm[subHi]*(xh.x+xh.y+xh.z+xh.w);
+  }`,
+    // q5_K — word-level like q4_K + the 5th bit per weight from qh (bit index == sub).
+    q5_K: `
+  let nbpr = d.K >> 8u; let nsub = d.K >> 5u; let rowBlk = row*nbpr;
+  for (var s=lid.x; s<nsub; s=s+128u) { let b=s>>3u; let ss=s&7u; let base=(rowBlk+b)*44u; let dd=unpack2x16float(W[base]); let m4=scale_min_k4(base,ss); sd[s]=dd.x*m4.x; sm[s]=dd.y*m4.y; }
+  workgroupBarrier();
+  let nwords = d.K >> 3u;
+  for (var qw=lid.x; qw<nwords; qw=qw+128u) {
+    let b=qw>>5u; let local=qw&31u; let c=local>>3u; let inner=local&7u;
+    let base=(rowBlk+b)*44u;
+    let word=W[base + 12u + local];
+    let qhB=unpack4xU8(W[base + 4u + inner]);
+    let subLo=b*8u+c*2u; let subHi=subLo+1u; let bitLo=c*2u;
+    let loN=vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)) + 16.0*vec4<f32>((qhB>>vec4<u32>(bitLo))&vec4<u32>(1u));
+    let hiN=vec4<f32>(unpack4xU8((word>>4u) & 0x0F0F0F0Fu)) + 16.0*vec4<f32>((qhB>>vec4<u32>(bitLo+1u))&vec4<u32>(1u));
+    let kLo=b*256u + c*64u + inner*4u; let kHi=kLo+32u;
+    let xl=vec4<f32>(x[kLo],x[kLo+1u],x[kLo+2u],x[kLo+3u]);
+    let xh=vec4<f32>(x[kHi],x[kHi+1u],x[kHi+2u],x[kHi+3u]);
+    acc = acc + sd[subLo]*dot(loN,xl) - sm[subLo]*(xl.x+xl.y+xl.z+xl.w)
+              + sd[subHi]*dot(hiN,xh) - sm[subHi]*(xh.x+xh.y+xh.z+xh.w);
+  }`,
+    // q6_K — pre-decode all 16 int8 scales/block to shared, then per-weight decode.
+    q6_K: `
+  let nbpr = d.K >> 8u; let rowBlk = row*nbpr; let nscale = nbpr*16u;
+  for (var si=lid.x; si<nscale; si=si+128u) { let b=si>>4u; let sIdx=si&15u; let base=(rowBlk+b)*53u; let dv=unpack2x16float(W[base+52u]).x; let sRaw=(W[base+48u+(sIdx>>2u)]>>((sIdx&3u)*8u))&0xFFu; sc6[si]=f32(select(i32(sRaw),i32(sRaw)-256,sRaw>=128u))*dv; }
+  workgroupBarrier();
+  for (var k=lid.x; k<d.K; k=k+128u) {
+    let b=k>>8u; let kk=k&255u; let base=(rowBlk+b)*53u;
+    let half=kk>>7u; let pos=kk&127u; let quarter=pos>>5u; let l=pos&31u; let is=l>>4u;
+    let qlOff=l+select(0u,32u,(quarter&1u)==1u);
+    let qlb=(W[base+half*16u+(qlOff>>2u)]>>((qlOff&3u)*8u))&0xFFu;
+    let qlNib=select(qlb>>4u,qlb&0xFu,quarter<2u);
+    let qhb=(W[base+32u+half*8u+(l>>2u)]>>((l&3u)*8u))&0xFFu;
+    let q=f32(i32(qlNib|(((qhb>>(quarter*2u))&3u)<<4u))-32);
+    acc = acc + x[k]*(sc6[b*16u + half*8u + quarter*2u + is]*q);
+  }`,
+    // q8_0 — tiny tensors only; simple per-block.
+    q8_0: `
+  let nbpr = d.K >> 5u; let rowBlk = row*nbpr;
+  for (var blk=lid.x; blk<nbpr; blk=blk+128u) {
+    let base=(rowBlk+blk)*9u; let dv=unpack2x16float(W[base]).x; let kbase=blk*32u;
+    for (var l=0u; l<32u; l=l+1u) { let bi=2u+l; let raw=(W[base+(bi>>2u)]>>((bi&3u)*8u))&0xFFu; acc = acc + x[kbase+l]*dv*f32(select(i32(raw),i32(raw)-256,raw>=128u)); }
+  }`,
+  };
   function gemvKWGSL(qtype) {
-    const g = QGPU[qtype];
+    const needsKQ = qtype === 'q4_K' || qtype === 'q5_K';
+    const shared = qtype === 'q6_K' ? 'var<workgroup> sc6 : array<f32,256>;'
+                 : needsKQ ? 'var<workgroup> sd : array<f32,128>;\nvar<workgroup> sm : array<f32,128>;' : '';
     return `
+enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _p:u32 };
 @group(0) @binding(0) var<storage, read>       x : array<f32>;
 @group(0) @binding(1) var<storage, read>       W : array<u32>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             d : D;
-${DECODER_WGSL[qtype]}
-var<workgroup> part : array<f32, ${GEMVK_WG}>;
-@compute @workgroup_size(${GEMVK_WG},1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
-  let row = wg.x + wg.y*nwg.x;
-  if (row >= d.N) { return; }
-  let nbpr = d.K / ${g.els}u;
-  var acc = 0.0; var k = lid.x;
-  loop {
-    if (k >= d.K) { break; }
-    let base = (row*nbpr + k/${g.els}u) * ${g.u32}u;
-    acc = acc + x[k] * ${g.dq}(base, k % ${g.els}u);
-    k = k + ${GEMVK_WG}u;
-  }
-  part[lid.x] = acc; workgroupBarrier();
-  var stride = ${GEMVK_WG}u/2u;
-  loop { if (stride==0u){break;} if (lid.x<stride){ part[lid.x]=part[lid.x]+part[lid.x+stride]; } workgroupBarrier(); stride=stride/2u; }
-  if (lid.x==0u) { y[row] = select(0.0, y[row], d.acc!=0u) + part[0]; }
+${needsKQ ? WGSL_KQ_COMMON : ''}
+${shared}
+var<workgroup> part : array<f32, 128>;
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let row = wg.x + wg.y*nwg.x; if (row >= d.N) { return; }
+  var acc = 0.0;
+${GEMV_BODY[qtype]}
+  let red = subgroupAdd(acc); let sgIdx = lid.x / sgs;
+  if (sgi == 0u) { part[sgIdx] = red; }
+  workgroupBarrier();
+  if (lid.x == 0u) { let nsg = (128u + sgs - 1u) / sgs; var t = 0.0; for (var i=0u; i<nsg; i=i+1u) { t = t + part[i]; } y[row] = select(0.0, y[row], d.acc!=0u) + t; }
 }`;
   }
   function gemmKWGSL(qtype) {
@@ -440,6 +506,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
   async function selfTestMatmul(E, opts) {
     const U = GPUBufferUsage;
     const N = (opts && opts.N) || 40, K = (opts && opts.K) || 512, T = (opts && opts.T) || 3;
+    const kn = (opts && opts.nonce != null) ? ('.' + opts.nonce) : '';   // bust the engine pipeline cache while iterating
     const out = {};
     for (const qtype of (opts && opts.types) || ['q4_K', 'q5_K', 'q6_K', 'q8_0']) {
       const g = QGPU[qtype], els = g.els, nbpr = K / els, nb = N * nbpr;
@@ -460,11 +527,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
         const dBuf = E.createBuffer(16, U.UNIFORM | U.COPY_DST, 'mm.d');
         if (useGemm) {
           E.device().queue.writeBuffer(dBuf, 0, new Uint32Array([T, N, K, 0]));
-          E.dispatch(E.getPipeline('gguf.gemmK.' + qtype, gemmKWGSL(qtype)), [xBuf, wBuf, yBuf, dBuf], [Math.ceil(T * N / 64), 1, 1]);
+          E.dispatch(E.getPipeline('gguf.gemmK.' + qtype + kn, gemmKWGSL(qtype)), [xBuf, wBuf, yBuf, dBuf], [Math.ceil(T * N / 64), 1, 1]);
         } else {
           E.device().queue.writeBuffer(dBuf, 0, new Uint32Array([N, K, 0, 0]));
           const nWG = N, gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
-          E.dispatch(E.getPipeline('gguf.gemvK.' + qtype, gemvKWGSL(qtype)), [xBuf, wBuf, yBuf, dBuf], [gx, gy, 1]);
+          E.dispatch(E.getPipeline('gguf.gemvK.' + qtype + kn, gemvKWGSL(qtype)), [xBuf, wBuf, yBuf, dBuf], [gx, gy, 1]);
         }
         await E.device().queue.onSubmittedWorkDone();
         const stg = E.createBuffer(T * N * 4, U.COPY_DST | U.MAP_READ, 'mm.rd');
