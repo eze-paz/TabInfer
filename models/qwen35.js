@@ -3262,6 +3262,25 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         for (const b of [xb, pb, sb, yb]) { try { b.destroy(); } catch (_) {} }
       }
     },
+    // Micro-bench the DeltaNet sequential scan (prefill) in isolation — no model needed — so the
+    // prefill bottleneck (serial recurrence vs parallel GEMM) can be MEASURED on this GPU.
+    _benchDelta: async (opts) => {
+      opts = opts || {}; await E.init();
+      const H = CONFIG.deltaHeads, dim = DELTA_DIM, T = opts.T || 256, iters = opts.iters || 20;
+      const qa = new Float32Array(T * H * dim); for (let i = 0; i < qa.length; i++) qa[i] = Math.sin(i * 0.001) * 0.1;
+      const gb = new Float32Array(T * H * 2); for (let i = 0; i < T * H; i++) { gb[i * 2] = 0.99; gb[i * 2 + 1] = 0.5; }   // expg<1, beta
+      const qb = f32buf(qa), kb = f32buf(qa), vb = f32buf(qa), gbb = f32buf(gb);
+      const Sb = E.createBuffer(H * dim * dim * 4, ST(), 'bench.S');
+      const ob = E.createBuffer(T * H * dim * 4, ST(), 'bench.o');
+      try {
+        await deltaRecur(qb, kb, vb, gbb, Sb, ob, H, dim, T); await E.device().queue.onSubmittedWorkDone();   // warm
+        const t0 = performance.now();
+        for (let i = 0; i < iters; i++) await deltaRecur(qb, kb, vb, gbb, Sb, ob, H, dim, T);
+        await E.device().queue.onSubmittedWorkDone();
+        const ms = (performance.now() - t0) / iters;
+        return { T, heads: H, dim, iters, msPerLayer: +ms.toFixed(3), msAll18: +(ms * 18).toFixed(2) };
+      } finally { for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} } }
+    },
     _setCoopMat: (b) => { _coopMat = b; },   // null=auto(probe), true/false to force the cooperative-matrix prefill path (A/B)
     _coopConfigs: () => ((E.caps && E.caps()) ? (E.caps().subgroupMatrixConfigs || []) : []),
     _probeCoopMat: async () => { _coopProbed = false; await E.init(); await probeCoopMat(); return { coopMat: _coopMat, useCoopMat: _useCoopMat(), cfg: _coopCfg, configs: ((E.caps && E.caps()) ? E.caps().subgroupMatrixConfigs : []) }; },
@@ -3282,4 +3301,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v76 (prefill GEMM: bank-conflict +1 tile padding, verified-equal probe + _benchGemmQ; on top of v75 coop-matrix / v74 f16)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v77 (+_benchDelta: isolate the DeltaNet serial-scan prefill cost vs GEMM — measured ~190× the biggest GEMM/layer on Iris Xe)'); } catch (_) {}
