@@ -772,7 +772,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   function gemvK(xBuf, wrec, yBuf, N, K, acc) {
     const pipe = E.getPipeline('ggufK.gemv.' + wrec.qtype, QK.gemvKWGSL(wrec.qtype));
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
-    const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
+    const nWG = Math.ceil(N / (QK.GEMVK_NR || 1));   // each workgroup computes NR rows
+    const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, wrec.raw, yBuf, d], [gx, gy, 1]);
   }
   function gemmK(xBuf, wrec, yBuf, T, N, K, acc) {
