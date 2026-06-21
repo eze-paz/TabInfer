@@ -120,6 +120,17 @@ const SandpieWebGPU = (function () {
       hasSubgroups: available.has('subgroups'),
       hasF16: available.has('shader-f16'),
       hasSubgroupMatrix: available.has('chromium-experimental-subgroup-matrix'),
+      // The device advertises which (M,N,K, component/result type) cooperative-matrix
+      // tiles its hardware multiply-accumulate supports, on GPUAdapterInfo. Copy them out
+      // (plain objects — the live list isn't iterable everywhere) so the model can pick a
+      // tile for the subgroup-matrix GEMM. Empty on every GPU that lacks the feature.
+      subgroupMatrixConfigs: (() => {
+        try {
+          const cfgs = info && info.subgroupMatrixConfigs;
+          if (!cfgs) return [];
+          return [...cfgs].map(c => ({ componentType: c.componentType, resultComponentType: c.resultComponentType, M: c.M, N: c.N, K: c.K }));
+        } catch (_) { return []; }
+      })(),
       hasTimestamp: available.has('timestamp-query'),
       limits: adapterLimits,
       adapter: {

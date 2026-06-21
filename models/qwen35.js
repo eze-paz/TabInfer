@@ -764,7 +764,75 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     s += `}`;
     return s;
   }
+  // ---- Cooperative-matrix (subgroup-matrix) int4 GEMM — hardware matrix units ----
+  // One workgroup computes one cfg.M×cfg.N output tile via subgroupMatrixMultiplyAccumulate,
+  // looping K in cfg.K steps. Each step: cooperatively dequant the int4 weight tile + downconvert
+  // the activation tile into workgroup f16 arrays, load both as subgroup matrices, MMA-accumulate
+  // (acc kept at the config's result type, f32 where offered), then store + write Y with the fused
+  // residual. UNVALIDATED on hardware we have — guarded entirely by probeCoopMat. Layouts:
+  //   As = M×K row-major (left<f16,K,M>) ; Bs = K×N row-major (right<f16,N,K>) ; Cs = M×N (result<_,N,M>)
+  // int4 nibble mapping mirrors gemvQ/gemmQ: byte = (k%8)/2, low nibble for even k, high for odd.
+  function gemmqCoopWgsl(cfg) {
+    const M = cfg.M, N = cfg.N, K = cfg.K, RES = (cfg.resultComponentType === 'f16') ? 'f16' : 'f32', WG = 32;
+    return `
+enable f16;
+enable chromium_experimental_subgroup_matrix;
+struct D { T:u32, N:u32, K:u32, acc:u32 };
+@group(0) @binding(0) var<storage, read>       X  : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;
+@group(0) @binding(3) var<storage, read_write> Y  : array<f32>;
+@group(0) @binding(4) var<uniform>             d  : D;
+var<workgroup> As : array<f16, ${M * K}u>;   // M×K row-major (left operand)
+var<workgroup> Bs : array<f16, ${K * N}u>;   // K×N row-major (right operand, dequantized)
+var<workgroup> Cs : array<${RES}, ${M * N}u>;
+@compute @workgroup_size(${WG}, 1, 1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_index) li:u32) {
+  let mBase = wg.y*${M}u; let nBase = wg.x*${N}u;
+  let WPR = d.K/8u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u;
+  let nTiles = d.K/${K}u;
+  var acc = subgroup_matrix_result<${RES}, ${N}, ${M}>();
+  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
+    let k0 = kt*${K}u;
+    for (var i:u32=li; i<${M * K}u; i=i+${WG}u) {
+      let m = i/${K}u; let k = i%${K}u; let gm = mBase+m; let gk = k0+k;
+      As[i] = select(0.0h, f16(X[gm*K4 + gk/4u][gk%4u]), gm<d.T);
+    }
+    for (var i:u32=li; i<${K * N}u; i=i+${WG}u) {
+      let k = i/${N}u; let n = i%${N}u; let gn = nBase+n; let gk = k0+k;
+      var val:f16 = 0.0h;
+      if (gn<d.N) {
+        let word = W[gn*WPR + gk/8u];
+        let byteIdx = (gk%8u)/2u;
+        let byte = (word >> (8u*byteIdx)) & 0xFFu;
+        let nib = select(byte & 0xFu, (byte>>4u)&0xFu, (gk&1u)==1u);
+        let s = sc[gn*gpr + gk/${QGROUP}u];
+        val = (f16(nib) - 8.0h) * s;
+      }
+      Bs[i] = val;
+    }
+    workgroupBarrier();
+    let a = subgroupMatrixLoad<subgroup_matrix_left<f16, ${K}, ${M}>>(&As, 0u, false, ${K}u);
+    let b = subgroupMatrixLoad<subgroup_matrix_right<f16, ${N}, ${K}>>(&Bs, 0u, false, ${N}u);
+    acc = subgroupMatrixMultiplyAccumulate(a, b, acc);
+    workgroupBarrier();
+  }
+  subgroupMatrixStore(&Cs, 0u, acc, false, ${N}u);
+  workgroupBarrier();
+  for (var i:u32=li; i<${M * N}u; i=i+${WG}u) {
+    let m = i/${N}u; let n = i%${N}u; let gm = mBase+m; let gn = nBase+n;
+    if (gm<d.T && gn<d.N) { let idx = gm*d.N+gn; Y[idx] = select(0.0, Y[idx], d.acc!=0u) + f32(Cs[i]); }
+  }
+}`;
+  }
+  function gemmQCoop(xBuf, wrec, yBuf, T, N, K, acc) {
+    const cfg = _coopCfg;
+    const pipe = E.getPipeline('q35.gemmQ.coop.' + cfg.M + 'x' + cfg.N + 'x' + cfg.K, gemmqCoopWgsl(cfg));
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
+    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / cfg.N), Math.ceil(T / cfg.M), 1]);
+  }
   function gemmQ(xBuf, wrec, yBuf, T, N, K, acc) {
+    if (_useCoopMat() && _coopCfg) return gemmQCoop(xBuf, wrec, yBuf, T, N, K, acc);   // hardware matrix path (probe-verified)
     const f16 = _useF16Math();
     const pipe = E.getPipeline(f16 ? 'q35.gemmQ.f16' : 'q35.gemmQ', gemmqWgsl(f16));
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
@@ -2055,6 +2123,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (_loaded) return;
     await probeSubgroups();   // mobile-safety: disable subgroups if this GPU computes them wrong
     await probeF16Gemm();     // verify the f16-dot prefill GEMM; fall back to f32 dot if this GPU computes f16 wrong
+    await probeCoopMat();     // enable the hardware cooperative-matrix prefill GEMM only if present AND verified
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     // Fast path: quantized weights already cached → straight to GPU buffers (skip the
@@ -2195,6 +2264,33 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _f16Math = null;
   function _useF16Math() { return _f16Math !== null ? _f16Math : !!(E.caps && E.caps() && E.caps().hasF16); }
 
+  // Prefill GEMM via the hardware cooperative-matrix path (chromium_experimental_subgroup_matrix:
+  // subgroupMatrixMultiplyAccumulate). This is the biggest theoretical prefill lever — dedicated
+  // matrix units — and exactly what makes MLDrift's prefill fast. It is OPT-IN AND PROVEN-ONLY:
+  // _useCoopMat() returns true ONLY after probeCoopMat numerically verifies the kernel against the
+  // f32 reference on THIS device. So on every GPU that lacks the feature (all of them today,
+  // including Iris Xe gen-12lp and Adreno) it stays false and gemmQ runs the f16 path unchanged.
+  // The experimental WGSL API + the subgroup/tile mapping can't be validated on hardware we have,
+  // so the probe is the gate: a wrong kernel disables itself, it never regresses the working path.
+  let _coopMat = null;        // null=auto (probe decides), true/false to force
+  let _coopCfg = null;        // the chosen { M, N, K, componentType, resultComponentType } tile
+  function _useCoopMat() { return _coopMat === true; }
+  // Pick the device's best f16-input cooperative-matrix tile: prefer a square M==N==K (simplest,
+  // correct tiling) with f16 components and f32 accumulation; fall back to any f16-input config.
+  function _pickCoopConfig() {
+    const c = (E.caps && E.caps()) ? E.caps() : null;
+    const cfgs = (c && Array.isArray(c.subgroupMatrixConfigs)) ? c.subgroupMatrixConfigs : [];
+    const f16in = cfgs.filter(x => x && x.componentType === 'f16' && (x.resultComponentType === 'f32' || x.resultComponentType === 'f16') && x.M && x.N && x.K);
+    if (!f16in.length) return null;
+    // K must divide QGROUP (32) so a k-tile spans whole quant groups, AND the model's
+    // matrix K (always a multiple of 32) is then a multiple of the tile K — no tail.
+    const aligned = f16in.filter(x => (QGROUP % x.K) === 0);
+    if (!aligned.length) return null;
+    const square = aligned.filter(x => x.M === x.N && x.N === x.K);
+    const sortByK = (a, b) => b.K - a.K;   // bigger K = fewer accumulate steps
+    return (square.length ? square.sort(sortByK) : aligned.slice().sort(sortByK))[0];
+  }
+
   // Some mobile GPUs ADVERTISE `subgroups` but compute subgroupAdd incorrectly — this was
   // the original mobile all-"!" bug, whose fix was "don't use subgroups." Trusting
   // caps().hasSubgroups (the capability-conditional GEMV path) silently re-introduces it on
@@ -2271,6 +2367,48 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     } catch (e) {
       _f16Math = false;                                                // anything goes wrong → safe f32 path
       console.warn('[q35] f16 GEMM probe failed — using f32 dot:', (e && e.message) || e);
+    } finally {
+      for (const b of bufs) { try { b.destroy(); } catch (_) {} }
+    }
+  }
+
+  // Cooperative-matrix prefill GEMM probe. OFF unless this device both advertises a usable f16
+  // subgroup-matrix config AND computes our gemmQCoop kernel correctly. Runs it over a small tiled
+  // matrix and compares to the (already-verified) f16/f32 gemmQ; mismatch, compile failure, or any
+  // throw → stay off. This is the ONLY thing that can enable the hardware-matrix path, so a wrong
+  // or unsupported kernel can never regress the working prefill. No user-agent sniffing.
+  let _coopProbed = false;
+  async function probeCoopMat() {
+    if (_coopProbed) return; _coopProbed = true;
+    if (_coopMat !== null) return;                                     // user forced a value — respect it
+    const cfg = _pickCoopConfig();
+    if (!cfg) { _coopMat = false; return; }                            // no subgroup-matrix on this GPU
+    _coopCfg = cfg;
+    let bufs = [];
+    try {
+      const T = cfg.M * 2, N = cfg.N * 2, K = QGROUP;                  // K=32 → multiple of cfg.K (cfg.K | 32) and of QGROUP
+      const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.11);
+      const Wf = new Float32Array(N * K); for (let i = 0; i < Wf.length; i++) Wf[i] = Math.cos(i * 0.017);
+      const u16 = new Uint16Array(Wf.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < Wf.length; i++) { t[0] = Wf[i]; u16[i] = ti[0] >>> 16; }   // f32 → bf16 bits
+      const { pack, scales } = quantizeInt4Bf16(u16, N, K);
+      const xb = f32buf(x);
+      const pb = E.createBuffer(pack.byteLength, ST(), 'coopprobe.pk'); E.device().queue.writeBuffer(pb, 0, pack);
+      const sb = E.createBuffer(scales.byteLength, ST(), 'coopprobe.sc'); E.device().queue.writeBuffer(sb, 0, scales);
+      const yb = E.createBuffer(T * N * 4, ST(), 'coopprobe.y');
+      const wrec = { pack: pb, scales: sb };
+      bufs = [xb, pb, sb, yb];
+      _coopMat = true;  await gemmQ(xb, wrec, yb, T, N, K, false); const yCoop = Array.from(await E.readF32(yb, T * N));
+      _coopMat = false; await gemmQ(xb, wrec, yb, T, N, K, false); const yRef = Array.from(await E.readF32(yb, T * N));
+      _coopMat = null;
+      let maxErr = 0, ref = 0;
+      for (let i = 0; i < T * N; i++) { maxErr = Math.max(maxErr, Math.abs(yCoop[i] - yRef[i])); ref = Math.max(ref, Math.abs(yRef[i])); }
+      const rel = maxErr / (ref || 1);
+      if (rel > 3e-2) { _coopMat = false; console.warn('[q35] cooperative-matrix GEMM WRONG (rel ' + rel.toFixed(3) + ', cfg ' + cfg.M + 'x' + cfg.N + 'x' + cfg.K + ') — using f16 path'); }
+      else { _coopMat = true; console.log('[q35] cooperative-matrix GEMM verified (rel ' + rel.toExponential(1) + ', cfg ' + cfg.M + 'x' + cfg.N + 'x' + cfg.K + ') — using hardware matrix units for prefill'); }
+    } catch (e) {
+      _coopMat = false;                                                // unsupported / compile fail / wrong → f16 path
+      console.warn('[q35] cooperative-matrix probe failed — using f16 path:', (e && e.message) || e);
     } finally {
       for (const b of bufs) { try { b.destroy(); } catch (_) {} }
     }
@@ -3016,6 +3154,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     _probeSubgroups: async () => { _subProbed = false; await E.init(); await probeSubgroups(); return { subOverride: _subOverride, useSub: _useSub() }; },
     _setF16Math: (b) => { _f16Math = b; },   // null=auto, true/false to force the prefill GEMM dot precision (A/B)
     _probeF16Gemm: async () => { _f16Probed = false; await E.init(); await probeF16Gemm(); return { f16Math: _f16Math, useF16Math: _useF16Math() }; },
+    _setCoopMat: (b) => { _coopMat = b; },   // null=auto(probe), true/false to force the cooperative-matrix prefill path (A/B)
+    _coopConfigs: () => ((E.caps && E.caps()) ? (E.caps().subgroupMatrixConfigs || []) : []),
+    _probeCoopMat: async () => { _coopProbed = false; await E.init(); await probeCoopMat(); return { coopMat: _coopMat, useCoopMat: _useCoopMat(), cfg: _coopCfg, configs: ((E.caps && E.caps()) ? E.caps().subgroupMatrixConfigs : []) }; },
     _setGenBatch: (k) => { _genBatch = k; }, _setAwqXor: (b) => { _awqXor = !!b; },
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
@@ -3033,4 +3174,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v74 (f16-dot prefill GEMM: native-f16 multiply-add + f32 accumulate, load-time numerical probe w/ f32 fallback — ~2× FMA rate on f16 GPUs)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v75 (cooperative-matrix prefill GEMM behind a load-time probe: hardware subgroup-matrix units where present+verified, else the v74 f16 path)'); } catch (_) {}
