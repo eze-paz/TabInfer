@@ -338,6 +338,67 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
   // Self-test: synthetic random blocks → JS dequant + GPU dequant → max abs error.
   // Requires window.SandpieWebGPU (the engine core) initialised.
   // ============================================================
+  // ============================================================
+  // Matmul kernels over k-quant weights (decode-in-loop). Templated per qtype so the
+  // decoder is inlined (the per-call type is fixed → no dynamic branch in the hot loop).
+  // Weight tensor [N,K] is row-major blocks: row n, block b at u32 base (n*(K/els)+b)*u32.
+  // These are CORRECTNESS-FIRST (one row/workgroup for gemv; one output/thread for gemm) —
+  // the fork engine will graft in the tiled/register-blocked versions for speed.
+  // ============================================================
+  const GEMVK_WG = 128;
+  function gemvKWGSL(qtype) {
+    const g = QGPU[qtype];
+    return `
+struct D { N:u32, K:u32, acc:u32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       x : array<f32>;
+@group(0) @binding(1) var<storage, read>       W : array<u32>;
+@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+@group(0) @binding(3) var<uniform>             d : D;
+${DECODER_WGSL[qtype]}
+var<workgroup> part : array<f32, ${GEMVK_WG}>;
+@compute @workgroup_size(${GEMVK_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+  let row = wg.x + wg.y*nwg.x;
+  if (row >= d.N) { return; }
+  let nbpr = d.K / ${g.els}u;
+  var acc = 0.0; var k = lid.x;
+  loop {
+    if (k >= d.K) { break; }
+    let base = (row*nbpr + k/${g.els}u) * ${g.u32}u;
+    acc = acc + x[k] * ${g.dq}(base, k % ${g.els}u);
+    k = k + ${GEMVK_WG}u;
+  }
+  part[lid.x] = acc; workgroupBarrier();
+  var stride = ${GEMVK_WG}u/2u;
+  loop { if (stride==0u){break;} if (lid.x<stride){ part[lid.x]=part[lid.x]+part[lid.x+stride]; } workgroupBarrier(); stride=stride/2u; }
+  if (lid.x==0u) { y[row] = select(0.0, y[row], d.acc!=0u) + part[0]; }
+}`;
+  }
+  function gemmKWGSL(qtype) {
+    const g = QGPU[qtype];
+    return `
+struct D { T:u32, N:u32, K:u32, acc:u32 };
+@group(0) @binding(0) var<storage, read>       x : array<f32>;
+@group(0) @binding(1) var<storage, read>       W : array<u32>;
+@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+@group(0) @binding(3) var<uniform>             d : D;
+${DECODER_WGSL[qtype]}
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let idx = gid.x; if (idx >= d.T*d.N) { return; }
+  let t = idx / d.N; let n = idx % d.N;
+  let nbpr = d.K / ${g.els}u; let xb = t*d.K;
+  var acc = 0.0;
+  for (var k:u32=0u; k<d.K; k=k+1u) {
+    let base = (n*nbpr + k/${g.els}u) * ${g.u32}u;
+    acc = acc + x[xb + k] * ${g.dq}(base, k % ${g.els}u);
+  }
+  y[idx] = select(0.0, y[idx], d.acc!=0u) + acc;
+}`;
+  }
+
+  // Matmul self-test: random k-quant [N,K] + random x → GPU gemvK / gemmK vs CPU (dequant
+  // reference then plain matmul). Confirms the row-major block indexing is correct.
   const BYTES_PER_BLK = { q4_K: 144, q5_K: 176, q6_K: 210, q8_0: 34 };
   const DEQUANT_REF = { q4_K: dequantQ4K, q5_K: dequantQ5K, q6_K: dequantQ6K, q8_0: dequantQ8_0 };
   async function selfTest(E, nb) {
@@ -374,8 +435,55 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     return out;
   }
 
+  // GPU gemv/gemm vs CPU reference. N rows, K cols (multiple of els), T query rows.
+  async function selfTestMatmul(E, opts) {
+    const U = GPUBufferUsage;
+    const N = (opts && opts.N) || 40, K = (opts && opts.K) || 512, T = (opts && opts.T) || 3;
+    const out = {};
+    for (const qtype of (opts && opts.types) || ['q4_K', 'q5_K', 'q6_K', 'q8_0']) {
+      const g = QGPU[qtype], els = g.els, nbpr = K / els, nb = N * nbpr;
+      const raw = new Uint8Array(nb * BYTES_PER_BLK[qtype]);
+      let s = 0x12345678 >>> 0;
+      for (let i = 0; i < raw.length; i++) { s = (s * 1664525 + 1013904223) >>> 0; raw[i] = (s >>> 16) & 0xFF; }
+      const Wf = DEQUANT_REF[qtype](raw, nb);           // [N,K] row-major
+      const x = new Float32Array(T * K);
+      for (let i = 0; i < x.length; i++) { s = (s * 1664525 + 1013904223) >>> 0; x[i] = ((s >>> 8 & 0xFFFF) / 65535 - 0.5); }
+      // CPU reference
+      const cpu = new Float32Array(T * N);
+      for (let t = 0; t < T; t++) for (let n = 0; n < N; n++) { let a = 0; for (let k = 0; k < K; k++) a += Wf[n * K + k] * x[t * K + k]; cpu[t * N + n] = a; }
+      const packed = g.repack(raw, nb);
+      const wBuf = E.createBuffer(packed.byteLength, U.STORAGE | U.COPY_DST, 'mm.W'); E.device().queue.writeBuffer(wBuf, 0, packed);
+      const xBuf = E.createBuffer(x.byteLength, U.STORAGE | U.COPY_DST, 'mm.x'); E.device().queue.writeBuffer(xBuf, 0, x);
+      const run = async (useGemm) => {
+        const yBuf = E.createBuffer(T * N * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'mm.y');
+        const dBuf = E.createBuffer(16, U.UNIFORM | U.COPY_DST, 'mm.d');
+        if (useGemm) {
+          E.device().queue.writeBuffer(dBuf, 0, new Uint32Array([T, N, K, 0]));
+          E.dispatch(E.getPipeline('gguf.gemmK.' + qtype, gemmKWGSL(qtype)), [xBuf, wBuf, yBuf, dBuf], [Math.ceil(T * N / 64), 1, 1]);
+        } else {
+          E.device().queue.writeBuffer(dBuf, 0, new Uint32Array([N, K, 0, 0]));
+          const nWG = N, gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+          E.dispatch(E.getPipeline('gguf.gemvK.' + qtype, gemvKWGSL(qtype)), [xBuf, wBuf, yBuf, dBuf], [gx, gy, 1]);
+        }
+        await E.device().queue.onSubmittedWorkDone();
+        const stg = E.createBuffer(T * N * 4, U.COPY_DST | U.MAP_READ, 'mm.rd');
+        const enc = E.device().createCommandEncoder(); enc.copyBufferToBuffer(yBuf, 0, stg, 0, T * N * 4); E.device().queue.submit([enc.finish()]);
+        await stg.mapAsync(GPUMapMode.READ); const gpu = new Float32Array(stg.getMappedRange().slice(0)); stg.unmap();
+        [yBuf, dBuf, stg].forEach(b => b.destroy());
+        return gpu;
+      };
+      const gemvGpu = await run(false);   // compares against cpu row 0 (T=1 path uses x[0..K])
+      const gemmGpu = await run(true);
+      const relerr = (ref, got, rows) => { let m = 0; for (let i = 0; i < rows * N; i++) { const e = Math.abs(ref[i] - got[i]) / (Math.abs(ref[i]) + 1e-6); if (e > m) m = e; } return m; };
+      out[qtype] = { gemv_rel: relerr(cpu, gemvGpu, 1), gemm_rel: relerr(cpu, gemmGpu, T) };
+      [wBuf, xBuf].forEach(b => b.destroy());
+    }
+    return out;
+  }
+
   return {
     GGML, TYPE_NAME, BLK, QGPU, parse, tensorByteLen,
+    gemvKWGSL, gemmKWGSL, selfTestMatmul,
     f16, getScaleMinK4, dequantQ4K, dequantQ5K, dequantQ6K, dequantQ8_0,
     repackQ4K, repackQ5K, repackQ6K, repackQ8_0, Q4K_U32, Q5K_U32, Q6K_U32, Q8_U32,
     WGSL_KQ_COMMON, WGSL_DQ4K, WGSL_DQ5K, WGSL_DQ6K, WGSL_DQ8, DECODER_WGSL,
