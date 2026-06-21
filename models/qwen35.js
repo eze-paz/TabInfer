@@ -1974,7 +1974,42 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { file: qcacheFile(), bytes: f.size };
   }
 
-  async function loadModel({ onProgress, variant } = {}) {
+  // Public loadModel: dedupe concurrent calls (a user message, the device-lost handler, and
+  // the visibility/focus recovery can all call this at once — they must share one reload, not
+  // race into double-loads).
+  let _loadingPromise = null;
+  async function loadModel(opts = {}) {
+    if (_loadingPromise) return _loadingPromise;
+    _loadingPromise = _loadModelImpl(opts).then((r) => { afterLoad(); return r; }).finally(() => { _loadingPromise = null; });
+    return _loadingPromise;
+  }
+  // Arm recovery for the freshly-created device + register the visibility hook once.
+  function afterLoad() {
+    if (!_loaded) return;
+    hookRecovery();
+    try { E.device().lost.then(() => { try { maybeRecover(); } catch (_) {} }); } catch (_) {}   // immediate rebuild on loss while visible
+  }
+  // PROACTIVE device-loss recovery. The unpreventable losses (OS sleep/wake, driver reset)
+  // would otherwise surface as "engine not initialised" on the user's NEXT message. Instead,
+  // rebuild the model the moment the device dies (if the tab is visible) or as soon as the tab
+  // becomes visible again (the sleep/wake case) — so the next message finds a ready device and
+  // the user never sees an error. Guarded by the loadModel dedupe above.
+  let _recoveryHooked = false;
+  function maybeRecover() {
+    try {
+      if (!_loaded || typeof document === 'undefined' || document.hidden) return;
+      if (E.caps && E.caps() && E.deviceGen() === _loadedGen) return;   // device still healthy
+      loadModel({}).catch(() => {});                                     // rebuild on the new device
+    } catch (_) {}
+  }
+  function hookRecovery() {
+    if (_recoveryHooked || typeof document === 'undefined') return;
+    _recoveryHooked = true;
+    document.addEventListener('visibilitychange', maybeRecover);
+    try { window.addEventListener('focus', maybeRecover); } catch (_) {}
+  }
+
+  async function _loadModelImpl({ onProgress, variant } = {}) {
     if (variant) selectModel(variant);   // may unload a different already-loaded variant
     // ALWAYS ensure a live device first. E.init() is idempotent when the device is alive and
     // re-creates it after a loss (TDR/driver reset — THE failure mode on weak iGPUs). It bumps
