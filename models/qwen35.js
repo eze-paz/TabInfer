@@ -704,7 +704,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // vec4 along K: shared tiles are vec4<f32> (16-byte loads), inner loop uses dot() so each
   // step is 4 FMAs/instruction over BK4=BK/4 vec4s (vs BK scalar steps). X read as vec4.
   const GEMMQ_BM = 64, GEMMQ_BN = 64, GEMMQ_BK = QGROUP, GEMMQ_TM = 4, GEMMQ_TN = 4;
-  const gemmqWgsl = (() => {
+  // f16math=true → the inner dot runs in f16 (the shared tiles are ALREADY vec4<f16>, so this
+  // is the native-f16 multiply-add path: ~2× the FMA rate on f16-capable GPUs like Adreno),
+  // with the cross-K accumulation kept in f32 for numerical safety — the same input-f16 /
+  // accumulate-f32 split MLDrift's cooperative-matrix GEMM uses. f16math=false → convert the
+  // f16 tiles back to f32 and dot in f32 (the portable reference). Picked per device by a
+  // load-time numerical probe (probeF16Gemm), never by user-agent sniffing.
+  function gemmqWgsl(f16math) {
     const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = GEMMQ_BK, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
     const NTH = (BM / TM) * (BN / TN), TILEA4 = BM * BK4, TILEB4 = BN * BK4, RN = BN / TN;
     let s = `
@@ -747,7 +753,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 `;
     for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${BK4}u + kk4];\n`;
     for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${BK4}u + kk4];\n`;
-    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      acc${i * TN + j} = acc${i * TN + j} + dot(vec4<f32>(a${i}), vec4<f32>(b${j}));\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += f16math
+      ? `      acc${i * TN + j} = acc${i * TN + j} + f32(dot(a${i}, b${j}));\n`               // f16 multiply-add, f32 accumulate
+      : `      acc${i * TN + j} = acc${i * TN + j} + dot(vec4<f32>(a${i}), vec4<f32>(b${j}));\n`;   // portable f32 dot
     s += `    }
     workgroupBarrier();
   }
@@ -755,9 +763,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `  { let gm=mBase+tM*${TM}u+${i}u; let gn=nBase+tN*${TN}u+${j}u; if (gm<d.T && gn<d.N) { let idx=gm*d.N+gn; Y[idx]=select(0.0,Y[idx],d.acc!=0u)+acc${i * TN + j}; } }\n`;
     s += `}`;
     return s;
-  })();
+  }
   function gemmQ(xBuf, wrec, yBuf, T, N, K, acc) {
-    const pipe = E.getPipeline('q35.gemmQ', gemmqWgsl);
+    const f16 = _useF16Math();
+    const pipe = E.getPipeline(f16 ? 'q35.gemmQ.f16' : 'q35.gemmQ', gemmqWgsl(f16));
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
     return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
@@ -2045,6 +2054,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     if (_loaded) return;
     await probeSubgroups();   // mobile-safety: disable subgroups if this GPU computes them wrong
+    await probeF16Gemm();     // verify the f16-dot prefill GEMM; fall back to f32 dot if this GPU computes f16 wrong
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     // Fast path: quantized weights already cached → straight to GPU buffers (skip the
@@ -2179,6 +2189,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _awqXor = false;       // compressed-tensors packs offset-binary (q+8) = OUR format → read direct, no transcode.
                              // (Toggle exists only for hypothetical two's-complement repos.)
   function _useSub() { return _subOverride !== null ? _subOverride : !!(E.caps && E.caps() && E.caps().hasSubgroups); }
+  // Prefill GEMM (gemmQ) inner dot: null=auto (f16 when shader-f16 is present — it always is,
+  // since every kernel here declares `enable f16`), true/false to force. Verified at load by
+  // probeF16Gemm against the f32 reference, so a device that computes f16 wrong falls back.
+  let _f16Math = null;
+  function _useF16Math() { return _f16Math !== null ? _f16Math : !!(E.caps && E.caps() && E.caps().hasF16); }
 
   // Some mobile GPUs ADVERTISE `subgroups` but compute subgroupAdd incorrectly — this was
   // the original mobile all-"!" bug, whose fix was "don't use subgroups." Trusting
@@ -2216,6 +2231,46 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     } catch (e) {
       _subOverride = false;                                            // anything goes wrong → safe path
       console.warn('[q35] subgroup probe failed — disabling subgroups:', (e && e.message) || e);
+    } finally {
+      for (const b of bufs) { try { b.destroy(); } catch (_) {} }
+    }
+  }
+
+  // Mirror of probeSubgroups for the f16-math prefill GEMM: run gemmQ once in f16-dot mode and
+  // once in the f32-reference mode over a small tiled (T>1) matrix, compare. f16 dot legitimately
+  // carries ~1e-3 relative error (10-bit mantissa), so the threshold is looser than the subgroup
+  // probe's; anything past it means this GPU computes f16 wrong → fall back to the f32 dot. No
+  // user-agent sniffing — the device tells us by being right or wrong.
+  let _f16Probed = false;
+  async function probeF16Gemm() {
+    if (_f16Probed) return; _f16Probed = true;
+    if (_f16Math !== null) return;                                     // user forced a value — respect it
+    if (!(E.caps && E.caps() && E.caps().hasF16)) { _f16Math = false; return; }   // no shader-f16 → can't (shaders wouldn't even compile, but be explicit)
+    let bufs = [];
+    try {
+      const T = 8, N = 64, K = 256;   // T>1 so gemmQ (the tiled prefill path), not gemvQ
+      const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.17);
+      const Wf = new Float32Array(N * K); for (let i = 0; i < Wf.length; i++) Wf[i] = Math.cos(i * 0.013);
+      const u16 = new Uint16Array(Wf.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < Wf.length; i++) { t[0] = Wf[i]; u16[i] = ti[0] >>> 16; }   // f32 → bf16 bits
+      const { pack, scales } = quantizeInt4Bf16(u16, N, K);
+      const xb = f32buf(x);
+      const pb = E.createBuffer(pack.byteLength, ST(), 'f16probe.pk'); E.device().queue.writeBuffer(pb, 0, pack);
+      const sb = E.createBuffer(scales.byteLength, ST(), 'f16probe.sc'); E.device().queue.writeBuffer(sb, 0, scales);
+      const yb = E.createBuffer(T * N * 4, ST(), 'f16probe.y');
+      const wrec = { pack: pb, scales: sb };
+      bufs = [xb, pb, sb, yb];
+      _f16Math = true;  await gemmQ(xb, wrec, yb, T, N, K, false); const yF16 = Array.from(await E.readF32(yb, T * N));
+      _f16Math = false; await gemmQ(xb, wrec, yb, T, N, K, false); const yRef = Array.from(await E.readF32(yb, T * N));
+      _f16Math = null;                                                 // back to auto unless we disable below
+      let maxErr = 0, ref = 0;
+      for (let i = 0; i < T * N; i++) { maxErr = Math.max(maxErr, Math.abs(yF16[i] - yRef[i])); ref = Math.max(ref, Math.abs(yRef[i])); }
+      const rel = maxErr / (ref || 1);
+      if (rel > 3e-2) { _f16Math = false; console.warn('[q35] f16 prefill GEMM WRONG (rel ' + rel.toFixed(3) + ') — using f32 dot'); }
+      else console.log('[q35] f16 prefill GEMM verified (rel ' + rel.toExponential(1) + ') — keeping f16 dot');
+    } catch (e) {
+      _f16Math = false;                                                // anything goes wrong → safe f32 path
+      console.warn('[q35] f16 GEMM probe failed — using f32 dot:', (e && e.message) || e);
     } finally {
       for (const b of bufs) { try { b.destroy(); } catch (_) {} }
     }
@@ -2959,6 +3014,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     _setPrefillSerial: (b) => { _prefillSerial = !!b; },
     _setBatchedPrefill: (b) => { _batchedPrefill = !!b; },
     _probeSubgroups: async () => { _subProbed = false; await E.init(); await probeSubgroups(); return { subOverride: _subOverride, useSub: _useSub() }; },
+    _setF16Math: (b) => { _f16Math = b; },   // null=auto, true/false to force the prefill GEMM dot precision (A/B)
+    _probeF16Gemm: async () => { _f16Probed = false; await E.init(); await probeF16Gemm(); return { f16Math: _f16Math, useF16Math: _useF16Math() }; },
     _setGenBatch: (k) => { _genBatch = k; }, _setAwqXor: (b) => { _awqXor = !!b; },
     _weightFull: async (name, n) => { const w = _weights[CONFIG.weightPrefix + name]; if (!w) return null; return w.f32 ? Array.from(await E.readF32(w.buf, n)) : Array.from(await readF16(w.buf, n)); },
     _dbgScr: async (name, n) => E.readF32(_scr[name], n || 64),
@@ -2976,4 +3033,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v73 (adaptive prefill chunk: probe+measure per-token, size each submit under the GPU watchdog — mobile-safe)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v74 (f16-dot prefill GEMM: native-f16 multiply-add + f32 accumulate, load-time numerical probe w/ f32 fallback — ~2× FMA rate on f16 GPUs)'); } catch (_) {}
