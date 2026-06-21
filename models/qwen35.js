@@ -1664,6 +1664,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
   let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
+  let _loadedGen = -1;   // E.deviceGen() the weights were built against (device-loss detection)
 
   // f32 → f16 bits (round-to-nearest), handling normals, subnormals, overflow.
   const _f32a = new Float32Array(1), _u32a = new Uint32Array(_f32a.buffer);
@@ -1975,27 +1976,28 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   async function loadModel({ onProgress, variant } = {}) {
     if (variant) selectModel(variant);   // may unload a different already-loaded variant
-    // Device-loss recovery (THE failure mode on weak iGPUs): a TDR/driver reset nulls the
-    // engine's device + caps, but our _loaded stayed true — so without this check loadModel
-    // would early-return and every forward would throw "engine not initialised". When caps
-    // is gone, our GPU buffers are dead handles: drop them (unload) and do a full reload.
-    // Fast, because the OPFS quant-cache is still warm (~3.5s, no re-quantize).
-    if (_loaded && (!E.caps || !E.caps())) {
-      try { console.warn('[q35] WebGPU device was lost — reloading the model on the new device.'); } catch (_) {}
+    // ALWAYS ensure a live device first. E.init() is idempotent when the device is alive and
+    // re-creates it after a loss (TDR/driver reset — THE failure mode on weak iGPUs). It bumps
+    // a device generation; if it differs from the gen our weights were built against, the
+    // device was lost+recreated (possibly by another backend) and every GPU buffer we hold is
+    // a dead handle → full reload. This is what fixes "engine not initialised": without it,
+    // _loaded stayed true over a dead device and every forward threw.
+    await E.init();
+    if (_loaded && _loadedGen !== E.deviceGen()) {
+      try { console.warn('[q35] WebGPU device changed (gen ' + _loadedGen + '→' + E.deviceGen() + ') — reloading the model on the new device.'); } catch (_) {}
       try { unload(); } catch (_) { _loaded = false; _weights = null; }
     }
     if (_loaded) return;
-    await E.init();
     await probeSubgroups();   // mobile-safety: disable subgroups if this GPU computes them wrong
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     // Fast path: quantized weights already cached → straight to GPU buffers (skip the
     // safetensors download/parse AND the bf16→int4 quantize).
-    if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; await warmup(onProgress); deleteBf16Opfs(); return; }   // drop any lingering bf16 (older caches kept both)
+    if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; _loadedGen = E.deviceGen(); await warmup(onProgress); deleteBf16Opfs(); return; }   // drop any lingering bf16 (older caches kept both)
     // Next-fastest: a host-served pre-built q4v (skips the 1.75GB bf16 download AND the
     // ~40s quantize). Downloaded into the OPFS cache, then read back like a local hit.
     if (await fetchRemoteQuantCache(onProgress) && await loadQuantCache(onProgress)) {
-      onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; await warmup(onProgress); return;
+      onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; _loadedGen = E.deviceGen(); await warmup(onProgress); return;
     }
     const src = await fetchModelBytes(onProgress);
     onProgress && onProgress({ phase: 'parse', pct: 0 });
@@ -2079,6 +2081,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     onProgress && onProgress({ phase: 'parse', pct: 100 });
     _loaded = true;
+    _loadedGen = E.deviceGen();
     await warmup(onProgress);                                     // compile all pipelines now, not on the first message
     // Save the compact quant cache, then DELETE the big bf16 safetensors — every future
     // load reads only the ~0.4GB quantized blob (no re-download, no re-quantize). Only delete
@@ -2188,6 +2191,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     free(_tokHist); _tokHist = null;
     free(_idsBuf); _idsBuf = null; _idsCap = 0;
     _loaded = false;
+    _loadedGen = -1;
     _warmed = false;   // a fresh load must re-warm the pipelines (device/buffers were torn down)
   }
 

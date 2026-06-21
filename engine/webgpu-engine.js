@@ -63,6 +63,7 @@ const SandpieWebGPU = (function () {
   ];
 
   let _adapter = null, _device = null, _caps = null;
+  let _deviceGen = 0;   // bumped on every successful (re)init → lets callers detect a device that was lost+recreated and rebuild stale GPU buffers
 
   // Initialise the GPU device, requesting every wanted feature the adapter
   // actually advertises. Returns a capability report (also cached on _caps).
@@ -97,6 +98,7 @@ const SandpieWebGPU = (function () {
     const requiredLimits = { ...adapterLimits };
 
     _device = await _adapter.requestDevice({ requiredFeatures, requiredLimits });
+    _deviceGen++;   // a new device → any GPU buffer built against a prior gen is now stale
     _device.lost.then((info) => {
       // Device loss (TDR / driver reset) is THE failure mode for WebGPU LLMs on
       // weak iGPUs. Surface it loudly and drop our handles so the next call
@@ -421,7 +423,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
 
   return {
     // engine core
-    init, device, caps,
+    init, device, caps, deviceGen: () => _deviceGen,
     renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling, beginBatch, endBatch, copyBuffer,
     createBuffer, uploadF32, readF32, gemm,
     // measurement
