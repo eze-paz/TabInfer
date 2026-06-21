@@ -574,6 +574,130 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
 
   // ============================================================
+  // MATMUL-DECOMPOSED chunkwise gated DeltaNet (deltaChunk2) — the high-occupancy form.
+  // ============================================================
+  // Same exact math as deltaChunk, but instead of 1 workgroup/head (16 wgs → GPU starved, ~21
+  // GFLOP/s), each per-chunk operation is its own massively-parallel kernel so the heavy ones run
+  // H·dim·dim = 262k threads (state update) / H·C·dim = 131k (readout) → full occupancy. Per chunk
+  // (state carries serially across chunks via SBuf): prep(M,QK) → readout(S_inᵀk, S_inᵀq) →
+  // solve(Δ̃ + output, the only serial-over-C part, H·dim threads) → state-update. Struct P shared:
+  // { H, dim, cs, Cc, C }. Layouts match deltaRecur (S[h][kk][vi], v/gb/out by global token).
+  const DC2_STRUCT = `struct P { H:u32, dim:u32, cs:u32, Cc:u32, C:u32, _a:u32, _b:u32, _c:u32 };`;
+  const DC2_PREP_WGSL = `${DC2_STRUCT}
+@group(0) @binding(0) var<storage,read>       q  : array<f32>;
+@group(0) @binding(1) var<storage,read>       k  : array<f32>;
+@group(0) @binding(2) var<storage,read_write> M  : array<f32>;   // [h][i][j] k_i·k_j
+@group(0) @binding(3) var<storage,read_write> QK : array<f32>;   // [h][i][j] q_i·k_j
+@group(0) @binding(4) var<uniform>            p  : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let g = gid.x; let C = p.C; let cc = C*C; let tot = p.H*cc;
+  if (g >= tot) { return; }
+  let h = g/cc; let r = g%cc; let i = r/C; let j = r%C;
+  var mm:f32 = 0.0; var qk:f32 = 0.0;
+  if (i < p.Cc && j < p.Cc && j <= i) {
+    let bi = ((p.cs+i)*p.H + h)*p.dim; let bj = ((p.cs+j)*p.H + h)*p.dim;
+    for (var kk:u32=0u; kk<p.dim; kk=kk+1u) { let kj = k[bj+kk]; mm = mm + k[bi+kk]*kj; qk = qk + q[bi+kk]*kj; }
+  }
+  M[g] = mm; QK[g] = qk;
+}`;
+  const DC2_READ_WGSL = `${DC2_STRUCT}
+@group(0) @binding(0) var<storage,read>       k   : array<f32>;
+@group(0) @binding(1) var<storage,read>       q   : array<f32>;
+@group(0) @binding(2) var<storage,read>       S   : array<f32>;
+@group(0) @binding(3) var<storage,read_write> skv : array<f32>;   // [h][i][vi] S_inᵀk_i
+@group(0) @binding(4) var<storage,read_write> sqv : array<f32>;   // [h][i][vi] S_inᵀq_i
+@group(0) @binding(5) var<uniform>            p   : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let g = gid.x; let C = p.C; let d = p.dim; let tot = p.H*C*d;
+  if (g >= tot) { return; }
+  let h = g/(C*d); let r = g%(C*d); let i = r/d; let vi = r%d;
+  var sk:f32 = 0.0; var sq:f32 = 0.0;
+  if (i < p.Cc) {
+    let bi = ((p.cs+i)*p.H + h)*d; let sb = h*d*d;
+    for (var kk:u32=0u; kk<d; kk=kk+1u) { let s = S[sb + kk*d + vi]; sk = sk + s*k[bi+kk]; sq = sq + s*q[bi+kk]; }
+  }
+  skv[h*C*d + i*d + vi] = sk; sqv[h*C*d + i*d + vi] = sq;
+}`;
+  const DC2_SOLVE_WGSL = `${DC2_STRUCT}
+@group(0) @binding(0) var<storage,read>       v   : array<f32>;
+@group(0) @binding(1) var<storage,read>       gb  : array<f32>;
+@group(0) @binding(2) var<storage,read>       M   : array<f32>;
+@group(0) @binding(3) var<storage,read>       QK  : array<f32>;
+@group(0) @binding(4) var<storage,read>       skv : array<f32>;
+@group(0) @binding(5) var<storage,read>       sqv : array<f32>;
+@group(0) @binding(6) var<storage,read_write> Dt  : array<f32>;   // [h][i][vi] Δ̃
+@group(0) @binding(7) var<storage,read_write> outv: array<f32>;
+@group(0) @binding(8) var<uniform>            p   : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let g = gid.x; let d = p.dim; let tot = p.H*d;
+  if (g >= tot) { return; }
+  let h = g/d; let vi = g%d; let C = p.C; let cc = C*C;
+  var gam:f32 = 1.0;
+  for (var i:u32=0u; i<p.Cc; i=i+1u) {
+    let th = (p.cs+i)*p.H + h;
+    gam = gam * gb[th*2u]; let beta = gb[th*2u+1u];
+    let vtil = v[th*d + vi] / gam;
+    var acc = beta*(vtil - skv[h*C*d + i*d + vi]);
+    for (var j:u32=0u; j<i; j=j+1u) { acc = acc - beta*M[h*cc + i*C + j]*Dt[h*C*d + j*d + vi]; }
+    Dt[h*C*d + i*d + vi] = acc;
+    var o = sqv[h*C*d + i*d + vi];
+    for (var j:u32=0u; j<=i; j=j+1u) { o = o + QK[h*cc + i*C + j]*Dt[h*C*d + j*d + vi]; }
+    outv[th*d + vi] = gam*o;
+  }
+}`;
+  const DC2_SUPD_WGSL = `${DC2_STRUCT}
+@group(0) @binding(0) var<storage,read>       k  : array<f32>;
+@group(0) @binding(1) var<storage,read>       gb : array<f32>;
+@group(0) @binding(2) var<storage,read>       Dt : array<f32>;
+@group(0) @binding(3) var<storage,read_write> S  : array<f32>;
+@group(0) @binding(4) var<uniform>            p  : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let g = gid.x; let d = p.dim; let tot = p.H*d*d;
+  if (g >= tot) { return; }
+  let h = g/(d*d); let r = g%(d*d); let kk = r/d; let vi = r%d; let C = p.C;
+  var Gam:f32 = 1.0;
+  for (var i:u32=0u; i<p.Cc; i=i+1u) { Gam = Gam * gb[((p.cs+i)*p.H + h)*2u]; }
+  var add:f32 = 0.0;
+  for (var j:u32=0u; j<p.Cc; j=j+1u) { add = add + k[((p.cs+j)*p.H + h)*d + kk]*Dt[h*C*d + j*d + vi]; }
+  let idx = h*d*d + kk*d + vi; S[idx] = Gam*(S[idx] + add);
+}`;
+  const DELTA_CHUNK2 = 64;   // internal chunk length for the matmul-decomposed path
+  let _dc2 = null;
+  function ensureDc2(H, C, dim) {
+    const need = { mm: H * C * C, sd: H * C * dim };
+    if (_dc2 && _dc2.mm >= need.mm && _dc2.sd >= need.sd) return _dc2;
+    if (_dc2) for (const k of ['M', 'QK', 'skv', 'sqv', 'Dt']) { try { _dc2[k].destroy(); } catch (_) {} }
+    _dc2 = {
+      mm: need.mm, sd: need.sd,
+      M: E.createBuffer(need.mm * 4, ST(), 'dc2.M'), QK: E.createBuffer(need.mm * 4, ST(), 'dc2.QK'),
+      skv: E.createBuffer(need.sd * 4, ST(), 'dc2.skv'), sqv: E.createBuffer(need.sd * 4, ST(), 'dc2.sqv'),
+      Dt: E.createBuffer(need.sd * 4, ST(), 'dc2.Dt'),
+    };
+    return _dc2;
+  }
+  function deltaChunk2(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, T) {
+    const C = DELTA_CHUNK2; const s = ensureDc2(nHeads, C, dim);
+    const prep = E.getPipeline('q35.dc2.prep', DC2_PREP_WGSL);
+    const read = E.getPipeline('q35.dc2.read', DC2_READ_WGSL);
+    const solve = E.getPipeline('q35.dc2.solve', DC2_SOLVE_WGSL);
+    const supd = E.getPipeline('q35.dc2.supd', DC2_SUPD_WGSL);
+    const nChunks = Math.ceil((T || 1) / C);
+    for (let ch = 0; ch < nChunks; ch++) {
+      const cs = ch * C, Cc = Math.min(C, T - cs);
+      const p = uniform(new Uint32Array([nHeads, dim, cs, Cc, C, 0, 0, 0]));
+      E.dispatch(prep, [qBuf, kBuf, s.M, s.QK, p], [Math.ceil(nHeads * C * C / 64), 1, 1]);
+      E.dispatch(read, [kBuf, qBuf, SBuf, s.skv, s.sqv, p], [Math.ceil(nHeads * C * dim / 64), 1, 1]);
+      E.dispatch(solve, [vBuf, gbBuf, s.M, s.QK, s.skv, s.sqv, s.Dt, outBuf, p], [Math.ceil(nHeads * dim / 64), 1, 1]);
+      E.dispatch(supd, [kBuf, gbBuf, s.Dt, SBuf, p], [Math.ceil(nHeads * dim * dim / 64), 1, 1]);
+    }
+    return Promise.resolve();
+  }
+
+  // ============================================================
   // CAUSAL DEPTHWISE conv1d (kernel=4) + SiLU, decode step (1 token).
   // Mixed q|k|v are conv'd along the sequence before the recurrence.
   // PyTorch causal Conv1d (left-pad K-1, groups=conv_dim) at the last pos:
@@ -2457,6 +2581,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // at 16 workgroups; the matmul-decomposed form is the path to the full 10×).
   let _deltaChunk = null;
   function _useDeltaChunk() { return _deltaChunk === true; }
+  // Which chunkwise impl the prefill uses when enabled: 'v78' = the data-local 1-wg/head kernel
+  // (MEASURED best on Iris Xe, 1.55× over sequential); 'matmul' = the high-occupancy matmul-
+  // decomposed form (deltaChunk2 — MEASURED 3× SLOWER on this iGPU: memory-bound on scratch
+  // round-trips; kept for Adreno A/B, which has more compute units and may flip the result).
+  let _deltaImpl = 'v78';
   // Parallel conv prefill (drop the serial t-loop). Validated bit-identical to the sequential conv,
   // but MEASURED 1.01× on Iris Xe (conv's 6144 channels already saturate; it was never a
   // bottleneck) → default OFF. Exposed for per-device testing (Adreno occupancy may differ).
@@ -3048,8 +3177,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         await gbeta(ps.aD, ps.bD, W(d + 'A_log'), W(d + 'dt_bias'), ps.gb, dH, T);
         await l2normHeads(ps.qd, ps.qn, dH, dK, C.rmsEps, qScale, T);
         await l2normHeads(ps.kd, ps.kn, dH, dK, C.rmsEps, 1.0, T);
-        if (_useDeltaChunk() && T > 1) await deltaChunk(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);   // chunkwise-parallel prefill (probe-verified)
-        else await deltaRecur(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);   // sequential scan (decode + fallback)
+        if (_useDeltaChunk() && T > 1) {   // chunkwise-parallel prefill (probe-verified)
+          if (_deltaImpl === 'matmul') await deltaChunk2(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);
+          else await deltaChunk(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);
+        } else await deltaRecur(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);   // sequential scan (decode + fallback)
         await gatedRMSNorm(ps.core, ps.zD, W(d + 'norm.weight'), ps.gnorm, dH, dV, _gnormEps, T);
         await linearQ(ps.gnorm, Wq(d + 'out_proj.weight'), ps.x, T, H, DVAL, true);
       }
@@ -3507,6 +3638,13 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         catch (e) { out.chunkErr = String(e && e.message || e); }
         for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} }
       }
+      if (typeof deltaChunk2 === 'function') {
+        const qb = f32buf(q), kb = f32buf(k), vb = f32buf(v), gbb = f32buf(gb);
+        const Sb = E.createBuffer(H * dim * dim * 4, ST(), 'st.S3'); const ob = E.createBuffer(T * H * dim * 4, ST(), 'st.o3');
+        try { await deltaChunk2(qb, kb, vb, gbb, Sb, ob, H, dim, T); await E.device().queue.onSubmittedWorkDone(); out.chunk2VsCpu = +rel(Array.from(await E.readF32(ob, T * H * dim))).toExponential(2); }
+        catch (e) { out.chunk2Err = String(e && e.message || e); }
+        for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} }
+      }
       return out;
     },
     // Micro-bench the DeltaNet sequential scan (prefill) in isolation — no model needed — so the
@@ -3519,18 +3657,21 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       const qb = f32buf(qa), kb = f32buf(qa), vb = f32buf(qa), gbb = f32buf(gb);
       const Sb = E.createBuffer(H * dim * dim * 4, ST(), 'bench.S');
       const ob = E.createBuffer(T * H * dim * 4, ST(), 'bench.o');
-      const run = opts.chunk ? deltaChunk : deltaRecur;
+      const run = opts.mode === 'chunk2' ? deltaChunk2 : (opts.mode === 'chunk' || opts.chunk) ? deltaChunk : deltaRecur;
+      const batched = opts.mode === 'chunk2';   // chunk2 = many dispatches → record into ONE command buffer per iter (matches prefill)
+      const once = async () => { if (batched) { E.beginBatch(); run(qb, kb, vb, gbb, Sb, ob, H, dim, T); await E.endBatch(); } else { await run(qb, kb, vb, gbb, Sb, ob, H, dim, T); } };
       try {
-        await run(qb, kb, vb, gbb, Sb, ob, H, dim, T); await E.device().queue.onSubmittedWorkDone();   // warm
+        await once(); await E.device().queue.onSubmittedWorkDone();   // warm
         const t0 = performance.now();
-        for (let i = 0; i < iters; i++) await run(qb, kb, vb, gbb, Sb, ob, H, dim, T);
+        for (let i = 0; i < iters; i++) await once();
         await E.device().queue.onSubmittedWorkDone();
         const ms = (performance.now() - t0) / iters;
-        return { T, heads: H, dim, iters, mode: opts.chunk ? 'chunk' : 'seq', msPerLayer: +ms.toFixed(3), msAll18: +(ms * 18).toFixed(2) };
+        return { T, heads: H, dim, iters, mode: (opts.mode || (opts.chunk ? 'chunk' : 'seq')), msPerLayer: +ms.toFixed(3), msAll18: +(ms * 18).toFixed(2) };
       } finally { for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} } }
     },
     _setDeltaChunk: (b) => { _deltaChunk = b; },   // null=auto(probe), true/false to force chunkwise-parallel DeltaNet prefill
     _setDeltaVT: (n) => { _deltaVT = n | 0; },     // val columns per workgroup (occupancy knob) for the chunkwise kernel
+    _setDeltaImpl: (s) => { _deltaImpl = s; },     // 'v78' (default, best on Iris Xe) | 'matmul' (deltaChunk2; for Adreno A/B)
     _setConvPar: (b) => { _convPar = !!b; },       // route prefill conv to the parallel kernel (default off; no-op gain on Iris Xe)
     // Validate + bench the parallel conv prefill vs the sequential one (no model needed).
     _selfTestConv: async (opts) => {
@@ -3577,4 +3718,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v79 (chunkwise DeltaNet VT-tunable occupancy knob + parallel conv prefill; both measured no-op on Iris Xe → off, exposed for Adreno; #4 attn/#5 acts verified non-bottleneck)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v80 (matmul-decomposed chunkwise DeltaNet — VALIDATED but 3× slower on Iris Xe iGPU, kept off behind _setDeltaImpl for Adreno A/B; v78 chunkwise stays default; prefill is serial-delta-bound)'); } catch (_) {}
