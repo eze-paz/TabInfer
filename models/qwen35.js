@@ -1818,6 +1818,68 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return srcFromChunks(await downloadToRam(onProgress));
   }
 
+  // ---- Quantized-weights cache --------------------------------------------------
+  // Skip the per-load bf16→int4 quantize (the ~40s "parse" phase, the dominant fixed load
+  // cost once the model is local) by saving the int4 packs + scales + f16/f32 raws to a
+  // compact OPFS blob (~0.3GB for 0.8B, ~5× smaller than the safetensors) and reloading them
+  // straight into GPU buffers. Format: [u64 headerLen][JSON header][data]; header.parts give
+  // byte offsets into the data section (each part 4-byte padded for writeBuffer).
+  const QCACHE_VER = 1;
+  const qcacheFile = () => 'q35-' + _variant + '-q4v' + QCACHE_VER + '.bin';
+  const _u8 = (a) => new Uint8Array(a.buffer, a.byteOffset, a.byteLength);
+  const _pad4 = (n) => (n + 3) & ~3;
+  async function writeQuantCache(qc, onProgress) {
+    let off = 0;
+    const tensors = qc.map(t => {
+      const arrs = t.kind === 'int4' ? [t.pack, t.scales] : [t.data];
+      const parts = arrs.map(a => { const len = _pad4(a.byteLength); const p = { off, len }; off += len; return p; });
+      return { name: t.name, kind: t.kind, N: t.N, K: t.K, shape: t.shape, numel: t.numel, parts };
+    });
+    const hjson = new TextEncoder().encode(JSON.stringify({ version: QCACHE_VER, variant: _variant, hidden: CONFIG.hidden, intermediate: CONFIG.intermediate, tensors }));
+    let root, w;
+    try {
+      root = await navigator.storage.getDirectory();
+      try { await root.removeEntry(qcacheFile()); } catch (_) {}
+      w = await (await root.getFileHandle(qcacheFile(), { create: true })).createWritable();
+      const hdr = new Uint8Array(8); new DataView(hdr.buffer).setBigUint64(0, BigInt(hjson.byteLength), true);
+      await w.write(hdr); await w.write(hjson);
+      const pad = new Uint8Array(4);
+      for (const t of qc) {
+        const arrs = t.kind === 'int4' ? [t.pack, t.scales] : [t.data];
+        for (const a of arrs) { const u = _u8(a); await w.write(u); const r = _pad4(u.byteLength) - u.byteLength; if (r) await w.write(pad.subarray(0, r)); }
+      }
+      await w.close();
+      onProgress && onProgress({ phase: 'qcache', pct: 100 });
+    } catch (e) { try { console.warn('[q35] quant-cache write failed', e); } catch (_) {} try { await w.close(); } catch (_) {} try { await root.removeEntry(qcacheFile()); } catch (_) {} }
+  }
+  async function loadQuantCache(onProgress) {
+    let chunks = null;
+    try {
+      const root = await navigator.storage.getDirectory();
+      const f = await (await root.getFileHandle(qcacheFile())).getFile();
+      if (f.size < 1e7) return false;
+      chunks = [];
+      for (let o = 0; o < f.size; o += OPFS_SLICE) { const e = Math.min(o + OPFS_SLICE, f.size); chunks.push(new Uint8Array(await f.slice(o, e).arrayBuffer())); onProgress && onProgress({ phase: 'cache', pct: Math.round(e / f.size * 100) }); }
+    } catch (_) { return false; }
+    try {
+      const src = srcFromChunks(chunks);
+      const hlen = Number(new DataView(src.readRange(0, 8).buffer).getBigUint64(0, true));
+      const hdr = JSON.parse(dec_(src.readRange(8, hlen)));
+      if (hdr.version !== QCACHE_VER || hdr.variant !== _variant || hdr.hidden !== CONFIG.hidden) return false;
+      const dataStart = 8 + hlen;
+      _weights = {};
+      const mk = (p, label) => { const b = E.createBuffer(p.len, ST(), label); E.device().queue.writeBuffer(b, 0, src.readRange(dataStart + p.off, p.len)); return b; };
+      for (let i = 0; i < hdr.tensors.length; i++) {
+        const t = hdr.tensors[i];
+        if (t.kind === 'int4') _weights[t.name] = { pack: mk(t.parts[0], t.name + '.pk'), scales: mk(t.parts[1], t.name + '.sc'), N: t.N, K: t.K, int4: true, shape: t.shape, numel: t.numel };
+        else if (t.kind === 'f32') _weights[t.name] = { buf: mk(t.parts[0], t.name), f32: true, shape: t.shape, numel: t.numel };
+        else _weights[t.name] = { buf: mk(t.parts[0], t.name), shape: t.shape, numel: t.numel };
+        if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / hdr.tensors.length * 100) });
+      }
+      return true;
+    } catch (e) { try { console.warn('[q35] quant-cache load failed', e); } catch (_) {} return false; }
+  }
+
   async function loadModel({ onProgress, variant } = {}) {
     if (variant) selectModel(variant);   // may unload a different already-loaded variant
     if (_loaded) return;
@@ -1825,8 +1887,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     await probeSubgroups();   // mobile-safety: disable subgroups if this GPU computes them wrong
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
+    // Fast path: quantized weights already cached → straight to GPU buffers (skip the
+    // safetensors download/parse AND the bf16→int4 quantize).
+    if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; return; }
     const src = await fetchModelBytes(onProgress);
     onProgress && onProgress({ phase: 'parse', pct: 0 });
+    const qc = [];   // collect quantized CPU arrays → written to the OPFS quant-cache after parse
     const headerLen = Number(new DataView(src.readRange(0, 8).buffer).getBigUint64(0, true));
     const header = JSON.parse(dec_(src.readRange(8, headerLen)));
     const dataStart = 8 + headerLen;
@@ -1852,6 +1918,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         E.device().queue.writeBuffer(packBuf, 0, pk);
         E.device().queue.writeBuffer(scBuf, 0, scF16);
         _weights[base + '.weight'] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: [N, K], numel: N * K };
+        qc.push({ name: base + '.weight', kind: 'int4', N, K, shape: [N, K], numel: N * K, pack: pk, scales: scF16 });
         if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
         continue;
       }
@@ -1867,6 +1934,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         E.device().queue.writeBuffer(packBuf, 0, pack);
         E.device().queue.writeBuffer(scBuf, 0, scales);
         _weights[name] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
+        qc.push({ name, kind: 'int4', N, K, shape: info.shape, numel, pack, scales });
       } else if (isF32Raw(name)) {
         let f32;
         if (info.dtype === 'BF16') f32 = bf16ToF32arr(aligned(raw, Uint16Array));
@@ -1875,6 +1943,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const buf = E.createBuffer(numel * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
         E.device().queue.writeBuffer(buf, 0, f32);
         _weights[name] = { buf, f32: true, shape: info.shape, numel };
+        qc.push({ name, kind: 'f32', shape: info.shape, numel, data: f32 });
       } else if (name.endsWith('embed_tokens.weight')) {
         // Tied embedding: store ONLY an int4 copy. It serves BOTH the embedding gather
         // (embedGatherQ dequantizes a row) AND the lm_head matmul. No f16 copy → saves
@@ -1887,6 +1956,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         E.device().queue.writeBuffer(packBuf, 0, pack);
         E.device().queue.writeBuffer(scBuf, 0, scales);
         _weights['__embed_int4'] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
+        qc.push({ name: '__embed_int4', kind: 'int4', N, K, shape: info.shape, numel, pack, scales });
       } else {
         let f16bits;
         if (info.dtype === 'BF16') f16bits = bf16ToF16bits(aligned(raw, Uint16Array));
@@ -1896,11 +1966,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
         E.device().queue.writeBuffer(buf, 0, f16bits);
         _weights[name] = { buf, shape: info.shape, numel };
+        qc.push({ name, kind: 'f16', shape: info.shape, numel, data: f16bits });
       }
       if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
     }
     onProgress && onProgress({ phase: 'parse', pct: 100 });
     _loaded = true;
+    try { await writeQuantCache(qc, onProgress); } catch (_) {}   // best-effort: speeds up every future load
   }
   const _td = new TextDecoder();
   function dec_(u8) { return _td.decode(u8); }
@@ -2437,7 +2509,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Delete the OPFS-cached model files (called by the Settings "clear local models" button).
   async function clearCache() {
     try { const root = await navigator.storage.getDirectory();
-      for (const v of Object.keys(VARIANTS)) { try { await root.removeEntry('q35-' + v + '-model.safetensors'); } catch (_) {} } } catch (_) {}
+      for (const v of Object.keys(VARIANTS)) {
+        try { await root.removeEntry('q35-' + v + '-model.safetensors'); } catch (_) {}
+        try { await root.removeEntry('q35-' + v + '-q4v' + QCACHE_VER + '.bin'); } catch (_) {}   // quantized-weights cache
+      } } catch (_) {}
   }
 
   // Page-side agent run (mirrors the wllama/litertlm/transformers.js contract). Streams
