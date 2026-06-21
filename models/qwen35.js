@@ -1878,7 +1878,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
       await w.close();
       onProgress && onProgress({ phase: 'qcache', pct: 100 });
-    } catch (e) { try { console.warn('[q35] quant-cache write failed', e); } catch (_) {} try { await w.close(); } catch (_) {} try { await root.removeEntry(qcacheFile()); } catch (_) {} }
+      return true;
+    } catch (e) { try { console.warn('[q35] quant-cache write failed', e); } catch (_) {} try { await w.close(); } catch (_) {} try { await root.removeEntry(qcacheFile()); } catch (_) {} return false; }
+  }
+  // Delete the large bf16 safetensors from OPFS (called once the compact quant cache is
+  // written) so only the ~0.4GB quantized blob remains — the 1.7GB bf16 otherwise wastes
+  // OPFS quota and risks evicting the quant cache it was used to build.
+  async function deleteBf16Opfs() {
+    try { const root = await navigator.storage.getDirectory(); await root.removeEntry(opfsFile()); return true; }
+    catch (_) { return false; }
   }
   async function loadQuantCache(onProgress) {
     let chunks = null;
@@ -1983,7 +1991,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     // Fast path: quantized weights already cached → straight to GPU buffers (skip the
     // safetensors download/parse AND the bf16→int4 quantize).
-    if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; await warmup(onProgress); return; }
+    if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; await warmup(onProgress); deleteBf16Opfs(); return; }   // drop any lingering bf16 (older caches kept both)
     // Next-fastest: a host-served pre-built q4v (skips the 1.75GB bf16 download AND the
     // ~40s quantize). Downloaded into the OPFS cache, then read back like a local hit.
     if (await fetchRemoteQuantCache(onProgress) && await loadQuantCache(onProgress)) {
@@ -2072,7 +2080,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     onProgress && onProgress({ phase: 'parse', pct: 100 });
     _loaded = true;
     await warmup(onProgress);                                     // compile all pipelines now, not on the first message
-    try { await writeQuantCache(qc, onProgress); } catch (_) {}   // best-effort: speeds up every future load
+    // Save the compact quant cache, then DELETE the big bf16 safetensors — every future
+    // load reads only the ~0.4GB quantized blob (no re-download, no re-quantize). Only delete
+    // if the quant cache wrote OK (else keep the bf16 so we don't have to re-download).
+    try { if (await writeQuantCache(qc, onProgress)) await deleteBf16Opfs(); } catch (_) {}
   }
   const _td = new TextDecoder();
   function dec_(u8) { return _td.decode(u8); }
