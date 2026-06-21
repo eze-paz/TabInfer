@@ -676,60 +676,65 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
   }
 
-  // ---- TILED int4 GEMM (prefill) — Y[T,N] = X[T,K] · dequant(W)ᵀ ----------------
-  // matvecQ is COMPUTE-bound at T>1 (unpack+T dots per weight word, register acc[T], no
-  // token reuse) → batching it gives ~0 throughput gain (16 tokens cost 16×). This tiles
-  // BOTH dims: a 16×16 workgroup loads a 16-token × BK and a 16-row × BK tile into shared
-  // memory (weights dequantized ONCE on load), so every loaded value is reused 16×. One
-  // dispatch handles all T → far fewer dispatches AND much higher FLOP efficiency.
-  const GEMMQ_BT = 16, GEMMQ_BN = 16, GEMMQ_BK = QGROUP;   // BK==group → one scale per row per k-tile
-  const GEMMQ_WGSL = `
+  // ---- REGISTER-BLOCKED + SHARED-MEM int4 GEMM (prefill) — Y[T,N] = X[T,K]·dq(W)ᵀ ----
+  // A BM×BN output tile per workgroup, BK-deep. Each k-step stages a BM-token × BK and a
+  // BN-row × BK tile into shared memory (weights dequantized ONCE on load → no redundant
+  // global loads), then each thread accumulates a TM×TN output block FROM the shared tiles
+  // in registers. BK=QGROUP=32 → only K/32 barriers (the BK=8 register-block attempt died on
+  // K/8 barriers) AND one scale per row per k-tile. Reading TM+TN shared values for TM*TN
+  // FMAs = ~2 FLOP/shared-read (vs 0.5 for one-output) → higher FLOP efficiency. Codegen-
+  // unrolled for static registers. (BM*BN/(TM*TN) threads.)
+  const GEMMQ_BM = 64, GEMMQ_BN = 64, GEMMQ_BK = QGROUP, GEMMQ_TM = 4, GEMMQ_TN = 4;
+  const gemmqWgsl = (() => {
+    const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = GEMMQ_BK, TM = GEMMQ_TM, TN = GEMMQ_TN;
+    const NTH = (BM / TM) * (BN / TN), TILEA = BM * BK, TILEB = BN * BK, RN = BN / TN;
+    let s = `
 enable f16;
 struct D { T:u32, N:u32, K:u32, acc:u32 };
 @group(0) @binding(0) var<storage, read>       X  : array<f32>;   // [T*K]
-@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // [N*K/8] packed nibbles (offset q+8)
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // [N*K/8] packed nibbles (q+8)
 @group(0) @binding(2) var<storage, read>       sc : array<f16>;   // [N*K/${QGROUP}]
 @group(0) @binding(3) var<storage, read_write> Y  : array<f32>;   // [T*N]
 @group(0) @binding(4) var<uniform>             d  : D;
-var<workgroup> As : array<f32, ${GEMMQ_BT * GEMMQ_BK}>;   // [t][k]
-var<workgroup> Bs : array<f32, ${GEMMQ_BN * GEMMQ_BK}>;   // [n][k] dequantized
-@compute @workgroup_size(${GEMMQ_BT}, ${GEMMQ_BN}, 1)
+var<workgroup> As : array<f32, ${TILEA}>;   // [BM][BK]
+var<workgroup> Bs : array<f32, ${TILEB}>;   // [BN][BK] dequantized
+@compute @workgroup_size(${NTH}, 1, 1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let tt = lid.x; let nn = lid.y;                 // local token / row
-  let t = wg.y*${GEMMQ_BT}u + tt;                 // global token
-  let n = wg.x*${GEMMQ_BN}u + nn;                 // global row
-  let words = d.K / 8u; let gpr = d.K / ${QGROUP}u; let tid = nn*${GEMMQ_BT}u + tt;
-  let nTiles = (d.K + ${GEMMQ_BK}u - 1u) / ${GEMMQ_BK}u;
-  var acc : f32 = 0.0;
-  let TILE = ${GEMMQ_BT * GEMMQ_BK}u;            // = BN*BK; entries per shared tile (512)
-  let NTH = ${GEMMQ_BT * GEMMQ_BN}u;             // threads/workgroup (256) → each loads TILE/NTH (2) entries
-  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
-    let k0 = kt*${GEMMQ_BK}u;
-    // load As (16 tokens × BK) and Bs (16 rows × BK, dequantized) — TILE entries each, 2/thread
-    for (var r:u32=0u; r<TILE/NTH; r=r+1u) {
-      let idx = tid + r*NTH;
-      let lt = idx / ${GEMMQ_BK}u; let lk = idx % ${GEMMQ_BK}u;
-      let gt = wg.y*${GEMMQ_BT}u + lt; let gk = k0 + lk;
-      As[idx] = select(0.0, X[gt*d.K + gk], gt < d.T && gk < d.K);
-      let ln = lt; let gn = wg.x*${GEMMQ_BN}u + ln;
-      var v : f32 = 0.0;
-      if (gn < d.N && gk < d.K) {
-        let word = W[gn*words + gk/8u];
-        let nib = (word >> (4u*(gk%8u))) & 0xFu;
-        v = (f32(nib) - 8.0) * f32(sc[gn*gpr + gk/${QGROUP}u]);
-      }
+  let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;   // thread's row-block / token-block
+  let mBase = wg.y*${BM}u; let nBase = wg.x*${BN}u;
+  let words = d.K/8u; let gpr = d.K/${QGROUP}u; let nTiles = (d.K + ${BK}u - 1u)/${BK}u;
+`;
+    for (let r = 0; r < TM * TN; r++) s += `  var acc${r}:f32=0.0;\n`;
+    s += `  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
+    let k0 = kt*${BK}u;
+    for (var r:u32=0u; r<${TILEA / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let lt = idx/${BK}u; let lk = idx%${BK}u; let gk = k0+lk; let gt = mBase+lt;
+      As[idx] = select(0.0, X[gt*d.K + gk], gt<d.T && gk<d.K);
+    }
+    for (var r:u32=0u; r<${TILEB / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let ln = idx/${BK}u; let lk = idx%${BK}u; let gk = k0+lk; let gn = nBase+ln;
+      var v:f32=0.0;
+      if (gn<d.N && gk<d.K) { let word = W[gn*words + gk/8u]; let nib=(word>>(4u*(gk%8u)))&0xFu; v=(f32(nib)-8.0)*f32(sc[gn*gpr + gk/${QGROUP}u]); }
       Bs[idx] = v;
     }
     workgroupBarrier();
-    for (var kk:u32=0u; kk<${GEMMQ_BK}u; kk=kk+1u) { acc = acc + As[tt*${GEMMQ_BK}u + kk] * Bs[nn*${GEMMQ_BK}u + kk]; }
+    for (var kk:u32=0u; kk<${BK}u; kk=kk+1u) {
+`;
+    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${BK}u + kk];\n`;
+    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${BK}u + kk];\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      acc${i * TN + j} = acc${i * TN + j} + a${i}*b${j};\n`;
+    s += `    }
     workgroupBarrier();
   }
-  if (t < d.T && n < d.N) { let idx = t*d.N + n; Y[idx] = select(0.0, Y[idx], d.acc != 0u) + acc; }
-}`;
+`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `  { let gm=mBase+tM*${TM}u+${i}u; let gn=nBase+tN*${TN}u+${j}u; if (gm<d.T && gn<d.N) { let idx=gm*d.N+gn; Y[idx]=select(0.0,Y[idx],d.acc!=0u)+acc${i * TN + j}; } }\n`;
+    s += `}`;
+    return s;
+  })();
   function gemmQ(xBuf, wrec, yBuf, T, N, K, acc) {
-    const pipe = E.getPipeline('q35.gemmQ', GEMMQ_WGSL);
+    const pipe = E.getPipeline('q35.gemmQ', gemmqWgsl);
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
-    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BT), 1]);
+    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
 
   // Router for the int4 weight path. wrec = { pack, scales, N, K }. acc=true →
