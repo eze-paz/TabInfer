@@ -440,23 +440,28 @@ struct P { nHeads:u32, dim:u32, T:u32, _b:u32 };
 @group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] [head][key][val]
 @group(0) @binding(5) var<storage, read_write> outv : array<f32>;
 @group(0) @binding(6) var<uniform>             p  : P;
-var<workgroup> Ss : array<f16, ${DELTA_DIM * DELTA_DIM}>;   // [key][val] f16 (32KB = full SLM)
 @compute @workgroup_size(${DELTA_DIM},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let h = wg.x; let vi = lid.x; let dim = p.dim;
   let gbase = h*dim*dim + vi;            // global S column vi for this head
-  for (var kk:u32=0u; kk<dim; kk=kk+1u) { Ss[kk*dim+vi] = f16(S[gbase + kk*dim]); }   // load column → SLM
-  for (var t:u32=0u; t<p.T; t=t+1u) {    // no barriers: thread vi owns column vi exclusively
+  // Thread vi owns column vi of S exclusively — there is NO cross-thread access, so this is
+  // PRIVATE per-thread scratch, not shared. Keeping it private uses ZERO workgroup storage:
+  // the old shared [128][128] f16 array needed the full 32KB SLM (== the device max), which
+  // failed to even create the pipeline / faulted the submit (VK_ERROR_DEVICE_LOST) on devices
+  // at the 16KB WebGPU baseline or Vulkan drivers that reserve workgroup memory.
+  var col : array<f16, ${DELTA_DIM}>;
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { col[kk] = f16(S[gbase + kk*dim]); }   // load column
+  for (var t:u32=0u; t<p.T; t=t+1u) {
     let th = t*p.nHeads + h; let base = th*dim;
     let expg = f16(gb[th*2u]); let beta = gb[th*2u + 1u];
     var kv : f32 = 0.0;
-    for (var kk:u32=0u; kk<dim; kk=kk+1u) { let idx = kk*dim+vi; let s = Ss[idx]*expg; Ss[idx] = s; kv = kv + f32(s)*k[base+kk]; }
+    for (var kk:u32=0u; kk<dim; kk=kk+1u) { let s = col[kk]*expg; col[kk] = s; kv = kv + f32(s)*k[base+kk]; }
     let delta = (v[base+vi] - kv) * beta;
     var o : f32 = 0.0;
-    for (var kk:u32=0u; kk<dim; kk=kk+1u) { let idx = kk*dim+vi; let s = Ss[idx] + f16(k[base+kk]*delta); Ss[idx] = s; o = o + f32(s)*q[base+kk]; }
+    for (var kk:u32=0u; kk<dim; kk=kk+1u) { let s = col[kk] + f16(k[base+kk]*delta); col[kk] = s; o = o + f32(s)*q[base+kk]; }
     outv[base+vi] = o;
   }
-  for (var kk:u32=0u; kk<dim; kk=kk+1u) { S[gbase + kk*dim] = f32(Ss[kk*dim+vi]); }   // write column back
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { S[gbase + kk*dim] = f32(col[kk]); }   // write column back
 }`;
   function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, T) {
     const pipe = E.getPipeline('q35.delta', DELTA_WGSL);
