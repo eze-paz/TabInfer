@@ -1624,7 +1624,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _variant = v;
     CONFIG.hidden = VARIANTS[v].hidden;
     CONFIG.intermediate = VARIANTS[v].intermediate;
-    MODEL_ROOT = 'https://huggingface.co/' + VARIANTS[v].repo + '/resolve/main/';
+    // Optional self-hosting / dev override: localStorage 'q35_root_<variant>' (or a global
+    // window.__Q35_ROOT[variant]) points the weights+tokenizer fetch at a mirror (e.g. a
+    // localhost static server) instead of HuggingFace — avoids HF throttling and OPFS-eviction
+    // re-downloads during iteration. The mirror must hold both MODEL_FILE and tokenizer.json.
+    let override = null;
+    try { override = (window.__Q35_ROOT && window.__Q35_ROOT[v]) || localStorage.getItem('q35_root_' + v); } catch (_) {}
+    MODEL_ROOT = override || ('https://huggingface.co/' + VARIANTS[v].repo + '/resolve/main/');
     MODEL_FILE = VARIANTS[v].file;
     _compressed = !!VARIANTS[v].compressed;
   }
