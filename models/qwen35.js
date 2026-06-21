@@ -1782,19 +1782,28 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // dynamic storage quota and quota-failing the write — a fresh 1.75GB OPFS file writes fine
   // when RAM is free. Returns true if fully cached. (Also fixes the mobile low-RAM failure.)
   async function downloadToOpfs(onProgress) {
-    let root, writer;
+    let root, fh, writer;
     try {
       root = await navigator.storage.getDirectory();
       try { await root.removeEntry(opfsFile()); } catch (_) {}
-      writer = await (await root.getFileHandle(opfsFile(), { create: true })).createWritable();
+      fh = await root.getFileHandle(opfsFile(), { create: true });
+      writer = await fh.createWritable({ keepExistingData: true });
     } catch (_) { return false; }
     try {
       const resp = await fetch(MODEL_ROOT + MODEL_FILE);
       const total = +(resp.headers.get('content-length') || 0);
-      const reader = resp.body.getReader(); let recv = 0;
+      const reader = resp.body.getReader();
+      // Chrome's FileSystemWritableFileStream buffers ALL writes in RAM until close() — for a
+      // 1.75GB model that's ~1.7GB of heap (the dominant first-load memory spike). Close+reopen
+      // every FLUSH bytes (writing at an explicit position) forces each segment to disk, so the
+      // in-flight buffer is bounded to ~one segment instead of the whole file.
+      const FLUSH = 128 * 1024 * 1024;
+      let recv = 0, sinceFlush = 0;
       for (;;) {
         const { done, value } = await reader.read(); if (done) break;
-        await writer.write(value); recv += value.length;
+        await writer.write({ type: 'write', position: recv, data: value });
+        recv += value.length; sinceFlush += value.length;
+        if (sinceFlush >= FLUSH) { await writer.close(); writer = await fh.createWritable({ keepExistingData: true }); sinceFlush = 0; }
         if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
       }
       await writer.close();
