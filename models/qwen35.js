@@ -423,36 +423,40 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // S in the persistent buffer), but each thread owns its own S columns (sbase + kk*dim,
   // stride dim) so the per-t S read-after-write needs no barrier; only the shared k/q tiles
   // do. T=1 (decode) → the original single-token step.
+  // S-IN-SHARED chunk recurrence: the state (128×128/head) was streamed from GLOBAL every
+  // token (~256KB/head/token = the post-GEMM bottleneck). Now the chunk loads its head's S
+  // into SHARED once (f16, 32KB = full SLM), runs the sequential recurrence with S in SLM,
+  // and writes S back once → S global traffic drops ~T×. Thread vi owns column vi of S end-
+  // to-end (no other thread touches it) → ZERO barriers in the token loop. kv/out accumulate
+  // in f32; only the stored state is f16 (the per-head decay expg<1 forgets old tokens, so
+  // f16 rounding doesn't accumulate unboundedly). k/q read from global (128-way broadcast).
   const DELTA_WGSL = `
+enable f16;
 struct P { nHeads:u32, dim:u32, T:u32, _b:u32 };
-@group(0) @binding(0) var<storage, read>       q  : array<f32>;   // [T*nHeads*dim] L2-normed
-@group(0) @binding(1) var<storage, read>       k  : array<f32>;   // [T*nHeads*dim] L2-normed
-@group(0) @binding(2) var<storage, read>       v  : array<f32>;   // [T*nHeads*dim]
-@group(0) @binding(3) var<storage, read>       gb : array<f32>;   // [T*nHeads*2]: expg, beta per head
+@group(0) @binding(0) var<storage, read>       q  : array<f32>;
+@group(0) @binding(1) var<storage, read>       k  : array<f32>;
+@group(0) @binding(2) var<storage, read>       v  : array<f32>;
+@group(0) @binding(3) var<storage, read>       gb : array<f32>;
 @group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] [head][key][val]
-@group(0) @binding(5) var<storage, read_write> outv : array<f32>; // [T*nHeads*dim]
+@group(0) @binding(5) var<storage, read_write> outv : array<f32>;
 @group(0) @binding(6) var<uniform>             p  : P;
-var<workgroup> ksh : array<f32, ${DELTA_DIM}>;
-var<workgroup> qsh : array<f32, ${DELTA_DIM}>;
+var<workgroup> Ss : array<f16, ${DELTA_DIM * DELTA_DIM}>;   // [key][val] f16 (32KB = full SLM)
 @compute @workgroup_size(${DELTA_DIM},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let h = wg.x; let vi = lid.x; let dim = p.dim;
-  let sbase = h*dim*dim + vi;            // S[h][kk][vi] = S[sbase + kk*dim]; thread vi owns column vi
-  for (var t:u32=0u; t<p.T; t=t+1u) {
+  let gbase = h*dim*dim + vi;            // global S column vi for this head
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { Ss[kk*dim+vi] = f16(S[gbase + kk*dim]); }   // load column → SLM
+  for (var t:u32=0u; t<p.T; t=t+1u) {    // no barriers: thread vi owns column vi exclusively
     let th = t*p.nHeads + h; let base = th*dim;
-    if (vi < dim) { ksh[vi] = k[base+vi]; qsh[vi] = q[base+vi]; }
-    workgroupBarrier();
-    if (vi < dim) {
-      let expg = gb[th*2u]; let beta = gb[th*2u + 1u];
-      var kv : f32 = 0.0;
-      for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i]*expg; S[i] = s; kv = kv + s*ksh[kk]; }
-      let delta = (v[base+vi] - kv) * beta;
-      var o : f32 = 0.0;
-      for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i] + ksh[kk]*delta; S[i] = s; o = o + s*qsh[kk]; }
-      outv[base+vi] = o;
-    }
-    workgroupBarrier();   // ksh/qsh reused next t
+    let expg = f16(gb[th*2u]); let beta = gb[th*2u + 1u];
+    var kv : f32 = 0.0;
+    for (var kk:u32=0u; kk<dim; kk=kk+1u) { let idx = kk*dim+vi; let s = Ss[idx]*expg; Ss[idx] = s; kv = kv + f32(s)*k[base+kk]; }
+    let delta = (v[base+vi] - kv) * beta;
+    var o : f32 = 0.0;
+    for (var kk:u32=0u; kk<dim; kk=kk+1u) { let idx = kk*dim+vi; let s = Ss[idx] + f16(k[base+kk]*delta); Ss[idx] = s; o = o + f32(s)*q[base+kk]; }
+    outv[base+vi] = o;
   }
+  for (var kk:u32=0u; kk<dim; kk=kk+1u) { S[gbase + kk*dim] = f32(Ss[kk*dim+vi]); }   // write column back
 }`;
   function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, T) {
     const pipe = E.getPipeline('q35.delta', DELTA_WGSL);
