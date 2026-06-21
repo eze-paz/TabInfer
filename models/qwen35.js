@@ -2540,16 +2540,25 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return needHead ? await readU32At(_tokHist, posBase + T) : undefined;
   }
 
-  const PCHUNK = 128;   // tokens per batched prefill chunk (bounds scratch memory + command-buffer size)
-  // Batched prefill of ids[startPos..]; returns the first generated token id. startPos>0 =
-  // prefix-cache reuse (the state for [0,startPos) was restored from the snapshot).
+  // Tokens per batched prefill chunk = ONE GPU submission. Sized to keep each submit well
+  // under the Windows TDR watchdog (~2s; a too-long single submission gets the driver reset
+  // → device lost). Measured ~5.3ms/token on the 0.8B Iris Xe → 128 tok ≈ 0.68s (safe). A 2B
+  // model is ~2.5×/token, so 128 tok would be ~1.7s (dangerously close) — scale the chunk
+  // down with model size, and shrink late (long-context) chunks where per-token attention
+  // grows, so no single submit approaches the watchdog regardless of model/context.
+  const PCHUNK_BASE = () => (CONFIG.hidden >= 2048 ? 48 : 128);
   async function forwardPrefill(ids, signal, startPos = 0) {
     const L = ids.length;
     let tok;
-    for (let c = startPos; c < L; c += PCHUNK) {
+    const base = PCHUNK_BASE();
+    for (let c = startPos; c < L; ) {
       if (signal && signal.aborted) return undefined;
-      const end = Math.min(c + PCHUNK, L);
+      // Halve the chunk once the context is long (attention cost ∝ context) so a late submit
+      // can't balloon past the watchdog: ≥3072 → /4, ≥1536 → /2.
+      const chunk = c >= 3072 ? Math.max(16, base >> 2) : c >= 1536 ? Math.max(24, base >> 1) : base;
+      const end = Math.min(c + chunk, L);
       tok = await forwardChunk(ids.slice(c, end), c, end === L);   // last chunk computes the head
+      c = end;
     }
     return tok;
   }
