@@ -417,35 +417,46 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // upstream (separate kernels, TODO); this kernel is the recurrence proper.
   // ============================================================
   const DELTA_DIM = 128;   // key_head_dim == value_head_dim
+  // Gated-DeltaNet recurrence over a CHUNK of T tokens in ONE dispatch (loops t INSIDE the
+  // kernel) — collapses the prefill's per-token deltaRecur loop (T×layers tiny dispatches,
+  // the post-GEMM bottleneck) to one dispatch/layer. The recurrence stays sequential (state
+  // S in the persistent buffer), but each thread owns its own S columns (sbase + kk*dim,
+  // stride dim) so the per-t S read-after-write needs no barrier; only the shared k/q tiles
+  // do. T=1 (decode) → the original single-token step.
   const DELTA_WGSL = `
-struct P { nHeads:u32, dim:u32, tOff:u32, _b:u32 };
+struct P { nHeads:u32, dim:u32, T:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       q  : array<f32>;   // [T*nHeads*dim] L2-normed
 @group(0) @binding(1) var<storage, read>       k  : array<f32>;   // [T*nHeads*dim] L2-normed
 @group(0) @binding(2) var<storage, read>       v  : array<f32>;   // [T*nHeads*dim]
 @group(0) @binding(3) var<storage, read>       gb : array<f32>;   // [T*nHeads*2]: expg, beta per head
-@group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] layout [head][key][val] (val contiguous → coalesced across threads)
+@group(0) @binding(4) var<storage, read_write> S  : array<f32>;   // [nHeads*dim*dim] [head][key][val]
 @group(0) @binding(5) var<storage, read_write> outv : array<f32>; // [T*nHeads*dim]
 @group(0) @binding(6) var<uniform>             p  : P;
 var<workgroup> ksh : array<f32, ${DELTA_DIM}>;
 var<workgroup> qsh : array<f32, ${DELTA_DIM}>;
 @compute @workgroup_size(${DELTA_DIM},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let h = wg.x; let vi = lid.x; let dim = p.dim; let th = p.tOff*p.nHeads + h; let base = th*dim;
-  if (vi < dim) { ksh[vi] = k[base+vi]; qsh[vi] = q[base+vi]; }
-  workgroupBarrier();
-  if (vi >= dim) { return; }
-  let expg = gb[th*2u]; let beta = gb[th*2u + 1u];
-  let sbase = h*dim*dim + vi;            // S[h][kk][vi] = S[sbase + kk*dim] — coalesced across vi
-  var kv : f32 = 0.0;
-  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i]*expg; S[i] = s; kv = kv + s*ksh[kk]; }
-  let delta = (v[base+vi] - kv) * beta;
-  var o : f32 = 0.0;
-  for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i] + ksh[kk]*delta; S[i] = s; o = o + s*qsh[kk]; }
-  outv[base+vi] = o;
+  let h = wg.x; let vi = lid.x; let dim = p.dim;
+  let sbase = h*dim*dim + vi;            // S[h][kk][vi] = S[sbase + kk*dim]; thread vi owns column vi
+  for (var t:u32=0u; t<p.T; t=t+1u) {
+    let th = t*p.nHeads + h; let base = th*dim;
+    if (vi < dim) { ksh[vi] = k[base+vi]; qsh[vi] = q[base+vi]; }
+    workgroupBarrier();
+    if (vi < dim) {
+      let expg = gb[th*2u]; let beta = gb[th*2u + 1u];
+      var kv : f32 = 0.0;
+      for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i]*expg; S[i] = s; kv = kv + s*ksh[kk]; }
+      let delta = (v[base+vi] - kv) * beta;
+      var o : f32 = 0.0;
+      for (var kk:u32=0u; kk<dim; kk=kk+1u) { let i = sbase + kk*dim; let s = S[i] + ksh[kk]*delta; S[i] = s; o = o + s*qsh[kk]; }
+      outv[base+vi] = o;
+    }
+    workgroupBarrier();   // ksh/qsh reused next t
+  }
 }`;
-  function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, tOff) {
+  function deltaRecur(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, T) {
     const pipe = E.getPipeline('q35.delta', DELTA_WGSL);
-    const p = uniform(new Uint32Array([nHeads, dim, tOff || 0, 0]));
+    const p = uniform(new Uint32Array([nHeads, dim, T || 1, 0]));
     return E.dispatch(pipe, [qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, p], [nHeads, 1, 1]);
   }
 
@@ -2368,7 +2379,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         await gbeta(ps.aD, ps.bD, W(d + 'A_log'), W(d + 'dt_bias'), ps.gb, dH, T);
         await l2normHeads(ps.qd, ps.qn, dH, dK, C.rmsEps, qScale, T);
         await l2normHeads(ps.kd, ps.kn, dH, dK, C.rmsEps, 1.0, T);
-        for (let t = 0; t < T; t++) await deltaRecur(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, t);   // sequential recurrence
+        await deltaRecur(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);   // whole chunk, 1 dispatch (loops t internally)
         await gatedRMSNorm(ps.core, ps.zD, W(d + 'norm.weight'), ps.gnorm, dH, dV, _gnormEps, T);
         await linearQ(ps.gnorm, Wq(d + 'out_proj.weight'), ps.x, T, H, DVAL, true);
       }
