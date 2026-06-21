@@ -2957,3 +2957,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
 })();
 
 if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
+// Version marker so a console log unambiguously shows WHICH build is live (deploys are a
+// manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
+// kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
+try { console.info('[q35] webgpu-qwen35 module v71 (deltaRecur=private-mem, mobile-safe SLM)'); } catch (_) {}
