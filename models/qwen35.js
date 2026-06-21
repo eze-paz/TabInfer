@@ -2603,17 +2603,37 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // down with model size, and shrink late (long-context) chunks where per-token attention
   // grows, so no single submit approaches the watchdog regardless of model/context.
   const PCHUNK_BASE = () => (CONFIG.hidden >= 2048 ? 48 : 128);
+  // Each forwardChunk() is ONE vkQueueSubmit (beginBatch→endBatch) and endBatch awaits the
+  // GPU, so chunks run serially. A too-long single submit trips the GPU watchdog (Windows TDR
+  // ~2s; mobile Vulkan/Adreno can be stricter AND much slower per token) → the driver resets
+  // the device → VK_ERROR_DEVICE_LOST. The OLD code used a fixed 128-token chunk tuned for
+  // Iris Xe (~5.3ms/tok → 0.68s); on a slower mobile GPU that same chunk can blow past the
+  // watchdog. This is exactly why a SHORT prompt (test harness, ~10 tok = one tiny chunk)
+  // survives on a phone but a real sandpie turn (system + ~2400-tok tool preamble = ~20
+  // chunks) loses the device. Fix: ADAPT the chunk to THIS device — start with a small probe
+  // that's safe even on a slow GPU, measure the actual per-token cost, then size every
+  // subsequent submit to a fixed time budget well under any watchdog. Free to measure: we
+  // already await each chunk's completion, so there's no throughput cost.
+  const TDR_BUDGET_MS = 600;   // target wall-clock per single GPU submission (≥3× margin under a 2s watchdog)
+  const PCHUNK_PROBE = 24;     // first submit on an unprofiled device: small enough to be safe even at ~60ms/tok
   async function forwardPrefill(ids, signal, startPos = 0) {
     const L = ids.length;
     let tok;
     const base = PCHUNK_BASE();
+    let chunk = Math.min(base, PCHUNK_PROBE);   // conservative until we've measured this GPU
     for (let c = startPos; c < L; ) {
       if (signal && signal.aborted) return undefined;
-      // Halve the chunk once the context is long (attention cost ∝ context) so a late submit
-      // can't balloon past the watchdog: ≥3072 → /4, ≥1536 → /2.
-      const chunk = c >= 3072 ? Math.max(16, base >> 2) : c >= 1536 ? Math.max(24, base >> 1) : base;
-      const end = Math.min(c + chunk, L);
-      tok = await forwardChunk(ids.slice(c, end), c, end === L);   // last chunk computes the head
+      // Long-context cap: attention cost ∝ context, so the per-token cost grows late in a long
+      // prompt. Shrink the ceiling so a late submit can't balloon: ≥3072 → /4, ≥1536 → /2.
+      const ctxCap = c >= 3072 ? Math.max(16, base >> 2) : c >= 1536 ? Math.max(24, base >> 1) : base;
+      const thisChunk = Math.max(8, Math.min(chunk, ctxCap));
+      const end = Math.min(c + thisChunk, L);
+      const t0 = (typeof performance !== 'undefined') ? performance.now() : 0;
+      tok = await forwardChunk(ids.slice(c, end), c, end === L);   // last chunk computes the head; endBatch awaits the GPU
+      const dt = ((typeof performance !== 'undefined') ? performance.now() : 0) - t0;
+      // Re-size the next chunk from the MEASURED per-token cost on this device, toward the budget.
+      const n = end - c;
+      if (dt > 0 && n > 0) chunk = Math.max(8, Math.min(base, Math.floor(TDR_BUDGET_MS / (dt / n))));
       c = end;
     }
     return tok;
@@ -2956,4 +2976,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v72 (deltaRecur=global-mem, no shared/private/f16 — mobile-safe)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v73 (adaptive prefill chunk: probe+measure per-token, size each submit under the GPU watchdog — mobile-safe)'); } catch (_) {}

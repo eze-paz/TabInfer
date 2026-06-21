@@ -45,6 +45,7 @@
       </select>
     </label>
     <button id="gen">Load model &amp; generate</button>
+    <button id="genStress" title="Prepend ~2000 filler tokens so the prefill spans many GPU submits — reproduces the sandpie tool-preamble load that was tripping the mobile GPU watchdog">Stress prefill (~2k tok)</button>
     <label style="color:#8b949e; font-size:0.85rem;">max tokens <input id="maxtok" type="number" value="80" style="width:4rem; background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;"></label>
     <span id="genstat" class="hi"></span>
     <span id="tps" class="ok" style="margin-left:0.6rem;"></span>
@@ -67,9 +68,9 @@
 <pre id="bench">—</pre>
 
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
-<script src="../modules/webgpu-engine.js?v=39"></script>
+<script src="../modules/webgpu-engine.js?v=41"></script>
 <script src="../modules/webgpu-qwen3.js?v=39"></script>
-<script src="../modules/webgpu-qwen35.js?v=39"></script>
+<script src="../modules/webgpu-qwen35.js?v=73"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -146,11 +147,11 @@
     } finally { $('runKernels').disabled = false; }
   });
 
-  $('gen').addEventListener('click', async () => {
+  async function runGen(stress) {
     const sel = $('model').value;
     const Q = sel === 'qwen3' ? window.SandpieQwen3 : window.SandpieQwen35;
     const variant = sel === 'qwen35-2b-awq' ? '2B-AWQ' : (sel === 'qwen35-2b' ? '2B' : (sel === 'qwen35' ? '0.8B' : undefined));
-    $('gen').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
+    $('gen').disabled = $('genStress').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
     try {
       // (re)load if not loaded, or if the selected Qwen3.5 variant differs from the loaded one
       const needLoad = !Q.isLoaded() || (variant && Q.variant && Q.variant() !== variant);
@@ -162,11 +163,20 @@
           else if (p.phase === 'parse') $('genstat').textContent = `quantizing ${p.pct}%`;
         }});
       }
-      $('genstat').textContent = 'generating…';
-      const prompt = $('prompt').value;
+      let prompt = $('prompt').value;
+      if (stress) {
+        // Force a big multi-chunk prefill (≈2000 tokens) — the same shape as sandpie's
+        // system + tool-preamble load that was tripping the mobile GPU watchdog. If the
+        // adaptive prefill chunking is working, this completes instead of losing the device.
+        const filler = 'The quick brown fox jumps over the lazy dog near the riverbank. ';
+        prompt = 'Read the following notes, then ' + prompt.charAt(0).toLowerCase() + prompt.slice(1) + '\n\nNotes:\n' + filler.repeat(330);
+        $('genstat').textContent = 'stress prefill (~2k tokens)…';
+      } else {
+        $('genstat').textContent = 'generating…';
+      }
       const maxTokens = +$('maxtok').value || 80;
       let n = 0, t0 = 0;
-      const out = await Q.generate(prompt, { maxTokens, onToken: (piece) => {
+      await Q.generate(prompt, { maxTokens, onToken: (piece) => {
         if (n === 0) t0 = performance.now();   // start timing at first token (exclude prefill)
         n++;
         $('out').textContent += piece;
@@ -176,8 +186,10 @@
       $('genstat').textContent = 'done';
     } catch (e) {
       $('genstat').textContent = 'error: ' + (e && e.message || e); console.error(e);
-    } finally { $('gen').disabled = false; }
-  });
+    } finally { $('gen').disabled = $('genStress').disabled = false; }
+  }
+  $('gen').addEventListener('click', () => runGen(false));
+  $('genStress').addEventListener('click', () => runGen(true));
 
   $('run').addEventListener('click', runAll);
   $('runCaps').addEventListener('click', async () => {
