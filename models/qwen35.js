@@ -2786,11 +2786,13 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   ];
   // Delete the OPFS-cached model files (called by the Settings "clear local models" button).
   async function clearCache() {
+    let removed = 0;
     try { const root = await navigator.storage.getDirectory();
       for (const v of Object.keys(VARIANTS)) {
-        try { await root.removeEntry('q35-' + v + '-model.safetensors'); } catch (_) {}
-        try { await root.removeEntry('q35-' + v + '-q4v' + QCACHE_VER + '.bin'); } catch (_) {}   // quantized-weights cache
+        try { await root.removeEntry('q35-' + v + '-model.safetensors'); removed++; } catch (_) {}
+        try { await root.removeEntry('q35-' + v + '-q4v' + QCACHE_VER + '.bin'); removed++; } catch (_) {}   // quantized-weights cache
       } } catch (_) {}
+    return removed > 0;
   }
 
   // Build a user-facing error, appending the WebGPU device-loss reason when relevant so the
@@ -2812,10 +2814,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // append results → re-prefill the whole history and stream again, up to MAX_ROUNDS.
   // (The small hybrid models are unreliable tool-callers — 2B is the realistic floor.)
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
-    // Single active local backend: free the OTHER local LLMs' GPU/WASM contexts first.
-    try { await window.SandpieWllama?.unload?.(); } catch (_) {}
-    try { await window.SandpieTransformersJS?.unload?.(); } catch (_) {}
-    try { await window.SandpieLiteRTLM?.unload?.(); } catch (_) {}
+    // WebGPU Qwen3.5 is the only in-browser backend now — no sibling GPU contexts to free.
     const variant = (provider && provider.endpoint) || '0.8B';
     const maxTokens = (provider && (provider.maxTokens | 0)) || 512;
     try {
