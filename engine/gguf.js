@@ -358,51 +358,52 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
   // is what lifts effective bandwidth toward the iGPU ceiling.
   const GEMVK_NR = 4, GEMVK_WG = 128;
   const GEMV_BODY = {
-    // q4_K — word-level (8 weights/u32), NR rows.
+    // q4_K — word-level (8 weights/u32), NR rows; vec4-aligned x; OOB rows clamped (no
+    // hot-loop branch, write-guarded) so the inner loop is divergence-free.
     q4_K: `
-  let nbpr = d.K >> 8u; let nsub = d.K >> 5u;
-  for (var idx=lid.x; idx<${GEMVK_NR}u*nsub; idx=idx+${GEMVK_WG}u) { let rr=idx/nsub; let s=idx%nsub; let row=rowBase+rr; if (row<d.N) { let b=s>>3u; let ss=s&7u; let base=(row*nbpr+b)*36u; let dd=unpack2x16float(W[base]); let m4=scale_min_k4(base,ss); sd[rr*nsub+s]=dd.x*m4.x; sm[rr*nsub+s]=dd.y*m4.y; } }
+  let nbpr = d.K >> 8u; let nsub = d.K >> 5u; let Nm1 = d.N - 1u;
+  for (var idx=lid.x; idx<${GEMVK_NR}u*nsub; idx=idx+${GEMVK_WG}u) { let rr=idx/nsub; let s=idx%nsub; let row=min(rowBase+rr,Nm1); let b=s>>3u; let ss=s&7u; let base=(row*nbpr+b)*36u; let dd=unpack2x16float(W[base]); let m4=scale_min_k4(base,ss); sd[rr*nsub+s]=dd.x*m4.x; sm[rr*nsub+s]=dd.y*m4.y; }
   workgroupBarrier();
   let nwords = d.K >> 3u;
   for (var qw=lid.x; qw<nwords; qw=qw+${GEMVK_WG}u) {
     let b=qw>>5u; let local=qw&31u; let c=local>>3u; let inner=local&7u;
     let subLo=b*8u+c*2u; let subHi=subLo+1u;
-    let kLo=b*256u + c*64u + inner*4u; let kHi=kLo+32u;
-    let xl=vec4<f32>(x[kLo],x[kLo+1u],x[kLo+2u],x[kLo+3u]);
-    let xh=vec4<f32>(x[kHi],x[kHi+1u],x[kHi+2u],x[kHi+3u]);
+    let kLo=b*256u + c*64u + inner*4u;
+    let xl=x[kLo>>2u]; let xh=x[(kLo+32u)>>2u];
     let sxl=xl.x+xl.y+xl.z+xl.w; let sxh=xh.x+xh.y+xh.z+xh.w;
-    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) { let row=rowBase+rr; if (row<d.N) {
+    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) {
+      let row=min(rowBase+rr,Nm1);
       let word=W[(row*nbpr+b)*36u + 4u + local];
       let loN=vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)); let hiN=vec4<f32>(unpack4xU8((word>>4u) & 0x0F0F0F0Fu));
       acc[rr] = acc[rr] + sd[rr*nsub+subLo]*dot(loN,xl) - sm[rr*nsub+subLo]*sxl + sd[rr*nsub+subHi]*dot(hiN,xh) - sm[rr*nsub+subHi]*sxh;
-    }}
+    }
   }`,
-    // q5_K — word-level + qh 5th bit, NR rows.
+    // q5_K — word-level + qh 5th bit, NR rows; vec4-x, clamped.
     q5_K: `
-  let nbpr = d.K >> 8u; let nsub = d.K >> 5u;
-  for (var idx=lid.x; idx<${GEMVK_NR}u*nsub; idx=idx+${GEMVK_WG}u) { let rr=idx/nsub; let s=idx%nsub; let row=rowBase+rr; if (row<d.N) { let b=s>>3u; let ss=s&7u; let base=(row*nbpr+b)*44u; let dd=unpack2x16float(W[base]); let m4=scale_min_k4(base,ss); sd[rr*nsub+s]=dd.x*m4.x; sm[rr*nsub+s]=dd.y*m4.y; } }
+  let nbpr = d.K >> 8u; let nsub = d.K >> 5u; let Nm1 = d.N - 1u;
+  for (var idx=lid.x; idx<${GEMVK_NR}u*nsub; idx=idx+${GEMVK_WG}u) { let rr=idx/nsub; let s=idx%nsub; let row=min(rowBase+rr,Nm1); let b=s>>3u; let ss=s&7u; let base=(row*nbpr+b)*44u; let dd=unpack2x16float(W[base]); let m4=scale_min_k4(base,ss); sd[rr*nsub+s]=dd.x*m4.x; sm[rr*nsub+s]=dd.y*m4.y; }
   workgroupBarrier();
   let nwords = d.K >> 3u;
   for (var qw=lid.x; qw<nwords; qw=qw+${GEMVK_WG}u) {
     let b=qw>>5u; let local=qw&31u; let c=local>>3u; let inner=local&7u;
     let subLo=b*8u+c*2u; let subHi=subLo+1u; let bitLo=c*2u;
-    let kLo=b*256u + c*64u + inner*4u; let kHi=kLo+32u;
-    let xl=vec4<f32>(x[kLo],x[kLo+1u],x[kLo+2u],x[kLo+3u]);
-    let xh=vec4<f32>(x[kHi],x[kHi+1u],x[kHi+2u],x[kHi+3u]);
+    let kLo=b*256u + c*64u + inner*4u;
+    let xl=x[kLo>>2u]; let xh=x[(kLo+32u)>>2u];
     let sxl=xl.x+xl.y+xl.z+xl.w; let sxh=xh.x+xh.y+xh.z+xh.w;
-    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) { let row=rowBase+rr; if (row<d.N) {
+    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) {
+      let row=min(rowBase+rr,Nm1);
       let base=(row*nbpr+b)*44u;
       let word=W[base + 12u + local]; let qhB=unpack4xU8(W[base + 4u + inner]);
       let loN=vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)) + 16.0*vec4<f32>((qhB>>vec4<u32>(bitLo))&vec4<u32>(1u));
       let hiN=vec4<f32>(unpack4xU8((word>>4u) & 0x0F0F0F0Fu)) + 16.0*vec4<f32>((qhB>>vec4<u32>(bitLo+1u))&vec4<u32>(1u));
       acc[rr] = acc[rr] + sd[rr*nsub+subLo]*dot(loN,xl) - sm[rr*nsub+subLo]*sxl + sd[rr*nsub+subHi]*dot(hiN,xh) - sm[rr*nsub+subHi]*sxh;
-    }}
+    }
   }`,
     // q6_K — word-level: each ql u32 = 8 weights (4 in a low-nibble quarter + 4 in a
     // high-nibble quarter) sharing one qh u32; shared int8 scales for NR rows.
     q6_K: `
-  let nbpr = d.K >> 8u; let nscale = nbpr*16u;
-  for (var idx=lid.x; idx<${GEMVK_NR}u*nscale; idx=idx+${GEMVK_WG}u) { let rr=idx/nscale; let si=idx%nscale; let row=rowBase+rr; if (row<d.N) { let b=si>>4u; let sIdx=si&15u; let base=(row*nbpr+b)*53u; let dv=unpack2x16float(W[base+52u]).x; let sRaw=(W[base+48u+(sIdx>>2u)]>>((sIdx&3u)*8u))&0xFFu; sc6[rr*nscale+si]=f32(select(i32(sRaw),i32(sRaw)-256,sRaw>=128u))*dv; } }
+  let nbpr = d.K >> 8u; let nscale = nbpr*16u; let Nm1 = d.N - 1u;
+  for (var idx=lid.x; idx<${GEMVK_NR}u*nscale; idx=idx+${GEMVK_WG}u) { let rr=idx/nscale; let si=idx%nscale; let row=min(rowBase+rr,Nm1); let b=si>>4u; let sIdx=si&15u; let base=(row*nbpr+b)*53u; let dv=unpack2x16float(W[base+52u]).x; let sRaw=(W[base+48u+(sIdx>>2u)]>>((sIdx&3u)*8u))&0xFFu; sc6[rr*nscale+si]=f32(select(i32(sRaw),i32(sRaw)-256,sRaw>=128u))*dv; }
   workgroupBarrier();
   let nqlw = d.K >> 3u;                 // ql u32 words per row (32/block)
   for (var w=lid.x; w<nqlw; w=w+${GEMVK_WG}u) {
@@ -410,27 +411,28 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     let l0=(wh&7u)*4u; let is=select(0u,1u,l0>=16u);
     let qA=select(0u,1u,isHi); let qB=select(2u,3u,isHi);
     let xAb=b*256u + half*128u + qA*32u + l0; let xBb=b*256u + half*128u + qB*32u + l0;
-    let xA=vec4<f32>(x[xAb],x[xAb+1u],x[xAb+2u],x[xAb+3u]);
-    let xB=vec4<f32>(x[xBb],x[xBb+1u],x[xBb+2u],x[xBb+3u]);
+    let xA=x[xAb>>2u]; let xB=x[xBb>>2u];
     let sA=b*16u+half*8u+qA*2u+is; let sB=b*16u+half*8u+qB*2u+is;
     let qhU=32u+half*8u+(l0>>2u);
-    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) { let row=rowBase+rr; if (row<d.N) {
+    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) {
+      let row=min(rowBase+rr,Nm1);
       let base=(row*nbpr+b)*53u;
       let qlWord=W[base+ww]; let qhB=unpack4xU8(W[base+qhU]);
       let loN=vec4<f32>(unpack4xU8(qlWord & 0x0F0F0F0Fu)) + 16.0*vec4<f32>((qhB>>vec4<u32>(qA*2u))&vec4<u32>(3u)) - vec4<f32>(32.0);
       let hiN=vec4<f32>(unpack4xU8((qlWord>>4u) & 0x0F0F0F0Fu)) + 16.0*vec4<f32>((qhB>>vec4<u32>(qB*2u))&vec4<u32>(3u)) - vec4<f32>(32.0);
       acc[rr] = acc[rr] + sc6[rr*nscale+sA]*dot(loN,xA) + sc6[rr*nscale+sB]*dot(hiN,xB);
-    }}
+    }
   }`,
-    // q8_0 — tiny tensors; NR rows, simple per-block.
+    // q8_0 — tiny tensors (ssm_alpha/beta); per-weight, vec4-x via component index.
     q8_0: `
-  let nbpr = d.K >> 5u;
+  let nbpr = d.K >> 5u; let Nm1 = d.N - 1u;
   for (var blk=lid.x; blk<nbpr; blk=blk+${GEMVK_WG}u) {
     let kbase=blk*32u;
-    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) { let row=rowBase+rr; if (row<d.N) {
+    for (var rr=0u; rr<${GEMVK_NR}u; rr=rr+1u) {
+      let row=min(rowBase+rr,Nm1);
       let base=(row*nbpr+blk)*9u; let dv=unpack2x16float(W[base]).x;
-      for (var l=0u; l<32u; l=l+1u) { let bi=2u+l; let raw=(W[base+(bi>>2u)]>>((bi&3u)*8u))&0xFFu; acc[rr] = acc[rr] + x[kbase+l]*dv*f32(select(i32(raw),i32(raw)-256,raw>=128u)); }
-    }}
+      for (var l=0u; l<32u; l=l+1u) { let bi=2u+l; let raw=(W[base+(bi>>2u)]>>((bi&3u)*8u))&0xFFu; let ki=kbase+l; acc[rr] = acc[rr] + x[ki>>2u][ki&3u]*dv*f32(select(i32(raw),i32(raw)-256,raw>=128u)); }
+    }
   }`,
   };
   function gemvKWGSL(qtype) {
@@ -441,7 +443,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     return `
 enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _p:u32 };
-@group(0) @binding(0) var<storage, read>       x : array<f32>;
+@group(0) @binding(0) var<storage, read>       x : array<vec4<f32>>;   // K/4 vec4 (K is a multiple of 256)
 @group(0) @binding(1) var<storage, read>       W : array<u32>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             d : D;
