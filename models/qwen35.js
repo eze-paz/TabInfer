@@ -483,7 +483,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // S column is private → no cross-thread S races). S_inᵀk / S_inᵀq are computed reading each S
   // element ONCE per chunk (kk outer), accumulating into per-token registers.
   const DELTA_CHUNK = 16;   // chunk length C; SLM = 2·C·dim·4 + 2·C²·4 ≈ 18KB (needs maxComputeWorkgroupStorageSize ≥ ~18.5KB; Iris Xe/Adreno report 32KB)
-  const deltaChunkWgsl = (() => {
+  // VT = val columns per workgroup. The original form was VT=dim (one workgroup/head = only nHeads
+  // workgroups → GPU starved). Splitting the val dim across workgroups (dim/VT per head → up to
+  // nHeads·dim/VT workgroups) raises occupancy at the cost of re-loading the val-independent tiles
+  // (K/Q/M/QK/γ) per val-block. Per-device sweet spot is measured (probeDeltaChunk picks the best).
+  function deltaChunkWgsl(VT) {
     const C = DELTA_CHUNK, D = DELTA_DIM;
     return `
 struct P { nHeads:u32, dim:u32, T:u32, _b:u32 };
@@ -500,20 +504,21 @@ var<workgroup> Mm  : array<f32, ${C * C}>;   // k_i·k_j
 var<workgroup> QKm : array<f32, ${C * C}>;   // q_i·k_j
 var<workgroup> gam : array<f32, ${C}>;       // cumulative decay γ_i
 var<workgroup> bet : array<f32, ${C}>;       // β_i
-@compute @workgroup_size(${D},1,1)
+@compute @workgroup_size(${VT},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let h = wg.x; let vi = lid.x; let dim = p.dim; let nH = p.nHeads; let T = p.T;
+  let li = lid.x; let h = wg.y; let vi = wg.x*${VT}u + li;   // wg.x = val-block, wg.y = head
+  let dim = p.dim; let nH = p.nHeads; let T = p.T;
   let hbase = h*dim*dim;
   let nChunks = (T + ${C}u - 1u)/${C}u;
   for (var ch:u32=0u; ch<nChunks; ch=ch+1u) {
     let cs = ch*${C}u; let Cc = min(${C}u, T - cs);
-    // load K/Q tiles for this chunk (pad rows ≥ Cc with 0)
-    for (var idx:u32=vi; idx<${C * D}u; idx=idx+${D}u) {
+    // load K/Q tiles for this chunk (val-independent → all ${VT} threads cooperate; pad rows ≥ Cc)
+    for (var idx:u32=li; idx<${C * D}u; idx=idx+${VT}u) {
       let i = idx/dim; let kk = idx%dim;
       if (i < Cc) { let base = ((cs+i)*nH + h)*dim; Kt[idx] = k[base+kk]; Qt[idx] = q[base+kk]; }
       else { Kt[idx] = 0.0; Qt[idx] = 0.0; }
     }
-    if (vi == 0u) {
+    if (li == 0u) {
       var g:f32 = 1.0;
       for (var i:u32=0u; i<${C}u; i=i+1u) {
         if (i < Cc) { let th = (cs+i)*nH + h; g = g*gb[th*2u]; gam[i] = g; bet[i] = gb[th*2u+1u]; }
@@ -522,7 +527,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     workgroupBarrier();
     // M_ij = k_i·k_j, QK_ij = q_i·k_j  (j ≤ i; else 0)
-    for (var p2:u32=vi; p2<${C * C}u; p2=p2+${D}u) {
+    for (var p2:u32=li; p2<${C * C}u; p2=p2+${VT}u) {
       let i = p2/${C}u; let j = p2%${C}u;
       var mm:f32 = 0.0; var qk:f32 = 0.0;
       if (j <= i && i < Cc && j < Cc) {
@@ -559,11 +564,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     workgroupBarrier();   // S writes done + SLM tiles free to reload for the next chunk
   }
 }`;
-  })();
+  }
+  let _deltaVT = 128;   // val columns per workgroup (occupancy knob); picked per-device by probeDeltaChunk
   function deltaChunk(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, T) {
-    const pipe = E.getPipeline('q35.deltaChunk', deltaChunkWgsl);
+    const VT = _deltaVT;
+    const pipe = E.getPipeline('q35.deltaChunk.vt' + VT, deltaChunkWgsl(VT));
     const p = uniform(new Uint32Array([nHeads, dim, T || 1, 0]));
-    return E.dispatch(pipe, [qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, p], [nHeads, 1, 1]);
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, p], [Math.ceil(dim / VT), nHeads, 1]);
   }
 
   // ============================================================
@@ -633,6 +640,61 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     const pipe = E.getPipeline('q35.convpf', CONV_PREFILL_WGSL);
     const p = uniform(new Uint32Array([convDim, T, 0, 0]));
     return E.dispatch(pipe, [xBuf, wBuf, biasBuf, stateBuf, outBuf, p], [Math.ceil(convDim / 64), 1, 1]);
+  }
+  // PARALLEL causal conv prefill: a depthwise conv has NO recurrence — out[t][c] depends only on
+  // x[t-3..t][c] (and the K-1 seed inputs in `state` for t<3). So drop the serial t-loop: one
+  // thread per (t,c). Two passes — (1) outputs (reads old state, never writes it), (2) the state
+  // carry-out — because writing `state` while pass-1 threads still read it would race.
+  const CONV_PREFILL_PAR_WGSL = `
+struct P { convDim:u32, T:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       x     : array<f32>;   // [T*convDim]
+@group(0) @binding(1) var<storage, read>       w     : array<f32>;   // [convDim*K]
+@group(0) @binding(2) var<storage, read>       bias  : array<f32>;   // [convDim]
+@group(0) @binding(3) var<storage, read>       state : array<f32>;   // [convDim*(K-1)] seed (oldest first)
+@group(0) @binding(4) var<storage, read_write> outv  : array<f32>;   // [T*convDim]
+@group(0) @binding(5) var<uniform>             p     : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let g = gid.x; let cd = p.convDim; let tot = p.T*cd;
+  if (g >= tot) { return; }
+  let t = g / cd; let c = g % cd;
+  let K = ${CONV_K}u; let Km1 = K - 1u; let wbase = c*K; let sbase = c*Km1;
+  var acc = bias[c];
+  // window[j] is the input at position (t - Km1 + j); j=Km1 is x_t. pos<0 → seed state[Km1+pos].
+  for (var j:u32=0u; j<K; j=j+1u) {
+    let posS = i32(t) + i32(j) - i32(Km1);   // signed input position
+    var val:f32;
+    if (posS >= 0) { val = x[u32(posS)*cd + c]; } else { val = state[sbase + u32(posS + i32(Km1))]; }
+    acc = acc + w[wbase+j]*val;
+  }
+  outv[g] = acc / (1.0 + exp(-acc));   // SiLU
+}`;
+  // State carry-out: new state = the last K-1 inputs of [seed, x_0..x_{T-1}]. Thread per channel
+  // reads the old seed first, then writes — no races (each thread owns its channel's slots).
+  const CONV_STATE_CARRY_WGSL = `
+struct P { convDim:u32, T:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       x     : array<f32>;
+@group(0) @binding(1) var<storage, read_write> state : array<f32>;   // [convDim*(K-1)]
+@group(0) @binding(2) var<uniform>             p     : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let c = gid.x; if (c >= p.convDim) { return; }
+  let cd = p.convDim; let K = ${CONV_K}u; let Km1 = K - 1u; let sbase = c*Km1;
+  let o0 = state[sbase]; let o1 = state[sbase+1u]; let o2 = state[sbase+2u];   // old seed (Km1==3)
+  for (var s:u32=0u; s<Km1; s=s+1u) {
+    let pos = p.T + s;                 // position in [seed(3) ++ x(T)] of the new-state slot s
+    var val:f32;
+    if (pos >= Km1) { val = x[(pos - Km1)*cd + c]; }
+    else { if (pos==0u){val=o0;} else if (pos==1u){val=o1;} else {val=o2;} }
+    state[sbase + s] = val;
+  }
+}`;
+  function conv1dPrefillPar(xBuf, wBuf, biasBuf, stateBuf, outBuf, convDim, T) {
+    const p = uniform(new Uint32Array([convDim, T, 0, 0]));
+    const pipe = E.getPipeline('q35.convpfPar', CONV_PREFILL_PAR_WGSL);
+    E.dispatch(pipe, [xBuf, wBuf, biasBuf, stateBuf, outBuf, p], [Math.ceil(convDim * T / 64), 1, 1]);   // outputs (reads old state)
+    const cpipe = E.getPipeline('q35.convCarry', CONV_STATE_CARRY_WGSL);
+    return E.dispatch(cpipe, [xBuf, stateBuf, p], [Math.ceil(convDim / 64), 1, 1]);                      // state carry-out
   }
 
   // ============================================================
@@ -2395,6 +2457,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // at 16 workgroups; the matmul-decomposed form is the path to the full 10×).
   let _deltaChunk = null;
   function _useDeltaChunk() { return _deltaChunk === true; }
+  // Parallel conv prefill (drop the serial t-loop). Validated bit-identical to the sequential conv,
+  // but MEASURED 1.01× on Iris Xe (conv's 6144 channels already saturate; it was never a
+  // bottleneck) → default OFF. Exposed for per-device testing (Adreno occupancy may differ).
+  let _convPar = false;
   function _useCoopMat() { return _coopMat === true; }
   // Pick the device's best f16-input cooperative-matrix tile: prefer a square M==N==K (simplest,
   // correct tiling) with f16 components and f32 accumulation; fall back to any f16-input config.
@@ -2973,7 +3039,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       } else {
         const d = p + 'linear_attn.';
         await linearQ(ps.normed, Wq(d + 'in_proj_qkv.weight'), ps.qkv, T, CONV_DIM, H);
-        await conv1dPrefill(ps.qkv, W(d + 'conv1d.weight'), s.convBias, _convState[l], ps.qkvc, CONV_DIM, T);
+        if (_convPar) await conv1dPrefillPar(ps.qkv, W(d + 'conv1d.weight'), s.convBias, _convState[l], ps.qkvc, CONV_DIM, T);
+        else await conv1dPrefill(ps.qkv, W(d + 'conv1d.weight'), s.convBias, _convState[l], ps.qkvc, CONV_DIM, T);
         await splitQKV(ps.qkvc, ps.qd, ps.kd, ps.vd, T);
         await linearQ(ps.normed, Wq(d + 'in_proj_a.weight'), ps.aD, T, dH, H);
         await linearQ(ps.normed, Wq(d + 'in_proj_b.weight'), ps.bD, T, dH, H);
@@ -3463,6 +3530,32 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       } finally { for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} } }
     },
     _setDeltaChunk: (b) => { _deltaChunk = b; },   // null=auto(probe), true/false to force chunkwise-parallel DeltaNet prefill
+    _setDeltaVT: (n) => { _deltaVT = n | 0; },     // val columns per workgroup (occupancy knob) for the chunkwise kernel
+    _setConvPar: (b) => { _convPar = !!b; },       // route prefill conv to the parallel kernel (default off; no-op gain on Iris Xe)
+    // Validate + bench the parallel conv prefill vs the sequential one (no model needed).
+    _selfTestConv: async (opts) => {
+      opts = opts || {}; await E.init();
+      const cd = opts.cd || 256, T = opts.T || 40, K = CONV_K, Km1 = K - 1;
+      const x = new Float32Array(T * cd), w = new Float32Array(cd * K), bias = new Float32Array(cd), st = new Float32Array(cd * Km1);
+      for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.021) * 0.7;
+      for (let i = 0; i < w.length; i++) w[i] = Math.cos(i * 0.05) * 0.4;
+      for (let i = 0; i < bias.length; i++) bias[i] = 0.01 * Math.sin(i);
+      for (let i = 0; i < st.length; i++) st[i] = Math.cos(i * 0.11) * 0.3;
+      const wb = f32buf(w), bb = f32buf(bias);
+      const runSeq = async () => { const xb = f32buf(x), sb = f32buf(st), ob = E.createBuffer(T * cd * 4, ST(), 'cv'); await conv1dPrefill(xb, wb, bb, sb, ob, cd, T); const o = Array.from(await E.readF32(ob, T * cd)), s = Array.from(await E.readF32(sb, cd * Km1)); for (const b of [xb, sb, ob]) b.destroy(); return { o, s }; };
+      const runPar = async () => { const xb = f32buf(x), sb = f32buf(st), ob = E.createBuffer(T * cd * 4, ST(), 'cv'); await conv1dPrefillPar(xb, wb, bb, sb, ob, cd, T); const o = Array.from(await E.readF32(ob, T * cd)), s = Array.from(await E.readF32(sb, cd * Km1)); for (const b of [xb, sb, ob]) b.destroy(); return { o, s }; };
+      const ref = await runSeq(), got = await runPar();
+      const rel = (a, b) => { let me = 0, rf = 0; for (let i = 0; i < a.length; i++) { me = Math.max(me, Math.abs(a[i] - b[i])); rf = Math.max(rf, Math.abs(b[i])); } return me / (rf || 1); };
+      // bench (bigger, realistic: CONV_DIM channels)
+      const bcd = CONV_DIM, bT = opts.benchT || 256, iters = 20;
+      const bx = new Float32Array(bT * bcd); for (let i = 0; i < bx.length; i++) bx[i] = Math.sin(i * 1e-4);
+      const bw = new Float32Array(bcd * K); for (let i = 0; i < bw.length; i++) bw[i] = Math.cos(i * 1e-3);
+      const bwb = f32buf(bw), bbb = f32buf(new Float32Array(bcd)), bsb = f32buf(new Float32Array(bcd * Km1)), bxb = f32buf(bx), bob = E.createBuffer(bT * bcd * 4, ST(), 'cvb');
+      const time = async (fn) => { await fn(bxb, bwb, bbb, bsb, bob, bcd, bT); await E.device().queue.onSubmittedWorkDone(); const t0 = performance.now(); for (let i = 0; i < iters; i++) await fn(bxb, bwb, bbb, bsb, bob, bcd, bT); await E.device().queue.onSubmittedWorkDone(); return (performance.now() - t0) / iters; };
+      const seqMs = await time(conv1dPrefill), parMs = await time(conv1dPrefillPar);
+      for (const b of [wb, bb, bwb, bbb, bsb, bxb, bob]) { try { b.destroy(); } catch (_) {} }
+      return { outRel: +rel(got.o, ref.o).toExponential(2), stateRel: +rel(got.s, ref.s).toExponential(2), seqMs: +seqMs.toFixed(3), parMs: +parMs.toFixed(3), speedup: +(seqMs / parMs).toFixed(2) };
+    },
     _probeDeltaChunk: async () => { _deltaChunkProbed = false; await E.init(); await probeDeltaChunk(); return { deltaChunk: _deltaChunk, useDeltaChunk: _useDeltaChunk() }; },
     _setCoopMat: (b) => { _coopMat = b; },   // null=auto(probe), true/false to force the cooperative-matrix prefill path (A/B)
     _coopConfigs: () => ((E.caps && E.caps()) ? (E.caps().subgroupMatrixConfigs || []) : []),
@@ -3484,4 +3577,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v78 (chunkwise-parallel gated-DeltaNet prefill: serial T→T/C, validated vs CPU ref to 1e-6, probe-gated; ~1.6× on Iris Xe, occupancy-bound)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v79 (chunkwise DeltaNet VT-tunable occupancy knob + parallel conv prefill; both measured no-op on Iris Xe → off, exposed for Adreno; #4 attn/#5 acts verified non-bottleneck)'); } catch (_) {}
