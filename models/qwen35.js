@@ -977,7 +977,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Scores live in shared mem (capacity ATTN_MAXK = MAX_SEQ). hd ≤ ATTN_WG.
   // ============================================================
   const ATTN_WG = 256;      // ≥ head_dim (Qwen3.5 full-attn hd=256); one thread per output dim
-  const ATTN_MAXK = 2048;   // = MAX_SEQ; scores buffer size in shared memory
+  const ATTN_MAXK = 4096;   // = MAX_SEQ; scores buffer size in shared memory (16KB f32, < 32KB SLM)
   const ATTN_WGSL = `
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       Q : array<f32>;
@@ -2020,7 +2020,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // ============================================================
   // Forward graph + KV cache + generate
   // ============================================================
-  const MAX_SEQ = 2048;
+  const MAX_SEQ = 4096;   // context + KV-cache + attn-score-buffer size; must hold prompt (tool schemas are large: 9 tools ≈ 2400 tokens) + generation. Prompts beyond this overflow → guarded in _streamIds.
   const LP = CONFIG.weightPrefix;        // 'model.language_model.'
   let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
   let _DBGLAYERS = false, _layerDbg = null;   // per-layer hidden-state norm capture (debug)
@@ -2427,6 +2427,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   const PF_BATCH = 16;   // prefill: submit this many forwards before draining (bounds queue depth)
   async function _streamIds(ids, { maxTokens = 256, onToken, signal } = {}) {
     const L = ids.length;
+    // Hard guard: a prompt at/over the context length overflows the KV cache + attention
+    // score buffer and silently produces garbage ("!"). Surface a clear error instead.
+    // (Tool schemas are large — ~9 tools ≈ 2400 tokens — so this is reachable in agent mode.)
+    if (L >= MAX_SEQ) throw new Error('prompt is ' + L + ' tokens but the WebGPU context is ' + MAX_SEQ + ' — reduce the number of tools or shorten the conversation.');
     let tok = 0;
     if (_batchedPrefill && !_prefillSerial && L > 1) {
       // BATCHED PREFILL scaffold (correct + coherent, A/B-verified identical output). OFF by
