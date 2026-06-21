@@ -710,9 +710,16 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // accumulate-f32 split MLDrift's cooperative-matrix GEMM uses. f16math=false → convert the
   // f16 tiles back to f32 and dot in f32 (the portable reference). Picked per device by a
   // load-time numerical probe (probeF16Gemm), never by user-agent sniffing.
-  function gemmqWgsl(f16math) {
+  // pad ∈ {0,1}: per-row padding (in vec4<f16> units) on the As/Bs shared tiles. The inner loop
+  // reads column kk4 across rows strided by the row width; with width BK4=8 vec4s, adjacent rows
+  // land on the same shared-memory banks (32 banks × 4B; an 8-vec4 row = 64B = a whole bank cycle)
+  // → bank conflicts serialize the reads. Padding the row to BK4+1 shifts every row by one bank so
+  // a column access hits distinct banks. Correctness-neutral (only the SLM layout changes); the
+  // win is GPU-specific, so it's a flag (_gemmPad) verified equal to the unpadded path at load.
+  function gemmqWgsl(f16math, pad) {
     const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = GEMMQ_BK, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
     const NTH = (BM / TM) * (BN / TN), TILEA4 = BM * BK4, TILEB4 = BN * BK4, RN = BN / TN;
+    const SW = BK4 + (pad ? 1 : 0);   // padded shared-tile row stride (vec4<f16> units)
     let s = `
 enable f16;
 struct D { T:u32, N:u32, K:u32, acc:u32 };
@@ -721,8 +728,8 @@ struct D { T:u32, N:u32, K:u32, acc:u32 };
 @group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/${QGROUP}]
 @group(0) @binding(3) var<storage, read_write> Y  : array<f32>;          // [T*N]
 @group(0) @binding(4) var<uniform>             d  : D;
-var<workgroup> As : array<vec4<f16>, ${TILEA4}>;   // [BM][BK4] (f16: half SLM bytes/occupancy)
-var<workgroup> Bs : array<vec4<f16>, ${TILEB4}>;   // [BN][BK4] dequantized
+var<workgroup> As : array<vec4<f16>, ${BM * SW}>;   // [BM][BK4(+pad)] (f16: half SLM bytes/occupancy)
+var<workgroup> Bs : array<vec4<f16>, ${BN * SW}>;   // [BN][BK4(+pad)] dequantized
 @compute @workgroup_size(${NTH}, 1, 1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
@@ -734,7 +741,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     let k0 = kt*${BK}u;
     for (var r:u32=0u; r<${TILEA4 / NTH}u; r=r+1u) {
       let idx = lx + r*${NTH}u; let lt = idx/${BK4}u; let kk4 = idx%${BK4}u; let gt = mBase+lt;
-      As[idx] = select(vec4<f16>(0.0), vec4<f16>(X[gt*K4 + k0/4u + kk4]), gt<d.T);
+      As[lt*${SW}u + kk4] = select(vec4<f16>(0.0), vec4<f16>(X[gt*K4 + k0/4u + kk4]), gt<d.T);
     }
     for (var r:u32=0u; r<${TILEB4 / NTH}u; r=r+1u) {
       let idx = lx + r*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
@@ -746,13 +753,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         let sv = f32(sc[gn*gpr + kt]);
         if ((kk4 & 1u) == 0u) { v = vec4<f32>(lo.x,hi.x,lo.y,hi.y) * sv; } else { v = vec4<f32>(lo.z,hi.z,lo.w,hi.w) * sv; }
       }
-      Bs[idx] = vec4<f16>(v);
+      Bs[ln*${SW}u + kk4] = vec4<f16>(v);
     }
     workgroupBarrier();
     for (var kk4:u32=0u; kk4<${BK4}u; kk4=kk4+1u) {
 `;
-    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${BK4}u + kk4];\n`;
-    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${BK4}u + kk4];\n`;
+    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${SW}u + kk4];\n`;
+    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${SW}u + kk4];\n`;
     for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += f16math
       ? `      acc${i * TN + j} = acc${i * TN + j} + f32(dot(a${i}, b${j}));\n`               // f16 multiply-add, f32 accumulate
       : `      acc${i * TN + j} = acc${i * TN + j} + dot(vec4<f32>(a${i}), vec4<f32>(b${j}));\n`;   // portable f32 dot
@@ -833,8 +840,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_index) li
   }
   function gemmQ(xBuf, wrec, yBuf, T, N, K, acc) {
     if (_useCoopMat() && _coopCfg) return gemmQCoop(xBuf, wrec, yBuf, T, N, K, acc);   // hardware matrix path (probe-verified)
-    const f16 = _useF16Math();
-    const pipe = E.getPipeline(f16 ? 'q35.gemmQ.f16' : 'q35.gemmQ', gemmqWgsl(f16));
+    const f16 = _useF16Math(), pad = _gemmPad;
+    const key = (f16 ? 'q35.gemmQ.f16' : 'q35.gemmQ') + (pad ? '.p' : '');
+    const pipe = E.getPipeline(key, gemmqWgsl(f16, pad));
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
     return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
@@ -2123,6 +2131,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (_loaded) return;
     await probeSubgroups();   // mobile-safety: disable subgroups if this GPU computes them wrong
     await probeF16Gemm();     // verify the f16-dot prefill GEMM; fall back to f32 dot if this GPU computes f16 wrong
+    await probeGemmPad();      // verify bank-conflict padding matches the unpadded path; disable on mismatch
     await probeCoopMat();     // enable the hardware cooperative-matrix prefill GEMM only if present AND verified
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
@@ -2263,6 +2272,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // probeF16Gemm against the f32 reference, so a device that computes f16 wrong falls back.
   let _f16Math = null;
   function _useF16Math() { return _f16Math !== null ? _f16Math : !!(E.caps && E.caps() && E.caps().hasF16); }
+  // Bank-conflict padding on the prefill GEMM's shared tiles. Correctness-neutral but its perf
+  // effect is GPU-specific: MEASURED a 10% REGRESSION on Iris Xe gen-12lp (no harmful bank pattern
+  // there; the extra SLM just costs occupancy), so it is OFF by default and only turned on by a
+  // load-time perf probe (probeGemmPad) on devices where it's both correct AND measurably faster.
+  let _gemmPad = false;
 
   // Prefill GEMM via the hardware cooperative-matrix path (chromium_experimental_subgroup_matrix:
   // subgroupMatrixMultiplyAccumulate). This is the biggest theoretical prefill lever — dedicated
@@ -2367,6 +2381,66 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     } catch (e) {
       _f16Math = false;                                                // anything goes wrong → safe f32 path
       console.warn('[q35] f16 GEMM probe failed — using f32 dot:', (e && e.message) || e);
+    } finally {
+      for (const b of bufs) { try { b.destroy(); } catch (_) {} }
+    }
+  }
+
+  // Bank-conflict padding is correctness-neutral and its payoff is GPU-specific, so decide it by
+  // MEASUREMENT at load: (1) verify the padded tiles produce the same numbers as unpadded (the
+  // f16/coop probes share the active padding, so they can't catch a layout bug — this is the only
+  // layout oracle), then (2) bench both on a representative prefill shape and enable padding ONLY
+  // if it's clearly faster (>3% margin, biased to the safe unpadded path). Any mismatch/throw → off.
+  let _padProbed = false;
+  async function probeGemmPad() {
+    if (_padProbed) return; _padProbed = true;
+    _gemmPad = false;
+    let bufs = [];
+    try {
+      // (1) correctness: padded vs unpadded must match to f16 rounding.
+      const cT = 8, cN = 64, cK = 256;
+      const x = new Float32Array(cT * cK); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.13);
+      const Wf = new Float32Array(cN * cK); for (let i = 0; i < Wf.length; i++) Wf[i] = Math.cos(i * 0.019);
+      const u16 = new Uint16Array(Wf.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < Wf.length; i++) { t[0] = Wf[i]; u16[i] = ti[0] >>> 16; }
+      const q = quantizeInt4Bf16(u16, cN, cK);
+      const xb = f32buf(x);
+      const pb = E.createBuffer(q.pack.byteLength, ST(), 'padprobe.pk'); E.device().queue.writeBuffer(pb, 0, q.pack);
+      const sb = E.createBuffer(q.scales.byteLength, ST(), 'padprobe.sc'); E.device().queue.writeBuffer(sb, 0, q.scales);
+      const yb = E.createBuffer(cT * cN * 4, ST(), 'padprobe.y');
+      const wrec = { pack: pb, scales: sb };
+      bufs = [xb, pb, sb, yb];
+      _gemmPad = true;  await gemmQ(xb, wrec, yb, cT, cN, cK, false); const yPad = Array.from(await E.readF32(yb, cT * cN));
+      _gemmPad = false; await gemmQ(xb, wrec, yb, cT, cN, cK, false); const yRaw = Array.from(await E.readF32(yb, cT * cN));
+      let maxErr = 0, ref = 0;
+      for (let i = 0; i < cT * cN; i++) { maxErr = Math.max(maxErr, Math.abs(yPad[i] - yRaw[i])); ref = Math.max(ref, Math.abs(yRaw[i])); }
+      if (maxErr / (ref || 1) > 1e-3) { _gemmPad = false; console.warn('[q35] gemmQ bank-pad MISMATCH (rel ' + (maxErr / (ref || 1)).toExponential(1) + ') — padding off'); return; }
+      // (2) perf: bench padded vs unpadded on a representative prefill GEMM; adopt only if >3% faster.
+      const bT = 256, bN = 1024, bK = 1024, iters = 20;
+      const bx = new Float32Array(bT * bK); for (let i = 0; i < bx.length; i++) bx[i] = Math.sin(i * 0.001);
+      const bWf = new Float32Array(bN * bK); for (let i = 0; i < bWf.length; i++) bWf[i] = Math.cos(i * 0.0007);
+      const bu = new Uint16Array(bWf.length); for (let i = 0; i < bWf.length; i++) { t[0] = bWf[i]; bu[i] = ti[0] >>> 16; }
+      const bq = quantizeInt4Bf16(bu, bN, bK);
+      const bxb = f32buf(bx);
+      const bpb = E.createBuffer(bq.pack.byteLength, ST(), 'padperf.pk'); E.device().queue.writeBuffer(bpb, 0, bq.pack);
+      const bsb = E.createBuffer(bq.scales.byteLength, ST(), 'padperf.sc'); E.device().queue.writeBuffer(bsb, 0, bq.scales);
+      const byb = E.createBuffer(bT * bN * 4, ST(), 'padperf.y');
+      const bw = { pack: bpb, scales: bsb };
+      bufs.push(bxb, bpb, bsb, byb);
+      const timeIt = async (padOn) => {
+        _gemmPad = padOn;
+        await gemmQ(bxb, bw, byb, bT, bN, bK, false); await E.device().queue.onSubmittedWorkDone();   // warm
+        const t0 = performance.now();
+        for (let i = 0; i < iters; i++) await gemmQ(bxb, bw, byb, bT, bN, bK, false);
+        await E.device().queue.onSubmittedWorkDone();
+        return (performance.now() - t0) / iters;
+      };
+      const msOn = await timeIt(true), msOff = await timeIt(false);
+      _gemmPad = (msOn < msOff * 0.97);   // adopt padding only if clearly faster
+      console.log('[q35] gemmQ bank-pad bench: padded ' + msOn.toFixed(3) + 'ms vs unpadded ' + msOff.toFixed(3) + 'ms → padding ' + (_gemmPad ? 'ON' : 'off'));
+    } catch (e) {
+      _gemmPad = false;
+      console.warn('[q35] gemmQ bank-pad probe failed — padding off:', (e && e.message) || e);
     } finally {
       for (const b of bufs) { try { b.destroy(); } catch (_) {} }
     }
@@ -3154,6 +3228,40 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     _probeSubgroups: async () => { _subProbed = false; await E.init(); await probeSubgroups(); return { subOverride: _subOverride, useSub: _useSub() }; },
     _setF16Math: (b) => { _f16Math = b; },   // null=auto, true/false to force the prefill GEMM dot precision (A/B)
     _probeF16Gemm: async () => { _f16Probed = false; await E.init(); await probeF16Gemm(); return { f16Math: _f16Math, useF16Math: _useF16Math() }; },
+    _setGemmPad: (b) => { _gemmPad = !!b; },   // A/B: bank-conflict padding on the prefill GEMM tiles
+    _probeGemmPad: async () => { _padProbed = false; await E.init(); await probeGemmPad(); return { gemmPad: _gemmPad }; },
+    // Micro-bench gemmQ in isolation (no model needed) so the prefill GEMM levers can be MEASURED
+    // on this GPU. Returns ms/iter + GFLOP/s. opts: { T, N, K, iters, pad, f16 }.
+    _benchGemmQ: async (opts) => {
+      opts = opts || {}; await E.init();
+      const T = opts.T || 512, N = opts.N || 2048, K = opts.K || 2048, iters = opts.iters || 30;
+      const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.001);
+      const Wf = new Float32Array(N * K); for (let i = 0; i < Wf.length; i++) Wf[i] = Math.cos(i * 0.0007);
+      const u16 = new Uint16Array(Wf.length); const tt = new Float32Array(1), ti = new Uint32Array(tt.buffer);
+      for (let i = 0; i < Wf.length; i++) { tt[0] = Wf[i]; u16[i] = ti[0] >>> 16; }
+      const { pack, scales } = quantizeInt4Bf16(u16, N, K);
+      const xb = f32buf(x);
+      const pb = E.createBuffer(pack.byteLength, ST(), 'bench.pk'); E.device().queue.writeBuffer(pb, 0, pack);
+      const sb = E.createBuffer(scales.byteLength, ST(), 'bench.sc'); E.device().queue.writeBuffer(sb, 0, scales);
+      const yb = E.createBuffer(T * N * 4, ST(), 'bench.y');
+      const wrec = { pack: pb, scales: sb };
+      const saveP = _gemmPad, saveF = _f16Math, saveC = _coopMat;
+      if (opts.pad != null) _gemmPad = !!opts.pad;
+      if (opts.f16 != null) _f16Math = !!opts.f16;
+      _coopMat = false;   // bench the f16/f32 tiled path, not coop
+      try {
+        await gemmQ(xb, wrec, yb, T, N, K, false); await E.device().queue.onSubmittedWorkDone();   // warm (compile)
+        const t0 = performance.now();
+        for (let i = 0; i < iters; i++) await gemmQ(xb, wrec, yb, T, N, K, false);
+        await E.device().queue.onSubmittedWorkDone();
+        const ms = (performance.now() - t0) / iters;
+        const gflops = (2 * T * N * K) / (ms / 1000) / 1e9;
+        return { T, N, K, iters, pad: _gemmPad, f16: _useF16Math(), ms: +ms.toFixed(3), gflops: +gflops.toFixed(1) };
+      } finally {
+        _gemmPad = saveP; _f16Math = saveF; _coopMat = saveC;
+        for (const b of [xb, pb, sb, yb]) { try { b.destroy(); } catch (_) {} }
+      }
+    },
     _setCoopMat: (b) => { _coopMat = b; },   // null=auto(probe), true/false to force the cooperative-matrix prefill path (A/B)
     _coopConfigs: () => ((E.caps && E.caps()) ? (E.caps().subgroupMatrixConfigs || []) : []),
     _probeCoopMat: async () => { _coopProbed = false; await E.init(); await probeCoopMat(); return { coopMat: _coopMat, useCoopMat: _useCoopMat(), cfg: _coopCfg, configs: ((E.caps && E.caps()) ? E.caps().subgroupMatrixConfigs : []) }; },
@@ -3174,4 +3282,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v75 (cooperative-matrix prefill GEMM behind a load-time probe: hardware subgroup-matrix units where present+verified, else the v74 f16 path)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v76 (prefill GEMM: bank-conflict +1 tile padding, verified-equal probe + _benchGemmQ; on top of v75 coop-matrix / v74 f16)'); } catch (_) {}
