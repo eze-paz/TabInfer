@@ -1834,16 +1834,27 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       },
     };
   }
+  // LAZY OPFS byte source: readRange(start,len) slices the cached file on demand (async),
+  // so the parse/quantize phase NEVER holds the whole 1.75GB bf16 in RAM. This is the fix for
+  // device loss DURING FIRST LOAD on weak iGPUs: opfsReadChunks used to pull the entire model
+  // into a ~1.75GB heap array AND we keep ~0.4GB of quantized copies (qc) AND build ~0.4GB of
+  // GPU buffers — a ~2.5GB spike that exhausts shared memory and gets the GPU device killed.
+  // Lazy slicing drops the per-load RAM peak to one tensor at a time (a few MB).
+  async function srcFromOpfsFile() {
+    try {
+      const root = await navigator.storage.getDirectory();
+      const f = await (await root.getFileHandle(opfsFile())).getFile();
+      if (f.size < 1e9) return null;   // partial/corrupt (bf16 is ~1.75GB)
+      return { byteLength: f.size, readRange: async (start, len) => new Uint8Array(await f.slice(start, start + len).arrayBuffer()) };
+    } catch (_) { return null; }
+  }
   async function fetchModelBytes(onProgress) {
-    const cached = await opfsReadChunks(onProgress);
-    if (cached) return srcFromChunks(cached);
-    // First try write-through to OPFS (low peak RAM → the write actually fits the quota),
-    // then serve THIS session by reading the cache back in slices. If caching is impossible
-    // (quota/permission), fall back to an in-RAM download (uncached — re-downloads next time).
-    if (await downloadToOpfs(onProgress)) {
-      const back = await opfsReadChunks(onProgress);
-      if (back) return srcFromChunks(back);
-    }
+    // Cached → lazy slices (no big RAM hold). Else write-through to OPFS (streaming, low RAM)
+    // then serve via lazy slices. Only if OPFS is unavailable do we fall back to an in-RAM
+    // download (uncached + the old big-heap source — last resort).
+    let s = await srcFromOpfsFile();
+    if (s) return s;
+    if (await downloadToOpfs(onProgress)) { s = await srcFromOpfsFile(); if (s) return s; }
     return srcFromChunks(await downloadToRam(onProgress));
   }
 
@@ -2036,14 +2047,14 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const src = await fetchModelBytes(onProgress);
     onProgress && onProgress({ phase: 'parse', pct: 0 });
     const qc = [];   // collect quantized CPU arrays → written to the OPFS quant-cache after parse
-    const headerLen = Number(new DataView(src.readRange(0, 8).buffer).getBigUint64(0, true));
-    const header = JSON.parse(dec_(src.readRange(8, headerLen)));
+    const headerLen = Number(new DataView((await src.readRange(0, 8)).buffer).getBigUint64(0, true));
+    const header = JSON.parse(dec_(await src.readRange(8, headerLen)));
     const dataStart = 8 + headerLen;
     _weights = {};
     const names = Object.keys(header).filter(n => n !== '__metadata__' && !isSkip(n));
     // Aligned byte-copy of a tensor's raw bytes → a typed array of the given ctor.
     const aligned = (raw, Ctor) => { const a = new Ctor(raw.byteLength / Ctor.BYTES_PER_ELEMENT); new Uint8Array(a.buffer).set(raw); return a; };
-    const readT = (inf) => src.readRange(dataStart + inf.data_offsets[0], inf.data_offsets[1] - inf.data_offsets[0]);
+    const readT = (inf) => src.readRange(dataStart + inf.data_offsets[0], inf.data_offsets[1] - inf.data_offsets[0]);   // returns a promise (lazy OPFS slice)
     for (let i = 0; i < names.length; i++) {
       const name = names[i], info = header[name];
       // compressed-tensors: scale/shape are consumed alongside their weight_packed
@@ -2053,9 +2064,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         // nibbles; XOR 0x88888888 flips bit-3 of each nibble → our offset-binary (q+8) encoding.
         const base = name.slice(0, -'.weight_packed'.length);
         const N = info.shape[0], K = info.shape[1] * 8;   // weight_packed is [N, K/8]
-        const pk = aligned(readT(info), Uint32Array);
+        const pk = aligned(await readT(info), Uint32Array);
         if (_awqXor) { for (let j = 0; j < pk.length; j++) pk[j] = pk[j] ^ 0x88888888; }
-        const scF16 = bf16ToF16bits(aligned(readT(header[base + '.weight_scale']), Uint16Array));
+        const scF16 = bf16ToF16bits(aligned(await readT(header[base + '.weight_scale']), Uint16Array));
         const packBuf = E.createBuffer(pk.byteLength, ST(), base + '.pk');
         const scBuf = E.createBuffer(scF16.byteLength, ST(), base + '.sc');
         E.device().queue.writeBuffer(packBuf, 0, pk);
@@ -2067,7 +2078,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
       const [begin, end] = info.data_offsets;
       const numel = info.shape.reduce((a, b) => a * b, 1);
-      const raw = src.readRange(dataStart + begin, end - begin);
+      const raw = await src.readRange(dataStart + begin, end - begin);
       if (isQuantWeight(name)) {
         if (info.dtype !== 'BF16') throw new Error('quant path expects BF16 for ' + name);
         const N = info.shape[0], K = info.shape[1];
