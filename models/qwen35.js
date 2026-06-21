@@ -2096,6 +2096,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _subOverride = null;   // GEMV reduction: null=auto (subgroups if supported), true/false to force
   let _prefillSerial = false;   // debug A/B: force the old token-by-token (drain-every-token) prefill
   let _batchedPrefill = true;   // batched prefill via tiled int4 GEMM (gemmQ) — the prefill speedup path
+  let _benchNoSys = false, _benchNoTools = false;   // bench: strip system / tool prompt in runConversation for a 1-to-1 vs the test harness
   let _awqXor = false;       // compressed-tensors packs offset-binary (q+8) = OUR format → read direct, no transcode.
                              // (Toggle exists only for hypothetical two's-complement repos.)
   function _useSub() { return _subOverride !== null ? _subOverride : !!(E.caps && E.caps() && E.caps().hasSubgroups); }
@@ -2564,6 +2565,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     if (canReuse) { snapCopy(false); startPos = _snapIds.length; }   // restore snapshot, prefill from here
     else resetState();
     let tok = 0;
+    const _tStart = (typeof performance !== 'undefined') ? performance.now() : 0;   // bench instrumentation
     if (_batchedPrefill && !_prefillSerial) {
       // Batched tiled-GEMM prefill of ids[startPos..].
       tok = await forwardPrefill(ids, signal, startPos);
@@ -2581,9 +2583,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     }
     // Snapshot the post-prefill state (BEFORE decode) so the next turn can reuse this prefix.
     if (!signal || !signal.aborted) { try { snapCopy(true); _snapIds = ids.slice(0, L); } catch (_) { _snapIds = null; } }
+    const _tFirst = (typeof performance !== 'undefined') ? performance.now() : 0;   // first token ready = bench's t0 (excludes prefill)
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
-    if (!emit(tok)) return outIds;
+    if (!emit(tok)) { _recordDecodeStats(L, startPos, _tStart, _tFirst, _tFirst, outIds.length); return outIds; }
     while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
       if (signal && signal.aborted) break;
       const K = Math.min(_genBatch, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
@@ -2594,7 +2597,26 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       let brk = false; for (let k = 0; k < K; k++) { if (!emit(toks[k])) { brk = true; break; } }
       if (brk) break;
     }
+    _recordDecodeStats(L, startPos, _tStart, _tFirst, (typeof performance !== 'undefined') ? performance.now() : 0, outIds.length);
     return outIds;
+  }
+  // Decode-only throughput, measured the SAME way as the test harness (timer starts at the
+  // first token, so prefill is excluded). Exposed via decodeStats(); logged when _benchLog.
+  // This is the apples-to-apples number to compare against the bench HTML — the UI's "tok/s"
+  // is TOTAL-time (load+prefill+decode) and is NOT comparable.
+  let _decodeStats = null, _benchLog = true;
+  function _recordDecodeStats(ctxLen, startPos, tStart, tFirst, tEnd, totalOut) {
+    const prefillMs = tFirst - tStart;
+    const decodeMs = tEnd - tFirst;
+    const decodeTokens = Math.max(0, totalOut - 1);   // tokens after the first (the bench counts the same way)
+    const decodeTokps = decodeMs > 0 ? (decodeTokens / (decodeMs / 1000)) : 0;
+    const prefillTokens = ctxLen - startPos;
+    _decodeStats = {
+      ctxLen, prefillTokens, prefillCached: startPos,
+      prefillMs: Math.round(prefillMs), prefillTokps: prefillMs > 0 ? +(prefillTokens / (prefillMs / 1000)).toFixed(1) : 0,
+      decodeTokens, decodeMs: Math.round(decodeMs), decodeTokps: +decodeTokps.toFixed(1),
+    };
+    if (_benchLog) { try { console.log('[q35 bench] ctx=' + ctxLen + ' (prefill ' + prefillTokens + ' tok' + (startPos ? ', ' + startPos + ' cached' : '') + ' in ' + _decodeStats.prefillMs + 'ms = ' + _decodeStats.prefillTokps + ' tok/s) | DECODE ' + decodeTokens + ' tok in ' + _decodeStats.decodeMs + 'ms = ' + _decodeStats.decodeTokps + ' tok/s'); } catch (_) {} }
   }
 
   // Simple chat generate (single user turn). Returns the full decoded string.
@@ -2717,10 +2739,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     };
     const sys = (systemPrompt && typeof systemPrompt === 'object') ? (systemPrompt.content || '') : (systemPrompt || '');
     const work = [];
-    if (sys) work.push({ role: 'system', content: sys });
+    if (sys && !_benchNoSys) work.push({ role: 'system', content: sys });   // _benchNoSys: drop system prompt for a 1-to-1 vs the bench
     for (const m of (messages || [])) { if (m && m.role) work.push(norm(m)); }
 
-    const MAX_ROUNDS = toolList.length ? 8 : 1;
+    const benchTools = _benchNoTools ? [] : toolList;   // _benchNoTools: drop the (~2400-token) tool preamble
+    const MAX_ROUNDS = benchTools.length ? 8 : 1;
     try {
       for (let round = 0; round < MAX_ROUNDS; round++) {
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
@@ -2732,7 +2755,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
           (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },
           (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },
         );
-        const ids = TOK.encodeChat(work, { tools: toolList.length ? toolList : null });
+        const ids = TOK.encodeChat(work, { tools: benchTools.length ? benchTools : null });
         await _streamIds(ids, { maxTokens, signal, onToken: (piece) => parser.push(piece) });
         parser.flush();
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
@@ -2789,6 +2812,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     selectModel, unload, variant: () => _variant, VARIANTS,
     exportQuantCache,   // save the OPFS q4v to a file → host it → set q35_q4v_<variant> to skip quantize for everyone
     warmup,             // force pipeline compilation (normally auto-run by loadModel)
+    // Bench: strip system/tool prompt in runConversation so the app path matches the test
+    // harness 1-to-1, + decode-only throughput (the UI tok/s is total-time, not comparable).
+    decodeStats: () => _decodeStats,
+    _setBench: (o) => { if (o && 'noSys' in o) _benchNoSys = !!o.noSys; if (o && 'noTools' in o) _benchNoTools = !!o.noTools; if (o && 'log' in o) _benchLog = !!o.log; return { noSys: _benchNoSys, noTools: _benchNoTools, log: _benchLog }; },
     // host contract (sandpie backend):
     DEFAULT_MODELS, DEFAULT_N_CTX, runConversation, clearCache,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
