@@ -467,6 +467,106 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
 
   // ============================================================
+  // CHUNKWISE-PARALLEL gated DeltaNet (PREFILL) — the 10x prefill lever.
+  // ============================================================
+  // Mathematically identical to deltaRecur's sequential scan, but the serial dependency is
+  // broken: tokens within a chunk all read the SAME incoming state S_in, so the only serial
+  // chain is chunk→chunk (T/C steps instead of T). Decode keeps the single-step deltaRecur.
+  //
+  // S is K×V, S[kk][vi] = S[h*dim*dim + kk*dim + vi]. For a chunk of C tokens (i=0..C-1):
+  //   g_i,β_i = gates; γ_i = Π_{j≤i} g_j (cumulative decay); Γ = γ_{C-1}.
+  //   M_ij = k_i·k_j (j<i) ; QK_ij = q_i·k_j (j≤i).
+  //   Δ̃_i = β_i( v_i/γ_i − S_inᵀk_i ) − β_i Σ_{j<i} M_ij Δ̃_j         (forward solve)
+  //   o_i  = γ_i( S_inᵀq_i + Σ_{j≤i} QK_ij Δ̃_j )
+  //   S_out[kk][vi] = Γ( S_in[kk][vi] + Σ_j k_j[kk] Δ̃_j[vi] )
+  // One workgroup per head, ${DELTA_DIM} threads (thread vi owns val-column vi end-to-end, so its
+  // S column is private → no cross-thread S races). S_inᵀk / S_inᵀq are computed reading each S
+  // element ONCE per chunk (kk outer), accumulating into per-token registers.
+  const DELTA_CHUNK = 16;   // chunk length C; SLM = 2·C·dim·4 + 2·C²·4 ≈ 18KB (needs maxComputeWorkgroupStorageSize ≥ ~18.5KB; Iris Xe/Adreno report 32KB)
+  const deltaChunkWgsl = (() => {
+    const C = DELTA_CHUNK, D = DELTA_DIM;
+    return `
+struct P { nHeads:u32, dim:u32, T:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       q  : array<f32>;
+@group(0) @binding(1) var<storage, read>       k  : array<f32>;
+@group(0) @binding(2) var<storage, read>       v  : array<f32>;
+@group(0) @binding(3) var<storage, read>       gb : array<f32>;
+@group(0) @binding(4) var<storage, read_write> S  : array<f32>;
+@group(0) @binding(5) var<storage, read_write> outv : array<f32>;
+@group(0) @binding(6) var<uniform>             p  : P;
+var<workgroup> Kt  : array<f32, ${C * D}>;   // [i][kk]
+var<workgroup> Qt  : array<f32, ${C * D}>;
+var<workgroup> Mm  : array<f32, ${C * C}>;   // k_i·k_j
+var<workgroup> QKm : array<f32, ${C * C}>;   // q_i·k_j
+var<workgroup> gam : array<f32, ${C}>;       // cumulative decay γ_i
+var<workgroup> bet : array<f32, ${C}>;       // β_i
+@compute @workgroup_size(${D},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let h = wg.x; let vi = lid.x; let dim = p.dim; let nH = p.nHeads; let T = p.T;
+  let hbase = h*dim*dim;
+  let nChunks = (T + ${C}u - 1u)/${C}u;
+  for (var ch:u32=0u; ch<nChunks; ch=ch+1u) {
+    let cs = ch*${C}u; let Cc = min(${C}u, T - cs);
+    // load K/Q tiles for this chunk (pad rows ≥ Cc with 0)
+    for (var idx:u32=vi; idx<${C * D}u; idx=idx+${D}u) {
+      let i = idx/dim; let kk = idx%dim;
+      if (i < Cc) { let base = ((cs+i)*nH + h)*dim; Kt[idx] = k[base+kk]; Qt[idx] = q[base+kk]; }
+      else { Kt[idx] = 0.0; Qt[idx] = 0.0; }
+    }
+    if (vi == 0u) {
+      var g:f32 = 1.0;
+      for (var i:u32=0u; i<${C}u; i=i+1u) {
+        if (i < Cc) { let th = (cs+i)*nH + h; g = g*gb[th*2u]; gam[i] = g; bet[i] = gb[th*2u+1u]; }
+        else { gam[i] = 1.0; bet[i] = 0.0; }
+      }
+    }
+    workgroupBarrier();
+    // M_ij = k_i·k_j, QK_ij = q_i·k_j  (j ≤ i; else 0)
+    for (var p2:u32=vi; p2<${C * C}u; p2=p2+${D}u) {
+      let i = p2/${C}u; let j = p2%${C}u;
+      var mm:f32 = 0.0; var qk:f32 = 0.0;
+      if (j <= i && i < Cc && j < Cc) {
+        for (var kk:u32=0u; kk<dim; kk=kk+1u) { mm = mm + Kt[i*dim+kk]*Kt[j*dim+kk]; qk = qk + Qt[i*dim+kk]*Kt[j*dim+kk]; }
+      }
+      Mm[p2] = mm; QKm[p2] = qk;
+    }
+    workgroupBarrier();
+    // per-thread (column vi): S_inᵀk_i and S_inᵀq_i, reading each S element once (kk outer)
+    var skv : array<f32, ${C}>; var sqv : array<f32, ${C}>;
+    for (var i:u32=0u; i<${C}u; i=i+1u) { skv[i] = 0.0; sqv[i] = 0.0; }
+    for (var kk:u32=0u; kk<dim; kk=kk+1u) {
+      let s = S[hbase + kk*dim + vi];
+      for (var i:u32=0u; i<Cc; i=i+1u) { skv[i] = skv[i] + s*Kt[i*dim+kk]; sqv[i] = sqv[i] + s*Qt[i*dim+kk]; }
+    }
+    // forward solve for Δ̃ (column vi) + output
+    var dlt : array<f32, ${C}>;
+    for (var i:u32=0u; i<Cc; i=i+1u) {
+      let vtil = v[((cs+i)*nH + h)*dim + vi] / gam[i];
+      var acc = bet[i]*(vtil - skv[i]);
+      for (var j:u32=0u; j<i; j=j+1u) { acc = acc - bet[i]*Mm[i*${C}u+j]*dlt[j]; }
+      dlt[i] = acc;
+      var o = sqv[i];
+      for (var j:u32=0u; j<=i; j=j+1u) { o = o + QKm[i*${C}u+j]*dlt[j]; }
+      outv[((cs+i)*nH + h)*dim + vi] = gam[i]*o;
+    }
+    // state update: S[kk][vi] = Γ( S[kk][vi] + Σ_j k_j[kk] Δ̃_j )
+    let Gam = gam[Cc - 1u];
+    for (var kk:u32=0u; kk<dim; kk=kk+1u) {
+      var add:f32 = 0.0;
+      for (var j:u32=0u; j<Cc; j=j+1u) { add = add + Kt[j*dim+kk]*dlt[j]; }
+      let idx = hbase + kk*dim + vi; S[idx] = Gam*(S[idx] + add);
+    }
+    workgroupBarrier();   // S writes done + SLM tiles free to reload for the next chunk
+  }
+}`;
+  })();
+  function deltaChunk(qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, nHeads, dim, T) {
+    const pipe = E.getPipeline('q35.deltaChunk', deltaChunkWgsl);
+    const p = uniform(new Uint32Array([nHeads, dim, T || 1, 0]));
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, gbBuf, SBuf, outBuf, p], [nHeads, 1, 1]);
+  }
+
+  // ============================================================
   // CAUSAL DEPTHWISE conv1d (kernel=4) + SiLU, decode step (1 token).
   // Mixed q|k|v are conv'd along the sequence before the recurrence.
   // PyTorch causal Conv1d (left-pad K-1, groups=conv_dim) at the last pos:
@@ -2133,6 +2233,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     await probeF16Gemm();     // verify the f16-dot prefill GEMM; fall back to f32 dot if this GPU computes f16 wrong
     await probeGemmPad();      // verify bank-conflict padding matches the unpadded path; disable on mismatch
     await probeCoopMat();     // enable the hardware cooperative-matrix prefill GEMM only if present AND verified
+    await probeDeltaChunk();  // enable chunkwise-parallel DeltaNet prefill only if it matches the sequential scan
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     // Fast path: quantized weights already cached → straight to GPU buffers (skip the
@@ -2288,6 +2389,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // so the probe is the gate: a wrong kernel disables itself, it never regresses the working path.
   let _coopMat = null;        // null=auto (probe decides), true/false to force
   let _coopCfg = null;        // the chosen { M, N, K, componentType, resultComponentType } tile
+  // Chunkwise-parallel gated DeltaNet for PREFILL (deltaChunk). null=auto (enabled by
+  // probeDeltaChunk after it verifies numerically equal to the sequential scan), true/false to
+  // force. Decode (T=1) always uses the sequential deltaRecur. ~1.6× on Iris Xe (occupancy-bound
+  // at 16 workgroups; the matmul-decomposed form is the path to the full 10×).
+  let _deltaChunk = null;
+  function _useDeltaChunk() { return _deltaChunk === true; }
   function _useCoopMat() { return _coopMat === true; }
   // Pick the device's best f16-input cooperative-matrix tile: prefer a square M==N==K (simplest,
   // correct tiling) with f16 components and f32 accumulation; fall back to any f16-input config.
@@ -2485,6 +2592,37 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       console.warn('[q35] cooperative-matrix probe failed — using f16 path:', (e && e.message) || e);
     } finally {
       for (const b of bufs) { try { b.destroy(); } catch (_) {} }
+    }
+  }
+
+  // Enable chunkwise-parallel DeltaNet for prefill only if it computes the SAME result as the
+  // sequential scan on this device (numerics + SLM limits vary). Runs both over a multi-chunk
+  // synthetic sequence and compares; mismatch / compile-fail (e.g. SLM too small) / throw → stay
+  // on the sequential scan. Correctness oracle is the sequential kernel (itself == the CPU ref).
+  let _deltaChunkProbed = false;
+  async function probeDeltaChunk() {
+    if (_deltaChunkProbed) return; _deltaChunkProbed = true;
+    if (_deltaChunk !== null) return;                                  // user forced a value
+    let bufs = [];
+    try {
+      const H = 2, dim = DELTA_DIM, T = 40;                            // 2 full chunks + a partial
+      const q = new Float32Array(T * H * dim), k = new Float32Array(T * H * dim), v = new Float32Array(T * H * dim);
+      const gb = new Float32Array(T * H * 2);
+      for (let i = 0; i < q.length; i++) { q[i] = Math.sin(i * 0.021) * 0.3; k[i] = Math.cos(i * 0.017) * 0.3; v[i] = Math.sin(i * 0.013 + 1) * 0.5; }
+      for (let i = 0; i < T * H; i++) { gb[i * 2] = 0.94 + 0.05 * Math.abs(Math.sin(i * 0.3)); gb[i * 2 + 1] = 0.4 + 0.3 * Math.abs(Math.cos(i * 0.2)); }
+      const mk = () => ({ qb: f32buf(q), kb: f32buf(k), vb: f32buf(v), gbb: f32buf(gb), Sb: E.createBuffer(H * dim * dim * 4, ST(), 'dc.S'), ob: E.createBuffer(T * H * dim * 4, ST(), 'dc.o') });
+      const a = mk(), b = mk(); bufs = [a.qb, a.kb, a.vb, a.gbb, a.Sb, a.ob, b.qb, b.kb, b.vb, b.gbb, b.Sb, b.ob];
+      await deltaRecur(a.qb, a.kb, a.vb, a.gbb, a.Sb, a.ob, H, dim, T); const ref = Array.from(await E.readF32(a.ob, T * H * dim));
+      await deltaChunk(b.qb, b.kb, b.vb, b.gbb, b.Sb, b.ob, H, dim, T); const got = Array.from(await E.readF32(b.ob, T * H * dim));
+      let me = 0, rf = 0; for (let i = 0; i < got.length; i++) { me = Math.max(me, Math.abs(got[i] - ref[i])); rf = Math.max(rf, Math.abs(ref[i])); }
+      const rel = me / (rf || 1);
+      if (rel > 1e-3) { _deltaChunk = false; console.warn('[q35] chunkwise DeltaNet MISMATCH (rel ' + rel.toExponential(1) + ') — using sequential scan'); }
+      else { _deltaChunk = true; console.log('[q35] chunkwise DeltaNet verified (rel ' + rel.toExponential(1) + ') — using it for prefill'); }
+    } catch (e) {
+      _deltaChunk = false;
+      console.warn('[q35] chunkwise DeltaNet probe failed — using sequential scan:', (e && e.message) || e);
+    } finally {
+      for (const bb of bufs) { try { bb.destroy(); } catch (_) {} }
     }
   }
   let _kv = null;          // per full-attn layer: {k,v} sized MAX_SEQ ; null for delta layers
@@ -2843,7 +2981,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         await gbeta(ps.aD, ps.bD, W(d + 'A_log'), W(d + 'dt_bias'), ps.gb, dH, T);
         await l2normHeads(ps.qd, ps.qn, dH, dK, C.rmsEps, qScale, T);
         await l2normHeads(ps.kd, ps.kn, dH, dK, C.rmsEps, 1.0, T);
-        await deltaRecur(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);   // whole chunk, 1 dispatch (loops t internally)
+        if (_useDeltaChunk() && T > 1) await deltaChunk(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);   // chunkwise-parallel prefill (probe-verified)
+        else await deltaRecur(ps.qn, ps.kn, ps.vd, ps.gb, _deltaS[l], ps.core, dH, dK, T);   // sequential scan (decode + fallback)
         await gatedRMSNorm(ps.core, ps.zD, W(d + 'norm.weight'), ps.gnorm, dH, dV, _gnormEps, T);
         await linearQ(ps.gnorm, Wq(d + 'out_proj.weight'), ps.x, T, H, DVAL, true);
       }
@@ -3262,6 +3401,47 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         for (const b of [xb, pb, sb, yb]) { try { b.destroy(); } catch (_) {} }
       }
     },
+    // CPU reference of the EXACT gated-delta recurrence the deltaRecur kernel implements (per
+    // head, thread=val-column vi): for each token, decay S column by expg, kv=Σ S·k, delta=
+    // β(v−kv), S+=k·delta, o=Σ S·q. Used as the correctness oracle for the chunkwise-parallel
+    // kernel. _selfTestDelta first checks this ref matches the existing GPU sequential kernel
+    // (proving the oracle), then — once it exists — the chunkwise kernel against the same ref.
+    _selfTestDelta: async (opts) => {
+      opts = opts || {}; await E.init();
+      const H = opts.H || 2, dim = DELTA_DIM, T = opts.T || 12;
+      const q = new Float32Array(T * H * dim), k = new Float32Array(T * H * dim), v = new Float32Array(T * H * dim);
+      const gb = new Float32Array(T * H * 2);
+      for (let i = 0; i < q.length; i++) { q[i] = Math.sin(i * 0.021) * 0.3; k[i] = Math.cos(i * 0.017) * 0.3; v[i] = Math.sin(i * 0.013 + 1) * 0.5; }
+      for (let i = 0; i < T * H; i++) { gb[i * 2] = 0.93 + 0.06 * Math.abs(Math.sin(i * 0.3)); gb[i * 2 + 1] = 0.4 + 0.3 * Math.abs(Math.cos(i * 0.2)); }   // expg∈[.93,.99], β∈[.4,.7]
+      // CPU sequential reference (exact mirror of DELTA_WGSL).
+      const S = new Float32Array(H * dim * dim), ref = new Float32Array(T * H * dim);
+      for (let t = 0; t < T; t++) for (let h = 0; h < H; h++) {
+        const base = (t * H + h) * dim, th = t * H + h, expg = gb[th * 2], beta = gb[th * 2 + 1], sh = h * dim * dim;
+        for (let vi = 0; vi < dim; vi++) {
+          let kv = 0; for (let kk = 0; kk < dim; kk++) { const idx = sh + kk * dim + vi; const s = S[idx] * expg; S[idx] = s; kv += s * k[base + kk]; }
+          const delta = (v[base + vi] - kv) * beta; let o = 0;
+          for (let kk = 0; kk < dim; kk++) { const idx = sh + kk * dim + vi; const s = S[idx] + k[base + kk] * delta; S[idx] = s; o += s * q[base + kk]; }
+          ref[base + vi] = o;
+        }
+      }
+      const rel = (got) => { let me = 0, rf = 0; for (let i = 0; i < got.length; i++) { me = Math.max(me, Math.abs(got[i] - ref[i])); rf = Math.max(rf, Math.abs(ref[i])); } return me / (rf || 1); };
+      const out = {};
+      // (1) prove the oracle: GPU sequential kernel must match the CPU ref.
+      { const qb = f32buf(q), kb = f32buf(k), vb = f32buf(v), gbb = f32buf(gb);
+        const Sb = E.createBuffer(H * dim * dim * 4, ST(), 'st.S'); const ob = E.createBuffer(T * H * dim * 4, ST(), 'st.o');
+        await deltaRecur(qb, kb, vb, gbb, Sb, ob, H, dim, T);
+        out.seqVsCpu = +rel(Array.from(await E.readF32(ob, T * H * dim))).toExponential(2);
+        for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} } }
+      // (2) chunkwise kernel vs the same ref — wired once gemmqDeltaChunk exists.
+      if (typeof deltaChunk === 'function') {
+        const qb = f32buf(q), kb = f32buf(k), vb = f32buf(v), gbb = f32buf(gb);
+        const Sb = E.createBuffer(H * dim * dim * 4, ST(), 'st.S2'); const ob = E.createBuffer(T * H * dim * 4, ST(), 'st.o2');
+        try { await deltaChunk(qb, kb, vb, gbb, Sb, ob, H, dim, T); out.chunkVsCpu = +rel(Array.from(await E.readF32(ob, T * H * dim))).toExponential(2); }
+        catch (e) { out.chunkErr = String(e && e.message || e); }
+        for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} }
+      }
+      return out;
+    },
     // Micro-bench the DeltaNet sequential scan (prefill) in isolation — no model needed — so the
     // prefill bottleneck (serial recurrence vs parallel GEMM) can be MEASURED on this GPU.
     _benchDelta: async (opts) => {
@@ -3272,15 +3452,18 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       const qb = f32buf(qa), kb = f32buf(qa), vb = f32buf(qa), gbb = f32buf(gb);
       const Sb = E.createBuffer(H * dim * dim * 4, ST(), 'bench.S');
       const ob = E.createBuffer(T * H * dim * 4, ST(), 'bench.o');
+      const run = opts.chunk ? deltaChunk : deltaRecur;
       try {
-        await deltaRecur(qb, kb, vb, gbb, Sb, ob, H, dim, T); await E.device().queue.onSubmittedWorkDone();   // warm
+        await run(qb, kb, vb, gbb, Sb, ob, H, dim, T); await E.device().queue.onSubmittedWorkDone();   // warm
         const t0 = performance.now();
-        for (let i = 0; i < iters; i++) await deltaRecur(qb, kb, vb, gbb, Sb, ob, H, dim, T);
+        for (let i = 0; i < iters; i++) await run(qb, kb, vb, gbb, Sb, ob, H, dim, T);
         await E.device().queue.onSubmittedWorkDone();
         const ms = (performance.now() - t0) / iters;
-        return { T, heads: H, dim, iters, msPerLayer: +ms.toFixed(3), msAll18: +(ms * 18).toFixed(2) };
+        return { T, heads: H, dim, iters, mode: opts.chunk ? 'chunk' : 'seq', msPerLayer: +ms.toFixed(3), msAll18: +(ms * 18).toFixed(2) };
       } finally { for (const b of [qb, kb, vb, gbb, Sb, ob]) { try { b.destroy(); } catch (_) {} } }
     },
+    _setDeltaChunk: (b) => { _deltaChunk = b; },   // null=auto(probe), true/false to force chunkwise-parallel DeltaNet prefill
+    _probeDeltaChunk: async () => { _deltaChunkProbed = false; await E.init(); await probeDeltaChunk(); return { deltaChunk: _deltaChunk, useDeltaChunk: _useDeltaChunk() }; },
     _setCoopMat: (b) => { _coopMat = b; },   // null=auto(probe), true/false to force the cooperative-matrix prefill path (A/B)
     _coopConfigs: () => ((E.caps && E.caps()) ? (E.caps().subgroupMatrixConfigs || []) : []),
     _probeCoopMat: async () => { _coopProbed = false; await E.init(); await probeCoopMat(); return { coopMat: _coopMat, useCoopMat: _useCoopMat(), cfg: _coopCfg, configs: ((E.caps && E.caps()) ? E.caps().subgroupMatrixConfigs : []) }; },
@@ -3301,4 +3484,4 @@ if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
 // Version marker so a console log unambiguously shows WHICH build is live (deploys are a
 // manual step; this is how we confirm a fix actually reached the device). v71: DeltaNet
 // kernel uses private (not 32KB shared) memory — runs on mobile/Adreno Vulkan.
-try { console.info('[q35] webgpu-qwen35 module v77 (+_benchDelta: isolate the DeltaNet serial-scan prefill cost vs GEMM — measured ~190× the biggest GEMM/layer on Iris Xe)'); } catch (_) {}
+try { console.info('[q35] webgpu-qwen35 module v78 (chunkwise-parallel gated-DeltaNet prefill: serial T→T/C, validated vs CPU ref to 1e-6, probe-gated; ~1.6× on Iris Xe, occupancy-bound)'); } catch (_) {}
