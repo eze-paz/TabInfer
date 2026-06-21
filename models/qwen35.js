@@ -2091,6 +2091,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (_kv) { for (const l of _kv) { if (l) { free(l.k); free(l.v); } } _kv = null; }
     if (_convState) { for (const b of _convState) free(b); _convState = null; }
     if (_deltaS) { for (const b of _deltaS) free(b); _deltaS = null; }
+    if (_snap) { for (const x of _snap.kv) { if (x) { free(x.k); free(x.v); } } for (const b of _snap.conv) free(b); for (const b of _snap.S) free(b); _snap = null; }
+    _snapIds = null;
     if (_scr) { for (const k in _scr) free(_scr[k]); _scr = null; }
     free(_tokHist); _tokHist = null;
     free(_idsBuf); _idsBuf = null; _idsCap = 0;
@@ -2133,6 +2135,37 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         zeroBuf(_deltaS[l], C.deltaHeads * C.deltaValDim * C.deltaKeyDim * 4);
       }
     }
+    _snapIds = null;   // an explicit reset invalidates the prefix-cache snapshot
+  }
+
+  // ---- PREFIX CACHE -------------------------------------------------------------
+  // Re-prefilling the (constant) system+tools prefix every turn is the dominant cost in
+  // agent mode (9 tools ≈ 2400 tokens ≈ 11s). After each prompt prefill we SNAPSHOT the
+  // full state (KV + conv ring + recurrent S) — taken BEFORE decode, so decode's batch
+  // overshoot / re-tokenization of generated text can never corrupt it. When the next
+  // turn's prompt EXTENDS the snapshotted prompt (it does: tools+history are a stable
+  // prefix), we RESTORE the snapshot and prefill only the new tokens.
+  let _snapIds = null, _snap = null;
+  function ensureSnap() {
+    if (_snap) return;
+    const C = CONFIG, Km1 = C.convKernel - 1;
+    _snap = { kv: [], conv: [], S: [] };
+    for (let l = 0; l < C.numLayers; l++) {
+      if (C.layerFullAttn[l]) { const per = MAX_SEQ * C.nKvHeads * C.headDim; _snap.kv.push({ k: scrBuf(per, 'sk' + l), v: scrBuf(per, 'sv' + l) }); _snap.conv.push(null); _snap.S.push(null); }
+      else { _snap.kv.push(null); _snap.conv.push(scrBuf(CONV_DIM * Km1, 'sc' + l)); _snap.S.push(scrBuf(C.deltaHeads * C.deltaValDim * C.deltaKeyDim, 'sS' + l)); }
+    }
+  }
+  // toSaved=true: live → snapshot (after prefill). false: snapshot → live (restore before reuse).
+  function snapCopy(toSaved) {
+    ensureSnap();
+    const C = CONFIG, Km1 = C.convKernel - 1;
+    const enc = E.device().createCommandEncoder();
+    const cp = (live, saved, bytes) => { const [a, b] = toSaved ? [live, saved] : [saved, live]; enc.copyBufferToBuffer(a, 0, b, 0, bytes); };
+    for (let l = 0; l < C.numLayers; l++) {
+      if (C.layerFullAttn[l]) { const kb = MAX_SEQ * C.nKvHeads * C.headDim * 4; cp(_kv[l].k, _snap.kv[l].k, kb); cp(_kv[l].v, _snap.kv[l].v, kb); }
+      else { cp(_convState[l], _snap.conv[l], CONV_DIM * Km1 * 4); cp(_deltaS[l], _snap.S[l], C.deltaHeads * C.deltaValDim * C.deltaKeyDim * 4); }
+    }
+    E.device().queue.submit([enc.finish()]);
   }
   // Scratch buffers (single-token decode; T=1 everywhere — prefill loops token-by-token
   // because the DeltaNet recurrence is inherently sequential).
@@ -2412,11 +2445,12 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   }
 
   const PCHUNK = 128;   // tokens per batched prefill chunk (bounds scratch memory + command-buffer size)
-  // Batched prefill of the whole prompt; returns the first generated token id.
-  async function forwardPrefill(ids, signal) {
+  // Batched prefill of ids[startPos..]; returns the first generated token id. startPos>0 =
+  // prefix-cache reuse (the state for [0,startPos) was restored from the snapshot).
+  async function forwardPrefill(ids, signal, startPos = 0) {
     const L = ids.length;
     let tok;
-    for (let c = 0; c < L; c += PCHUNK) {
+    for (let c = startPos; c < L; c += PCHUNK) {
       if (signal && signal.aborted) return undefined;
       const end = Math.min(c + PCHUNK, L);
       tok = await forwardChunk(ids.slice(c, end), c, end === L);   // last chunk computes the head
@@ -2431,20 +2465,20 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // score buffer and silently produces garbage ("!"). Surface a clear error instead.
     // (Tool schemas are large — ~9 tools ≈ 2400 tokens — so this is reachable in agent mode.)
     if (L >= MAX_SEQ) throw new Error('prompt is ' + L + ' tokens but the WebGPU context is ' + MAX_SEQ + ' — reduce the number of tools or shorten the conversation.');
+    // PREFIX CACHE: if this prompt extends the snapshotted one (tools+history are a stable
+    // prefix every turn), restore that state and prefill only the new tail. Else reset + full.
+    let startPos = 0;
+    const canReuse = _snapIds && _snapIds.length >= 1 && _snapIds.length < L && (() => { for (let i = 0; i < _snapIds.length; i++) if (_snapIds[i] !== ids[i]) return false; return true; })();
+    if (canReuse) { snapCopy(false); startPos = _snapIds.length; }   // restore snapshot, prefill from here
+    else resetState();
     let tok = 0;
-    if (_batchedPrefill && !_prefillSerial && L > 1) {
-      // BATCHED PREFILL scaffold (correct + coherent, A/B-verified identical output). OFF by
-      // default: with matvecQ chunked at MATVEC_MAXT=16 it's dispatch-bound, NOT a true tiled
-      // GEMM, so it ties the per-token path (~40 tok/s) rather than beating it. The real win
-      // needs a tiled int4 GEMM kernel + a chunked DeltaNet scan (the recurrence loop is the
-      // floor). Kept + flag-gated as the foundation for that work. _setBatchedPrefill(true).
-      tok = await forwardPrefill(ids, signal);
+    if (_batchedPrefill && !_prefillSerial) {
+      // Batched tiled-GEMM prefill of ids[startPos..].
+      tok = await forwardPrefill(ids, signal, startPos);
       if (signal && signal.aborted) return [];
     } else {
-      // Per-token fallback (A/B via _setPrefillSerial). Pipelined: only drain every PF_BATCH
-      // tokens + the last; submitOnly overlaps CPU-encode(i+1) with GPU-run(i). Only the LAST
-      // token needs logits (noLmHead skips the 248K-vocab lm_head on the rest).
-      for (let i = 0; i < L; i++) {
+      // Per-token fallback (A/B via _setPrefillSerial), pipelined from startPos.
+      for (let i = startPos; i < L; i++) {
         if (signal && signal.aborted) return [];
         const last = i === L - 1;
         const sync = _prefillSerial || last || ((i + 1) % PF_BATCH === 0);
@@ -2453,6 +2487,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         else await forward(ids[i], i, opts);
       }
     }
+    // Snapshot the post-prefill state (BEFORE decode) so the next turn can reuse this prefix.
+    if (!signal || !signal.aborted) { try { snapCopy(true); _snapIds = ids.slice(0, L); } catch (_) { _snapIds = null; } }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok)) return outIds;
@@ -2472,7 +2508,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Simple chat generate (single user turn). Returns the full decoded string.
   async function generate(prompt, { maxTokens = 64, onToken, signal, system } = {}) {
     await loadModel({});
-    resetState();
+    // (no resetState here — _streamIds reuses the prefix-cache snapshot when the prompt extends it)
     const msgs = [];
     if (system) msgs.push({ role: 'system', content: system });
     msgs.push({ role: 'user', content: prompt });
@@ -2595,7 +2631,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     try {
       for (let round = 0; round < MAX_ROUNDS; round++) {
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-        resetState();   // no incremental KV reuse across rounds — re-prefill the full history
+        // (no resetState — _streamIds prefix-cache reuses the stable system+tools+history prefix)
         emit({ type: 'round_start' });
         let firstTok = false;
         const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
