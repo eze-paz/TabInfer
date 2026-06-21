@@ -64,6 +64,8 @@ const SandpieWebGPU = (function () {
 
   let _adapter = null, _device = null, _caps = null;
   let _deviceGen = 0;   // bumped on every successful (re)init → lets callers detect a device that was lost+recreated and rebuild stale GPU buffers
+  let _lastLost = null;            // { reason, message, at } of the most recent device loss (diagnostics)
+  const _lostListeners = [];       // callbacks fired on device loss (proactive recovery)
 
   // Initialise the GPU device, requesting every wanted feature the adapter
   // actually advertises. Returns a capability report (also cached on _caps).
@@ -100,11 +102,15 @@ const SandpieWebGPU = (function () {
     _device = await _adapter.requestDevice({ requiredFeatures, requiredLimits });
     _deviceGen++;   // a new device → any GPU buffer built against a prior gen is now stale
     _device.lost.then((info) => {
-      // Device loss (TDR / driver reset) is THE failure mode for WebGPU LLMs on
-      // weak iGPUs. Surface it loudly and drop our handles so the next call
-      // re-inits rather than using a dead device.
-      console.error('[webgpu-engine] DEVICE LOST:', info && info.reason, info && info.message);
+      // Device loss (TDR / driver reset / OOM) is THE failure mode for WebGPU LLMs on weak
+      // iGPUs. Record reason+message so we can diagnose the actual cause (reason 'destroyed'
+      // = app called destroy(); 'unknown' = driver/TDR/OOM — the message usually says which),
+      // drop our handles so the next call re-inits, and notify any registered listeners so the
+      // model can rebuild proactively instead of erroring on the user's next message.
+      _lastLost = { reason: (info && info.reason) || 'unknown', message: (info && info.message) || '', at: (typeof performance !== 'undefined' ? Math.round(performance.now()) : 0) };
+      console.error('[webgpu-engine] DEVICE LOST:', _lastLost.reason, '—', _lastLost.message);
       _device = null; _caps = null; _pipelineCache.clear(); _bgCache.clear();
+      for (const fn of _lostListeners) { try { fn(_lastLost); } catch (_) {} }
     });
 
     const info = (_adapter.info) || (await (_adapter.requestAdapterInfo ? _adapter.requestAdapterInfo() : Promise.resolve({})));
@@ -424,6 +430,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   return {
     // engine core
     init, device, caps, deviceGen: () => _deviceGen,
+    lastLoss: () => _lastLost, onLost: (fn) => { if (typeof fn === 'function') _lostListeners.push(fn); },
     renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling, beginBatch, endBatch, copyBuffer,
     createBuffer, uploadF32, readF32, gemm,
     // measurement

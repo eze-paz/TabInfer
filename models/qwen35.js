@@ -1983,12 +1983,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _loadingPromise = _loadModelImpl(opts).then((r) => { afterLoad(); return r; }).finally(() => { _loadingPromise = null; });
     return _loadingPromise;
   }
-  // Arm recovery for the freshly-created device + register the visibility hook once.
-  function afterLoad() {
-    if (!_loaded) return;
-    hookRecovery();
-    try { E.device().lost.then(() => { try { maybeRecover(); } catch (_) {} }); } catch (_) {}   // immediate rebuild on loss while visible
-  }
+  // Register the recovery hooks once (idempotent).
+  function afterLoad() { if (_loaded) hookRecovery(); }
   // PROACTIVE device-loss recovery. The unpreventable losses (OS sleep/wake, driver reset)
   // would otherwise surface as "engine not initialised" on the user's NEXT message. Instead,
   // rebuild the model the moment the device dies (if the tab is visible) or as soon as the tab
@@ -2003,10 +1999,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     } catch (_) {}
   }
   function hookRecovery() {
-    if (_recoveryHooked || typeof document === 'undefined') return;
+    if (_recoveryHooked) return;
     _recoveryHooked = true;
-    document.addEventListener('visibilitychange', maybeRecover);
-    try { window.addEventListener('focus', maybeRecover); } catch (_) {}
+    try { E.onLost && E.onLost(() => maybeRecover()); } catch (_) {}   // rebuild the instant the device dies (if visible)
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', maybeRecover);
+      try { window.addEventListener('focus', maybeRecover); } catch (_) {}
+    }
   }
 
   async function _loadModelImpl({ onProgress, variant } = {}) {
@@ -2772,6 +2771,19 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       } } catch (_) {}
   }
 
+  // Build a user-facing error, appending the WebGPU device-loss reason when relevant so the
+  // actual cause (reason 'unknown' + a message like out-of-memory / device-hung = TDR/OOM;
+  // 'destroyed' = something called destroy()) is visible in the report instead of just the
+  // generic "engine not initialised".
+  function webgpuErr(e) {
+    let m = (e && e.message) || String(e);
+    try {
+      const L = E.lastLoss && E.lastLoss();
+      if (L && /not initialised|device|lost/i.test(m)) m += ' — device lost (reason: ' + L.reason + (L.message ? '; ' + L.message : '') + '); rebuilding, please retry';
+    } catch (_) {}
+    return 'webgpu: ' + m;
+  }
+
   // Page-side agent run (mirrors the wllama/litertlm/transformers.js contract). Streams
   // the same event protocol conversations.js expects. Supports the agentic tool loop:
   // stream a round → if the model emitted <tool_call>s, run them via ./sandpie-tool →
@@ -2797,7 +2809,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     } catch (e) {
       emit({ type: 'info', message: null });
       if (e && e.name === 'AbortError') throw e;
-      emit({ type: 'error', message: 'webgpu: ' + ((e && e.message) || e) }); emit({ type: 'agent_done' }); return;
+      emit({ type: 'error', message: webgpuErr(e) }); emit({ type: 'agent_done' }); return;
     }
 
     const toolList = Array.isArray(tools) ? tools : [];
@@ -2874,7 +2886,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     } catch (e) {
       if (e && e.name === 'AbortError') throw e;
       emit({ type: 'info', message: null });
-      emit({ type: 'error', message: 'webgpu: ' + ((e && e.message) || e) });
+      emit({ type: 'error', message: webgpuErr(e) });
     }
     emit({ type: 'agent_done' });
   }
