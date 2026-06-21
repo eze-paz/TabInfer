@@ -1908,6 +1908,63 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     } catch (e) { try { console.warn('[q35] quant-cache load failed', e); } catch (_) {} return false; }
   }
 
+  // ---- Pre-built (remote) quantized weights ------------------------------------
+  // The bf16→int4 quantize is a ~40s one-time CPU wait on a fresh browser (the "parse"
+  // phase). It's avoidable entirely: the q4v blob written by writeQuantCache IS our exact
+  // GPU format, so if a host serves a pre-built one we download THAT (~0.3GB for 0.8B, vs
+  // the 1.75GB bf16 safetensors) straight into the OPFS quant-cache and skip both the big
+  // download AND the quantize. Resolve the URL from (in order) a global, a localStorage
+  // override, or the variant's q4vUrl; null → no remote, fall back to bf16+quantize.
+  // Produce the file to host with exportQuantCache() (below) after one normal load.
+  function q4vUrl() {
+    try { return (window.__Q35_Q4V && window.__Q35_Q4V[_variant]) || localStorage.getItem('q35_q4v_' + _variant) || (VARIANTS[_variant] && VARIANTS[_variant].q4vUrl) || null; }
+    catch (_) { return (VARIANTS[_variant] && VARIANTS[_variant].q4vUrl) || null; }
+  }
+  // Stream a pre-built q4v straight into the OPFS quant-cache file (write-through, no
+  // GB-scale heap alloc — same approach as downloadToOpfs). Returns true if it landed;
+  // loadQuantCache() then reads it back (and validates version/variant). Best-effort:
+  // any failure (no URL, 404, quota) returns false and the caller falls back to bf16.
+  async function fetchRemoteQuantCache(onProgress) {
+    const url = q4vUrl();
+    if (!url) return false;
+    let root, writer;
+    try {
+      root = await navigator.storage.getDirectory();
+      try { await root.removeEntry(qcacheFile()); } catch (_) {}
+      writer = await (await root.getFileHandle(qcacheFile(), { create: true })).createWritable();
+    } catch (_) { return false; }
+    try {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error('q4v fetch ' + resp.status);
+      const total = +(resp.headers.get('content-length') || 0);
+      const reader = resp.body.getReader(); let recv = 0;
+      for (;;) {
+        const { done, value } = await reader.read(); if (done) break;
+        await writer.write(value); recv += value.length;
+        if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total, prebuilt: true });
+      }
+      await writer.close();
+      return true;
+    } catch (e) {
+      try { console.warn('[q35] prebuilt q4v fetch failed (', (e && e.message) || e, ') — falling back to bf16+quantize'); } catch (_) {}
+      try { await writer.close(); } catch (_) {}
+      try { await root.removeEntry(qcacheFile()); } catch (_) {}
+      return false;
+    }
+  }
+  // Save the OPFS quant-cache to a downloadable file so it can be hosted and served back
+  // via q4vUrl() — i.e. how you produce the pre-built blob. Run a normal load once (which
+  // writes the cache), then call SandpieQwen35.exportQuantCache() from the console.
+  async function exportQuantCache() {
+    const root = await navigator.storage.getDirectory();
+    const f = await (await root.getFileHandle(qcacheFile())).getFile();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(f); a.download = qcacheFile();
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 60000);
+    return { file: qcacheFile(), bytes: f.size };
+  }
+
   async function loadModel({ onProgress, variant } = {}) {
     if (variant) selectModel(variant);   // may unload a different already-loaded variant
     if (_loaded) return;
@@ -1918,6 +1975,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // Fast path: quantized weights already cached → straight to GPU buffers (skip the
     // safetensors download/parse AND the bf16→int4 quantize).
     if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; await warmup(onProgress); return; }
+    // Next-fastest: a host-served pre-built q4v (skips the 1.75GB bf16 download AND the
+    // ~40s quantize). Downloaded into the OPFS cache, then read back like a local hit.
+    if (await fetchRemoteQuantCache(onProgress) && await loadQuantCache(onProgress)) {
+      onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; await warmup(onProgress); return;
+    }
     const src = await fetchModelBytes(onProgress);
     onProgress && onProgress({ phase: 'parse', pct: 0 });
     const qc = [];   // collect quantized CPU arrays → written to the OPFS quant-cache after parse
@@ -2630,9 +2692,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       let lastPct = -1;
       await loadModel({ variant, onProgress: (p) => {
         if (!p) return;
-        if (p.phase === 'download') { if (p.pct === lastPct) return; lastPct = p.pct; emit({ type: 'info', message: `Downloading… ${p.pct}% (${(p.recv / 1e9).toFixed(2)}GB)` }); }
+        if (p.phase === 'download') { if (p.pct === lastPct) return; lastPct = p.pct; emit({ type: 'info', message: p.prebuilt ? `Downloading prequantized weights… ${p.pct}%` : `Downloading… ${p.pct}% (${(p.recv / 1e9).toFixed(2)}GB)` }); }
         else if (p.phase === 'cache') emit({ type: 'info', message: 'Loading from cache…' });
-        else if (p.phase === 'parse') emit({ type: 'info', message: 'Quantizing… ' + (p.pct || 0) + '%' });
+        else if (p.phase === 'parse') emit({ type: 'info', message: 'Preparing weights… ' + (p.pct || 0) + '%' });
+        else if (p.phase === 'warmup') emit({ type: 'info', message: 'Warming up GPU…' });
       } });
     } catch (e) {
       emit({ type: 'info', message: null });
@@ -2724,6 +2787,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
     selectModel, unload, variant: () => _variant, VARIANTS,
+    exportQuantCache,   // save the OPFS q4v to a file → host it → set q35_q4v_<variant> to skip quantize for everyone
+    warmup,             // force pipeline compilation (normally auto-run by loadModel)
     // host contract (sandpie backend):
     DEFAULT_MODELS, DEFAULT_N_CTX, runConversation, clearCache,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
