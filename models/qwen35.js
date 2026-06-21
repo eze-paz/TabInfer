@@ -695,45 +695,53 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // K/8 barriers) AND one scale per row per k-tile. Reading TM+TN shared values for TM*TN
   // FMAs = ~2 FLOP/shared-read (vs 0.5 for one-output) → higher FLOP efficiency. Codegen-
   // unrolled for static registers. (BM*BN/(TM*TN) threads.)
+  // vec4 along K: shared tiles are vec4<f32> (16-byte loads), inner loop uses dot() so each
+  // step is 4 FMAs/instruction over BK4=BK/4 vec4s (vs BK scalar steps). X read as vec4.
   const GEMMQ_BM = 64, GEMMQ_BN = 64, GEMMQ_BK = QGROUP, GEMMQ_TM = 4, GEMMQ_TN = 4;
   const gemmqWgsl = (() => {
-    const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = GEMMQ_BK, TM = GEMMQ_TM, TN = GEMMQ_TN;
-    const NTH = (BM / TM) * (BN / TN), TILEA = BM * BK, TILEB = BN * BK, RN = BN / TN;
+    const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = GEMMQ_BK, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
+    const NTH = (BM / TM) * (BN / TN), TILEA4 = BM * BK4, TILEB4 = BN * BK4, RN = BN / TN;
     let s = `
 enable f16;
 struct D { T:u32, N:u32, K:u32, acc:u32 };
-@group(0) @binding(0) var<storage, read>       X  : array<f32>;   // [T*K]
-@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // [N*K/8] packed nibbles (q+8)
-@group(0) @binding(2) var<storage, read>       sc : array<f16>;   // [N*K/${QGROUP}]
-@group(0) @binding(3) var<storage, read_write> Y  : array<f32>;   // [T*N]
+@group(0) @binding(0) var<storage, read>       X  : array<vec4<f32>>;   // [T*K/4]
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles (q+8)
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/${QGROUP}]
+@group(0) @binding(3) var<storage, read_write> Y  : array<f32>;          // [T*N]
 @group(0) @binding(4) var<uniform>             d  : D;
-var<workgroup> As : array<f32, ${TILEA}>;   // [BM][BK]
-var<workgroup> Bs : array<f32, ${TILEB}>;   // [BN][BK] dequantized
+var<workgroup> As : array<vec4<f32>, ${TILEA4}>;   // [BM][BK4]
+var<workgroup> Bs : array<vec4<f32>, ${TILEB4}>;   // [BN][BK4] dequantized
 @compute @workgroup_size(${NTH}, 1, 1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
-  let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;   // thread's row-block / token-block
+  let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
   let mBase = wg.y*${BM}u; let nBase = wg.x*${BN}u;
-  let words = d.K/8u; let gpr = d.K/${QGROUP}u; let nTiles = (d.K + ${BK}u - 1u)/${BK}u;
+  let WPR = d.K/8u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u; let nTiles = (d.K + ${BK}u - 1u)/${BK}u;
 `;
     for (let r = 0; r < TM * TN; r++) s += `  var acc${r}:f32=0.0;\n`;
     s += `  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
     let k0 = kt*${BK}u;
-    for (var r:u32=0u; r<${TILEA / NTH}u; r=r+1u) {
-      let idx = lx + r*${NTH}u; let lt = idx/${BK}u; let lk = idx%${BK}u; let gk = k0+lk; let gt = mBase+lt;
-      As[idx] = select(0.0, X[gt*d.K + gk], gt<d.T && gk<d.K);
+    for (var r:u32=0u; r<${TILEA4 / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let lt = idx/${BK4}u; let kk4 = idx%${BK4}u; let gt = mBase+lt;
+      As[idx] = select(vec4<f32>(0.0), X[gt*K4 + k0/4u + kk4], gt<d.T);
     }
-    for (var r:u32=0u; r<${TILEB / NTH}u; r=r+1u) {
-      let idx = lx + r*${NTH}u; let ln = idx/${BK}u; let lk = idx%${BK}u; let gk = k0+lk; let gn = nBase+ln;
-      var v:f32=0.0;
-      if (gn<d.N && gk<d.K) { let word = W[gn*words + gk/8u]; let nib=(word>>(4u*(gk%8u)))&0xFu; v=(f32(nib)-8.0)*f32(sc[gn*gpr + gk/${QGROUP}u]); }
+    for (var r:u32=0u; r<${TILEB4 / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
+      var v:vec4<f32> = vec4<f32>(0.0);
+      if (gn<d.N) {
+        let word = W[gn*WPR + k0/8u + kk4/2u];
+        let lo = vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+        let hi = vec4<f32>(unpack4xU8((word >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+        let sv = f32(sc[gn*gpr + kt]);
+        if ((kk4 & 1u) == 0u) { v = vec4<f32>(lo.x,hi.x,lo.y,hi.y) * sv; } else { v = vec4<f32>(lo.z,hi.z,lo.w,hi.w) * sv; }
+      }
       Bs[idx] = v;
     }
     workgroupBarrier();
-    for (var kk:u32=0u; kk<${BK}u; kk=kk+1u) {
+    for (var kk4:u32=0u; kk4<${BK4}u; kk4=kk4+1u) {
 `;
-    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${BK}u + kk];\n`;
-    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${BK}u + kk];\n`;
-    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      acc${i * TN + j} = acc${i * TN + j} + a${i}*b${j};\n`;
+    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${BK4}u + kk4];\n`;
+    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${BK4}u + kk4];\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      acc${i * TN + j} = acc${i * TN + j} + dot(a${i}, b${j});\n`;
     s += `    }
     workgroupBarrier();
   }
