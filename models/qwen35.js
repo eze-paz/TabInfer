@@ -709,8 +709,8 @@ struct D { T:u32, N:u32, K:u32, acc:u32 };
 @group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/${QGROUP}]
 @group(0) @binding(3) var<storage, read_write> Y  : array<f32>;          // [T*N]
 @group(0) @binding(4) var<uniform>             d  : D;
-var<workgroup> As : array<vec4<f32>, ${TILEA4}>;   // [BM][BK4]
-var<workgroup> Bs : array<vec4<f32>, ${TILEB4}>;   // [BN][BK4] dequantized
+var<workgroup> As : array<vec4<f16>, ${TILEA4}>;   // [BM][BK4] (f16: half SLM bytes/occupancy)
+var<workgroup> Bs : array<vec4<f16>, ${TILEB4}>;   // [BN][BK4] dequantized
 @compute @workgroup_size(${NTH}, 1, 1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
@@ -722,7 +722,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     let k0 = kt*${BK}u;
     for (var r:u32=0u; r<${TILEA4 / NTH}u; r=r+1u) {
       let idx = lx + r*${NTH}u; let lt = idx/${BK4}u; let kk4 = idx%${BK4}u; let gt = mBase+lt;
-      As[idx] = select(vec4<f32>(0.0), X[gt*K4 + k0/4u + kk4], gt<d.T);
+      As[idx] = select(vec4<f16>(0.0), vec4<f16>(X[gt*K4 + k0/4u + kk4]), gt<d.T);
     }
     for (var r:u32=0u; r<${TILEB4 / NTH}u; r=r+1u) {
       let idx = lx + r*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
@@ -734,14 +734,14 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         let sv = f32(sc[gn*gpr + kt]);
         if ((kk4 & 1u) == 0u) { v = vec4<f32>(lo.x,hi.x,lo.y,hi.y) * sv; } else { v = vec4<f32>(lo.z,hi.z,lo.w,hi.w) * sv; }
       }
-      Bs[idx] = v;
+      Bs[idx] = vec4<f16>(v);
     }
     workgroupBarrier();
     for (var kk4:u32=0u; kk4<${BK4}u; kk4=kk4+1u) {
 `;
     for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${BK4}u + kk4];\n`;
     for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${BK4}u + kk4];\n`;
-    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      acc${i * TN + j} = acc${i * TN + j} + dot(a${i}, b${j});\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      acc${i * TN + j} = acc${i * TN + j} + dot(vec4<f32>(a${i}), vec4<f32>(b${j}));\n`;
     s += `    }
     workgroupBarrier();
   }
