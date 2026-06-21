@@ -1967,6 +1967,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   async function loadModel({ onProgress, variant } = {}) {
     if (variant) selectModel(variant);   // may unload a different already-loaded variant
+    // Device-loss recovery (THE failure mode on weak iGPUs): a TDR/driver reset nulls the
+    // engine's device + caps, but our _loaded stayed true — so without this check loadModel
+    // would early-return and every forward would throw "engine not initialised". When caps
+    // is gone, our GPU buffers are dead handles: drop them (unload) and do a full reload.
+    // Fast, because the OPFS quant-cache is still warm (~3.5s, no re-quantize).
+    if (_loaded && (!E.caps || !E.caps())) {
+      try { console.warn('[q35] WebGPU device was lost — reloading the model on the new device.'); } catch (_) {}
+      try { unload(); } catch (_) { _loaded = false; _weights = null; }
+    }
     if (_loaded) return;
     await E.init();
     await probeSubgroups();   // mobile-safety: disable subgroups if this GPU computes them wrong
@@ -2158,6 +2167,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (_snap) { for (const x of _snap.kv) { if (x) { free(x.k); free(x.v); } } for (const b of _snap.conv) free(b); for (const b of _snap.S) free(b); _snap = null; }
     _snapIds = null;
     if (_scr) { for (const k in _scr) free(_scr[k]); _scr = null; }
+    if (_pscr) { for (const k in _pscr) free(_pscr[k]); _pscr = null; _pscrCap = 0; }   // prefill scratch
+    if (_dbgCap) { for (const k in _dbgCap) free(_dbgCap[k]); _dbgCap = {}; }            // debug capture buffers
+    // CRUCIAL for device-loss recovery: the pooled uniform buffers are device-bound. If
+    // left dangling, after a reload uniform() hands back buffers from the DEAD device and
+    // writeBuffer silently no-ops → kernels read garbage dims → "!!!!" output. Drop them so
+    // they're recreated on the new device.
+    for (const b of _uPool) free(b); _uPool = []; _uIdx = 0;
     free(_tokHist); _tokHist = null;
     free(_idsBuf); _idsBuf = null; _idsCap = 0;
     _loaded = false;
