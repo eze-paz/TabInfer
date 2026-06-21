@@ -30,6 +30,7 @@ const SandpieGGUF = (function () {
     1:  { els: 1,   bytes: 2 },     // F16
     8:  { els: 32,  bytes: 34 },    // Q8_0: f16 d + 32×int8
     12: { els: 256, bytes: 144 },   // Q4_K
+    13: { els: 256, bytes: 176 },   // Q5_K
     14: { els: 256, bytes: 210 },   // Q6_K
   };
 
