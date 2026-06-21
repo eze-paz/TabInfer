@@ -1917,7 +1917,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     // Fast path: quantized weights already cached → straight to GPU buffers (skip the
     // safetensors download/parse AND the bf16→int4 quantize).
-    if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; return; }
+    if (await loadQuantCache(onProgress)) { onProgress && onProgress({ phase: 'parse', pct: 100 }); _loaded = true; await warmup(onProgress); return; }
     const src = await fetchModelBytes(onProgress);
     onProgress && onProgress({ phase: 'parse', pct: 0 });
     const qc = [];   // collect quantized CPU arrays → written to the OPFS quant-cache after parse
@@ -2000,6 +2000,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     onProgress && onProgress({ phase: 'parse', pct: 100 });
     _loaded = true;
+    await warmup(onProgress);                                     // compile all pipelines now, not on the first message
     try { await writeQuantCache(qc, onProgress); } catch (_) {}   // best-effort: speeds up every future load
   }
   const _td = new TextDecoder();
@@ -2097,6 +2098,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     free(_tokHist); _tokHist = null;
     free(_idsBuf); _idsBuf = null; _idsCap = 0;
     _loaded = false;
+    _warmed = false;   // a fresh load must re-warm the pipelines (device/buffers were torn down)
   }
 
   function scrBuf(n, label) { return E.createBuffer(n * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, label); }
@@ -2456,6 +2458,34 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       tok = await forwardChunk(ids.slice(c, end), c, end === L);   // last chunk computes the head
     }
     return tok;
+  }
+
+  // WARMUP — eliminate the cold-start shader-compile tax on the user's FIRST message.
+  // Every kernel uses a constant pipeline cache key (q35.gemmQ, q3.gemvQ, …) with N/K/T
+  // passed as uniforms, so there are only ~25 distinct pipelines for the whole model.
+  // But createComputePipeline is SYNCHRONOUS (webgpu-engine getPipeline): the first time
+  // each is dispatched, the driver compiles WGSL→native on the main thread — hundreds of
+  // ms each on Intel iGPUs. Lazily, that ENTIRE compile bill lands on the first real
+  // prefill (the warm bench never pays it — that's why turn-1 looked ~2× slower than the
+  // 220 tok/s bench). Here we force every pipeline to compile NOW, during load, by running
+  // one tiny prefill chunk (warms the batched GEMM, attention, DeltaNet, conv-prefill,
+  // embed-gather, final-norm, lm_head + argmax) plus two decode steps (warms the decode
+  // gemvQ + chained embed path). State touched by the dummy run is wiped by resetState().
+  let _warmed = false;
+  async function warmup(onProgress) {
+    if (_warmed) return; _warmed = true;
+    try {
+      onProgress && onProgress({ phase: 'warmup', pct: 0 });
+      ensureState(); ensureScratch();
+      const T = 8, ids = []; for (let i = 0; i < T; i++) ids.push(i + 1);   // valid, < vocab
+      await forwardChunk(ids, 0, true);            // compiles every prefill-path pipeline + head
+      await forward(null, T, { chain: true, submitOnly: true });   // decode gemvQ + chained embed
+      await forward(null, T + 1, { chain: true, submitOnly: true });
+      await E.device().queue.onSubmittedWorkDone();   // ensure all compiles + dispatches flushed
+      try { await readU32Range(_tokHist, T + 1, 1); } catch (_) {}   // warm the readback/staging path
+      resetState();   // wipe conv/delta state the dummy run dirtied (KV is overwritten from pos 0 anyway); nulls the snapshot
+      onProgress && onProgress({ phase: 'warmup', pct: 100 });
+    } catch (e) { try { console.warn('[q35] warmup skipped:', (e && e.message) || e); } catch (_) {} }
   }
 
   const PF_BATCH = 16;   // prefill: submit this many forwards before draining (bounds queue depth)
