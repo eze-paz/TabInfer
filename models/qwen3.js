@@ -646,42 +646,47 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // reads), keeping a running max/sum/acc per query (online softmax). Portable (no
   // subgroups). hd ≤ 128. Shared ≈ 25KB.
   const ATTN_QT = 16, ATTN_KT = 8, ATTN_HDMAX = 128, ATTN_WG = 128;   // QT*KT == WG
+  // VEC4 vectorization: the score dot was a single serial f32 accumulator over hd=128
+  // (`dot += a*b`, each add waiting on the last) → ~27% of GPU compute peak (latency/ILP
+  // bound, NOT bandwidth: measured 33 GFLOP/s vs 124 peak, 4 GB/s). Here Q/K/V/O are read
+  // as vec4 and the dot accumulates into a vec4 (4 independent lanes) → 4-wide ILP + 4×
+  // fewer loop iterations. acc/V-accumulation vectorized the same way. Storage stride
+  // HD4 = HDMAX/4; the live loop bound is hd4 = hd/4 (hd is a multiple of 4 for Qwen3).
   const ATTN_WGSL = `
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
-@group(0) @binding(0) var<storage, read>       Q : array<f32>;
-@group(0) @binding(1) var<storage, read>       K : array<f32>;
-@group(0) @binding(2) var<storage, read>       V : array<f32>;
-@group(0) @binding(3) var<storage, read_write> O : array<f32>;
+@group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
 @group(0) @binding(4) var<uniform>             p : P;
-const QT=${ATTN_QT}u; const KT=${ATTN_KT}u; const HDMAX=${ATTN_HDMAX}u; const WG=${ATTN_WG}u;
-var<workgroup> qsh : array<f32, QT*HDMAX>;   // QT queries × hd
-var<workgroup> ksh : array<f32, KT*HDMAX>;   // KT keys × hd (one tile)
-var<workgroup> vsh : array<f32, KT*HDMAX>;
-var<workgroup> acc : array<f32, QT*HDMAX>;   // running output per query
-var<workgroup> scr : array<f32, QT*KT>;      // score/prob tile
-var<workgroup> msh : array<f32, QT>;         // running max
-var<workgroup> lsh : array<f32, QT>;         // running denom
-var<workgroup> csh : array<f32, QT>;         // rescale factor this tile
+const QT=${ATTN_QT}u; const KT=${ATTN_KT}u; const HD4=${ATTN_HDMAX / 4}u; const WG=${ATTN_WG}u;
+var<workgroup> qsh : array<vec4<f32>, QT*HD4>;   // QT queries × hd4
+var<workgroup> ksh : array<vec4<f32>, KT*HD4>;   // KT keys × hd4 (one tile)
+var<workgroup> vsh : array<vec4<f32>, KT*HD4>;
+var<workgroup> acc : array<vec4<f32>, QT*HD4>;   // running output per query
+var<workgroup> scr : array<f32, QT*KT>;          // score/prob tile
+var<workgroup> msh : array<f32, QT>;             // running max
+var<workgroup> lsh : array<f32, QT>;             // running denom
+var<workgroup> csh : array<f32, QT>;             // rescale factor this tile
 @compute @workgroup_size(${ATTN_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
   let tid = lidv.x;
-  let hd = p.hd;
+  let hd4 = p.hd / 4u;
   let nqb = (p.T + QT - 1u)/QT;
   let blk = wg.x + wg.y*nwg.x;
   let hq = blk / nqb;
   if (hq >= p.nHq) { return; }
   let qbase = (blk % nqb) * QT;
   let grp = p.nHq / p.nKv; let hk = hq / grp;
-  let kvstride = p.nKv*hd; let qhstride = p.nHq*hd;
-  let scale = 1.0/sqrt(f32(hd));
-  let lastq = min(qbase + QT, p.T);
-  let qmax = (p.S - p.T) + lastq - 1u;   // highest global key any query in this block attends (causal)
+  let kv4 = (p.nKv*p.hd)/4u; let qhs4 = (p.nHq*p.hd)/4u; let hkoff = hk*hd4; let hqoff = hq*hd4;
+  let scale = 1.0/sqrt(f32(p.hd));
+  let qmax = (p.S - p.T) + min(qbase + QT, p.T) - 1u;   // highest global key any query in this block attends (causal)
   // load Q tile + init acc
   var e = tid;
-  loop { if (e >= QT*hd) { break; }
-    let qi = e/hd; let dd = e%hd; let gq = qbase+qi;
-    qsh[e] = select(0.0, Q[gq*qhstride + hq*hd + dd], gq < p.T);
-    acc[e] = 0.0;
+  loop { if (e >= QT*hd4) { break; }
+    let qi = e/hd4; let d4 = e%hd4; let gq = qbase+qi;
+    qsh[qi*HD4+d4] = select(vec4<f32>(0.0), Q[gq*qhs4 + hqoff + d4], gq < p.T);
+    acc[qi*HD4+d4] = vec4<f32>(0.0);
     e = e + WG;
   }
   if (tid < QT) { msh[tid] = -3.0e38; lsh[tid] = 0.0; }
@@ -690,16 +695,17 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   loop {
     if (k0 >= p.S || k0 > qmax) { break; }     // causal early-exit: skip fully-masked key-tiles
     e = tid;                                   // load K/V tile
-    loop { if (e >= KT*hd) { break; }
-      let kj = e/hd; let dd = e%hd; let gk = k0+kj; let ok = gk < p.S;
-      ksh[e] = select(0.0, K[gk*kvstride + hk*hd + dd], ok);
-      vsh[e] = select(0.0, V[gk*kvstride + hk*hd + dd], ok);
+    loop { if (e >= KT*hd4) { break; }
+      let kj = e/hd4; let d4 = e%hd4; let gk = k0+kj; let ok = gk < p.S;
+      ksh[kj*HD4+d4] = select(vec4<f32>(0.0), K[gk*kv4 + hkoff + d4], ok);
+      vsh[kj*HD4+d4] = select(vec4<f32>(0.0), V[gk*kv4 + hkoff + d4], ok);
       e = e + WG;
     }
     workgroupBarrier();
     { let qi = tid / KT; let kj = tid % KT;    // scores: 1 thread per (qi,kj), QT*KT==WG
-      var dot = 0.0;
-      for (var i=0u;i<hd;i=i+1u){ dot = dot + qsh[qi*hd+i]*ksh[kj*hd+i]; }
+      var s4 = vec4<f32>(0.0);                 // 4 independent accumulator lanes (ILP)
+      for (var i4=0u;i4<hd4;i4=i4+1u){ s4 = s4 + qsh[qi*HD4+i4]*ksh[kj*HD4+i4]; }
+      let dot = s4.x + s4.y + s4.z + s4.w;
       let gq = qbase+qi; let gk = k0+kj; let gqpos = (p.S - p.T) + gq;
       let valid = (gq < p.T) && (gk < p.S) && (gk <= gqpos);
       scr[tid] = select(-3.0e38, dot*scale, valid);
@@ -719,21 +725,21 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
       lsh[qi] = lsh[qi]*corr + sum; msh[qi] = mnew; csh[qi] = corr;
     }
     workgroupBarrier();
-    e = tid;                                   // acc[qi][d] = acc*corr + Σ_kj prob*V
-    loop { if (e >= QT*hd) { break; }
-      let qi = e/hd; let dd = e%hd;
-      var a = acc[e]*csh[qi];
-      for (var kj=0u;kj<KT;kj=kj+1u){ a = a + scr[qi*KT+kj]*vsh[kj*hd+dd]; }
-      acc[e] = a;
+    e = tid;                                   // acc[qi][d4] = acc*corr + Σ_kj prob*V
+    loop { if (e >= QT*hd4) { break; }
+      let qi = e/hd4; let d4 = e%hd4;
+      var a = acc[qi*HD4+d4]*csh[qi];
+      for (var kj=0u;kj<KT;kj=kj+1u){ a = a + scr[qi*KT+kj]*vsh[kj*HD4+d4]; }
+      acc[qi*HD4+d4] = a;
       e = e + WG;
     }
     workgroupBarrier();
     k0 = k0 + KT;
   }
   e = tid;                                     // write O = acc / denom
-  loop { if (e >= QT*hd) { break; }
-    let qi = e/hd; let dd = e%hd; let gq = qbase+qi;
-    if (gq < p.T) { O[gq*qhstride + hq*hd + dd] = acc[e] / lsh[qi]; }
+  loop { if (e >= QT*hd4) { break; }
+    let qi = e/hd4; let d4 = e%hd4; let gq = qbase+qi;
+    if (gq < p.T) { O[gq*qhs4 + hqoff + d4] = acc[qi*HD4+d4] / lsh[qi]; }
     e = e + WG;
   }
 }`;
