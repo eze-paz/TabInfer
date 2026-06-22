@@ -653,10 +653,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // fewer loop iterations. acc/V-accumulation vectorized the same way. Storage stride
   // HD4 = HDMAX/4; the live loop bound is hd4 = hd/4 (hd is a multiple of 4 for Qwen3).
   const ATTN_WGSL = `
+enable f16;
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       K : array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read>       V : array<vec4<f16>>;
 @group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
 @group(0) @binding(4) var<uniform>             p : P;
 const QT=${ATTN_QT}u; const KT=${ATTN_KT}u; const HD4=${ATTN_HDMAX / 4}u; const WG=${ATTN_WG}u;
@@ -697,8 +698,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     e = tid;                                   // load K/V tile
     loop { if (e >= KT*hd4) { break; }
       let kj = e/hd4; let d4 = e%hd4; let gk = k0+kj; let ok = gk < p.S;
-      ksh[kj*HD4+d4] = select(vec4<f32>(0.0), K[gk*kv4 + hkoff + d4], ok);
-      vsh[kj*HD4+d4] = select(vec4<f32>(0.0), V[gk*kv4 + hkoff + d4], ok);
+      ksh[kj*HD4+d4] = select(vec4<f32>(0.0), vec4<f32>(K[gk*kv4 + hkoff + d4]), ok);
+      vsh[kj*HD4+d4] = select(vec4<f32>(0.0), vec4<f32>(V[gk*kv4 + hkoff + d4]), ok);
       e = e + WG;
     }
     workgroupBarrier();
@@ -751,10 +752,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   // PV accumulation (nd dims × ng key-groups, reduced). Query at the last position attends
   // all keys (T=1 ⇒ causal limit = S-1), so no per-key mask.
   const ATTN_DEC_WGSL = `
+enable f16;
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       K : array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read>       V : array<vec4<f16>>;
 @group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
 @group(0) @binding(4) var<uniform>             p : P;
 const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const MAXS=${4096}u;
@@ -777,7 +779,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   var key = lid;                                // scores: each thread strides the keys
   loop { if (key>=S) {break;}
     var s4 = vec4<f32>(0.0);
-    for (var i4=0u;i4<hd4;i4=i4+1u){ s4 = s4 + qd[i4]*K[key*kv4 + hkoff + i4]; }
+    for (var i4=0u;i4<hd4;i4=i4+1u){ s4 = s4 + qd[i4]*vec4<f32>(K[key*kv4 + hkoff + i4]); }
     sc[key] = (s4.x+s4.y+s4.z+s4.w)*scale;
     key = key + DWG;
   }
@@ -794,7 +796,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   let nd = hd4; let ng = DWG / nd;
   let d4 = lid % nd; let g = lid / nd;
   var acc4 = vec4<f32>(0.0);
-  var s = g; loop { if (s>=S) {break;} acc4 = acc4 + sc[s]*V[s*kv4 + hkoff + d4]; s = s + ng; }
+  var s = g; loop { if (s>=S) {break;} acc4 = acc4 + sc[s]*vec4<f32>(V[s*kv4 + hkoff + d4]); s = s + ng; }
   part[lid] = acc4; workgroupBarrier();
   if (lid < nd) {
     var sum4 = vec4<f32>(0.0);
@@ -802,6 +804,28 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     O[hqoff + lid] = sum4 / denom;
   }
 }`;
+  // Cast-copy f32 → f16 into the KV cache. copyBuffer can't convert dtypes, so this
+  // reads vec4<f32> rows of the rope'd K / raw V and writes them as vec4<f16> at a vec4
+  // offset. floatCount/dstFloatOffset are vec4-aligned (nKv*hd = 1024, a multiple of 4).
+  const CASTF16_WGSL = `
+enable f16;
+struct P { off:u32, n:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       src : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> dst : array<vec4<f16>>;
+@group(0) @binding(2) var<uniform>             p   : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i = gid.y*(nwg.x*64u)+gid.x; if(i>=p.n){return;}
+  dst[p.off + i] = vec4<f16>(src[i]);
+}`;
+  function castCopyF16(srcBuf, dstBuf, dstFloatOffset, floatCount) {
+    const pipe = E.getPipeline('q3.castf16', CASTF16_WGSL);
+    const n = floatCount / 4, off = dstFloatOffset / 4;
+    const p = uniform(new Uint32Array([off, n, 0, 0]));
+    const nWG = Math.ceil(n / 64), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [srcBuf, dstBuf, p], [gx, gy, 1]);
+  }
+
   function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
     const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
     if (T === 1) {   // decode: dedicated single-query kernel, one workgroup per head
@@ -972,7 +996,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for(let i=0;i<Q.length;i++)Q[i]=Math.sin(i*0.2);
       for(let i=0;i<Kk.length;i++)Kk[i]=Math.cos(i*0.15);
       for(let i=0;i<Vv.length;i++)Vv[i]=Math.sin(i*0.09+1);
-      const qb=f32buf(Q),kb=f32buf(Kk),vb=f32buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
+      Kk.set(roundF16(Kk)); Vv.set(roundF16(Vv));   // KV cache is f16 — round ref inputs to match
+      const qb=f32buf(Q),kb=f16buf(Kk),vb=f16buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
       await attention(qb,kb,vb,ob,T,S,nHq,nKv,hd);
       const got=await E.readF32(ob,Q.length);
       const y=new Float32Array(Q.length); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
@@ -990,7 +1015,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for(let i=0;i<Q.length;i++)Q[i]=Math.sin(i*0.013);
       for(let i=0;i<Kk.length;i++)Kk[i]=Math.cos(i*0.011);
       for(let i=0;i<Vv.length;i++)Vv[i]=Math.sin(i*0.007+0.5);
-      const qb=f32buf(Q),kb=f32buf(Kk),vb=f32buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
+      Kk.set(roundF16(Kk)); Vv.set(roundF16(Vv));   // KV cache is f16 — round ref inputs to match
+      const qb=f32buf(Q),kb=f16buf(Kk),vb=f16buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
       await attention(qb,kb,vb,ob,T,S,nHq,nKv,hd);
       const got=await E.readF32(ob,Q.length);
       const y=new Float32Array(Q.length); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
@@ -1008,7 +1034,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for(let i=0;i<Q.length;i++)Q[i]=Math.sin(i*0.021);
       for(let i=0;i<Kk.length;i++)Kk[i]=Math.cos(i*0.013);
       for(let i=0;i<Vv.length;i++)Vv[i]=Math.sin(i*0.006+0.3);
-      const qb=f32buf(Q),kb=f32buf(Kk),vb=f32buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
+      Kk.set(roundF16(Kk)); Vv.set(roundF16(Vv));   // KV cache is f16 — round ref inputs to match
+      const qb=f32buf(Q),kb=f16buf(Kk),vb=f16buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
       await attention(qb,kb,vb,ob,T,S,nHq,nKv,hd);   // T=1 → decode kernel
       const got=await E.readF32(ob,Q.length);
       const y=new Float32Array(Q.length); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
@@ -1426,12 +1453,16 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _tokHist = null;   // GPU token history: argmax of pos P writes [P+1]; decode embed at pos P reads [P]. Enables GPU-resident chaining (no per-token CPU readback in the loop).
 
   function scrBuf(n, label) { return E.createBuffer(n * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, label); }
+  // KV cache is f16 (2 bytes/elem): halves the attention K/V read — the dominant cost of
+  // prefill (bandwidth-bound) — and the cache footprint. llama.cpp's flash_attn_vec uses
+  // f16 (or q8_0/q4_0) KV by default. Written via castCopyF16 (copyBuffer can't convert).
+  function kvBuf(n, label) { return E.createBuffer(n * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, label); }
   function ensureKv() {
     if (_kv) return;
     const { numLayers, nKvHeads, headDim } = CONFIG;
     const per = MAX_SEQ * nKvHeads * headDim;
     _kv = [];
-    for (let l = 0; l < numLayers; l++) _kv.push({ k: scrBuf(per, 'k' + l), v: scrBuf(per, 'v' + l) });
+    for (let l = 0; l < numLayers; l++) _kv.push({ k: kvBuf(per, 'k' + l), v: kvBuf(per, 'v' + l) });
     _tokHist = E.createBuffer(MAX_SEQ * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'tokHist');
   }
   function ensureScratch(T) {
@@ -1489,8 +1520,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       // on Intel). Write rope output to a separate buffer.
       await ropeQK(s.q, W(p + 'self_attn.q_norm.weight'), s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
       await ropeQK(s.k, W(p + 'self_attn.k_norm.weight'), s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
-      copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
-      copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
+      castCopyF16(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
+      castCopyF16(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
       await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
       await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
       await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
@@ -1612,7 +1643,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const Vv = new Float32Array(S * nKv * hd); for (let i = 0; i < Vv.length; i++) Vv[i] = Math.sin(i * 0.005);
     const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
     const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'ba'); E.device().queue.writeBuffer(b, 0, a.buffer, 0, a.byteLength); return b; };
-    const qb = mk(Q), kb = mk(Kk), vb = mk(Vv), ob = E.createBuffer(Q.byteLength, UF, 'bo');
+    const qb = mk(Q), kb = f16buf(Kk), vb = f16buf(Vv), ob = E.createBuffer(Q.byteLength, UF, 'bo');   // KV f16
     uniformReset(); await attention(qb, kb, vb, ob, T, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone();
     const t0 = performance.now();
     for (let i = 0; i < iters; i++) { uniformReset(); await attention(qb, kb, vb, ob, T, S, nHq, nKv, hd); }
