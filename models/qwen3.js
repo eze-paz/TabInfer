@@ -446,7 +446,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // so BM can be large with no register blowup → each weight read from VRAM serves BM tokens.
   // Portable: no subgroups / subgroup-matrix → runs on Iris Xe gen-12lp.
   const GEMM_WG_M = 32, GEMM_WG_N = 8, GEMM_TILE_M = 4, GEMM_TILE_N = 4, GEMM_TILE_K = 16;
-  const GEMM_BM = GEMM_WG_M * GEMM_TILE_M;   // 128 tokens/block (more tokens amortize each weight read)
+  const GEMM_BM = GEMM_WG_M * GEMM_TILE_M;   // 128 tokens/block (BM=256 hurt occupancy on Iris Xe; T=256 fills 2 blocks "free")
   const GEMM_BN = GEMM_WG_N * GEMM_TILE_N;   // 32 outputs/block
   const GEMMQ_WGSL = `
 enable f16;
@@ -674,6 +674,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   let grp = p.nHq / p.nKv; let hk = hq / grp;
   let kvstride = p.nKv*hd; let qhstride = p.nHq*hd;
   let scale = 1.0/sqrt(f32(hd));
+  let lastq = min(qbase + QT, p.T);
+  let qmax = (p.S - p.T) + lastq - 1u;   // highest global key any query in this block attends (causal)
   // load Q tile + init acc
   var e = tid;
   loop { if (e >= QT*hd) { break; }
@@ -686,7 +688,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   workgroupBarrier();
   var k0 = 0u;
   loop {
-    if (k0 >= p.S) { break; }
+    if (k0 >= p.S || k0 > qmax) { break; }     // causal early-exit: skip fully-masked key-tiles
     e = tid;                                   // load K/V tile
     loop { if (e >= KT*hd) { break; }
       let kj = e/hd; let dd = e%hd; let gk = k0+kj; let ok = gk < p.S;
@@ -1570,7 +1572,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // global position posBase+t — already proven by decode (T=1,posBase>0) — so KV
     // accumulates correctly across chunks. This does NOT reduce total work (the tiled-GEMM
     // + flash-attn ports do that); it only makes a long prefill safe instead of fatal.
-    const PREFILL_CHUNK = 128;   // == GEMM_BM: each chunk fills one M-block → weights read once per chunk
+    const PREFILL_CHUNK = 256;   // == GEMM_BM: each chunk fills one M-block; engine submit-split keeps TDR safe
     const _tp0 = performance.now();
     const _savedPerf = _PERF; _PERF = true;
     let tok0, _gpuMs = 0, _encMs = 0;

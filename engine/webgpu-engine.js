@@ -279,7 +279,7 @@ const SandpieWebGPU = (function () {
     pass.setBindGroup(0, bindGroup);
     pass.dispatchWorkgroups(workgroups[0] || 1, workgroups[1] || 1, workgroups[2] || 1);
     pass.end();
-    if (_batchEncoder) return Promise.resolve();        // submitted later by endBatch()
+    if (_batchEncoder) { _batchTick(); return Promise.resolve(); }   // flushed in chunks by _batchTick / endBatch
     device().queue.submit([enc.finish()]);
     return (opts && opts.await) ? device().queue.onSubmittedWorkDone() : Promise.resolve();
   }
@@ -288,17 +288,32 @@ const SandpieWebGPU = (function () {
   // beginBatch() → subsequent dispatch()/copyBuffer() append to one encoder;
   // endBatch() submits it and returns the completion promise. ~364 submits/token
   // → 1, eliminating inter-submit GPU idle bubbles (the measured decode wall).
-  let _batchEncoder = null;
-  function beginBatch() { _batchEncoder = device().createCommandEncoder({ label: 'forward' }); }
+  // A whole forward batched into ONE submit can run for seconds on an iGPU and trip
+  // the OS GPU watchdog (Windows TDR → driver reset → PC freeze). _batchTick() flushes
+  // the encoder every _BATCH_FLUSH GPU ops so each submit stays short; buffers persist
+  // and submit order is preserved, so this is correctness-neutral (mirrors llama.cpp's
+  // 64-kernel COMMAND_SUBMIT_BATCH_SIZE). No drain between flushes (would serialize
+  // CPU/GPU) — short command buffers alone let the GPU preempt and dodge the watchdog.
+  let _batchEncoder = null, _batchCount = 0;
+  const _BATCH_FLUSH = 32;
+  function beginBatch() { _batchEncoder = device().createCommandEncoder({ label: 'forward' }); _batchCount = 0; }
+  function _batchTick() {
+    if (!_batchEncoder) return;
+    if (++_batchCount >= _BATCH_FLUSH) {
+      device().queue.submit([_batchEncoder.finish()]);
+      _batchEncoder = device().createCommandEncoder({ label: 'forward' });
+      _batchCount = 0;
+    }
+  }
   function endBatch() {
     if (!_batchEncoder) return Promise.resolve();
-    const enc = _batchEncoder; _batchEncoder = null;
+    const enc = _batchEncoder; _batchEncoder = null; _batchCount = 0;
     device().queue.submit([enc.finish()]);
     return device().queue.onSubmittedWorkDone();
   }
   // Buffer copy that respects batch mode.
   function copyBuffer(src, srcByteOff, dst, dstByteOff, bytes) {
-    if (_batchEncoder) { _batchEncoder.copyBufferToBuffer(src, srcByteOff, dst, dstByteOff, bytes); return; }
+    if (_batchEncoder) { _batchEncoder.copyBufferToBuffer(src, srcByteOff, dst, dstByteOff, bytes); _batchTick(); return; }
     const enc = device().createCommandEncoder();
     enc.copyBufferToBuffer(src, srcByteOff, dst, dstByteOff, bytes);
     device().queue.submit([enc.finish()]);
