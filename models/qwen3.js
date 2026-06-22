@@ -743,9 +743,73 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     e = e + WG;
   }
 }`;
+  // DECODE attention (T==1). The prefill kernel above wastes ~15/16 of its work at T=1
+  // (a QT=16 query block with 1 valid query) → measured 5 GFLOP/s (4% of peak), which is
+  // why long-context decode crawls and the GPU idles. This is the dedicated single-query
+  // path (llama.cpp's flash_attn_vec analogue): ONE workgroup per head, all 128 threads
+  // split the S keys — score via vec4 dot + parallel max/sum reduction, then a 128-thread
+  // PV accumulation (nd dims × ng key-groups, reduced). Query at the last position attends
+  // all keys (T=1 ⇒ causal limit = S-1), so no per-key mask.
+  const ATTN_DEC_WGSL = `
+struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
+@group(0) @binding(4) var<uniform>             p : P;
+const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const MAXS=${4096}u;
+var<workgroup> qd  : array<vec4<f32>, HD4>;   // the single query (hd4 vec4)
+var<workgroup> sc  : array<f32, MAXS>;        // scores / probs per key
+var<workgroup> red : array<f32, DWG>;         // reduction scratch
+var<workgroup> part: array<vec4<f32>, DWG>;   // PV partials
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+  let lid = lidv.x;
+  let hq = wg.x + wg.y*nwg.x;
+  if (hq >= p.nHq) { return; }
+  let hd4 = p.hd/4u;
+  let grp = p.nHq/p.nKv; let hk = hq/grp;
+  let kv4 = (p.nKv*p.hd)/4u; let qhs4 = (p.nHq*p.hd)/4u; let hqoff = hq*hd4; let hkoff = hk*hd4;
+  let scale = 1.0/sqrt(f32(p.hd));
+  let S = p.S;
+  var e = lid; loop { if (e>=hd4) {break;} qd[e] = Q[hqoff + e]; e = e + DWG; }   // query gq=0
+  workgroupBarrier();
+  var key = lid;                                // scores: each thread strides the keys
+  loop { if (key>=S) {break;}
+    var s4 = vec4<f32>(0.0);
+    for (var i4=0u;i4<hd4;i4=i4+1u){ s4 = s4 + qd[i4]*K[key*kv4 + hkoff + i4]; }
+    sc[key] = (s4.x+s4.y+s4.z+s4.w)*scale;
+    key = key + DWG;
+  }
+  workgroupBarrier();
+  var lmax = -3.0e38; key = lid; loop { if(key>=S){break;} lmax = max(lmax, sc[key]); key = key+DWG; }
+  red[lid] = lmax; workgroupBarrier();
+  var st = DWG/2u; loop { if(st==0u){break;} if(lid<st){ red[lid]=max(red[lid],red[lid+st]); } workgroupBarrier(); st=st/2u; }
+  let m = red[0]; workgroupBarrier();
+  var lsum = 0.0; key = lid; loop { if(key>=S){break;} let pe = exp(sc[key]-m); sc[key]=pe; lsum=lsum+pe; key=key+DWG; }
+  red[lid] = lsum; workgroupBarrier();
+  st = DWG/2u; loop { if(st==0u){break;} if(lid<st){ red[lid]=red[lid]+red[lid+st]; } workgroupBarrier(); st=st/2u; }
+  let denom = red[0]; workgroupBarrier();
+  // PV: 128 threads = nd dims × ng key-groups; each accumulates its key subset, then reduce
+  let nd = hd4; let ng = DWG / nd;
+  let d4 = lid % nd; let g = lid / nd;
+  var acc4 = vec4<f32>(0.0);
+  var s = g; loop { if (s>=S) {break;} acc4 = acc4 + sc[s]*V[s*kv4 + hkoff + d4]; s = s + ng; }
+  part[lid] = acc4; workgroupBarrier();
+  if (lid < nd) {
+    var sum4 = vec4<f32>(0.0);
+    for (var gg=0u; gg<ng; gg=gg+1u){ sum4 = sum4 + part[gg*nd + lid]; }
+    O[hqoff + lid] = sum4 / denom;
+  }
+}`;
   function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
-    const pipe = E.getPipeline('q3.attnFlash', ATTN_WGSL);
     const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
+    if (T === 1) {   // decode: dedicated single-query kernel, one workgroup per head
+      const pipe = E.getPipeline('q3.attnDecode', ATTN_DEC_WGSL);
+      const gx = Math.min(nHq, 65535), gy = Math.ceil(nHq / gx);
+      return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
+    }
+    const pipe = E.getPipeline('q3.attnFlash', ATTN_WGSL);
     const blocks = nHq * Math.ceil(T / ATTN_QT);
     const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
     return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
@@ -935,6 +999,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         let den=0;const a=new Float32Array(hd);for(let s=0;s<=last;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)a[i]+=w*Vv[ko+i];}
         for(let i=0;i<hd;i++)y[qo+i]=a[i]/den;}
       check('attentionTiled', maxAbs(got,y), 2e-3);
+      [qb,kb,vb,ob].forEach(b=>b.destroy());
+    }
+    // --- attention decode (T=1 path: routes to the dedicated single-query kernel) ---
+    {
+      const T=1,S=130,nHq=16,nKv=8,hd=128;
+      const Q=new Float32Array(T*nHq*hd),Kk=new Float32Array(S*nKv*hd),Vv=new Float32Array(S*nKv*hd);
+      for(let i=0;i<Q.length;i++)Q[i]=Math.sin(i*0.021);
+      for(let i=0;i<Kk.length;i++)Kk[i]=Math.cos(i*0.013);
+      for(let i=0;i<Vv.length;i++)Vv[i]=Math.sin(i*0.006+0.3);
+      const qb=f32buf(Q),kb=f32buf(Kk),vb=f32buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
+      await attention(qb,kb,vb,ob,T,S,nHq,nKv,hd);   // T=1 → decode kernel
+      const got=await E.readF32(ob,Q.length);
+      const y=new Float32Array(Q.length); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
+      for(let hq=0;hq<nHq;hq++){const hk=Math.floor(hq/grp);const qo=hq*hd;
+        let m=-1e38;for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];d*=scale;if(d>m)m=d;}
+        let den=0;const a=new Float32Array(hd);for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)a[i]+=w*Vv[ko+i];}
+        for(let i=0;i<hd;i++)y[qo+i]=a[i]/den;}
+      check('attentionDecode', maxAbs(got,y), 2e-3);
       [qb,kb,vb,ob].forEach(b=>b.destroy());
     }
     // --- swiglu ---
