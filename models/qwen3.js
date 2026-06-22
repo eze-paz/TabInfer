@@ -1336,7 +1336,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     await loadModel({});
     const L = ids.length;
     if (L >= MAX_SEQ) throw new Error('prompt too long: ' + L + ' tokens >= MAX_SEQ ' + MAX_SEQ);
+    const _tp0 = performance.now();
     const tok0 = await forward(ids, 0);                    // single-submit prefill
+    const _tp1 = performance.now();
     const outIds = []; let pos = L, prevText = '';
     const pushTok = (t) => {
       if (STOP(t)) return false;
@@ -1357,6 +1359,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for (let k = 0; k < K; k++) { if (!pushTok(toks[k]) || outIds.length >= maxTokens) { brk = true; break; } }
       if (brk) break;
     }
+    const _te = performance.now();
+    const _dms = _te - _tp1, _n = outIds.length;
+    console.log('[qwen3 perf] prompt=' + L + ' tok | prefill=' + ((_tp1 - _tp0) / 1000).toFixed(2) + 's (' + (L / ((_tp1 - _tp0) / 1000)).toFixed(0) + ' tok/s) | decode=' + _n + ' tok in ' + (_dms / 1000).toFixed(2) + 's (' + (_n / (_dms / 1000)).toFixed(1) + ' tok/s) | maxTokens=' + maxTokens);
     return prevText;
   }
 
