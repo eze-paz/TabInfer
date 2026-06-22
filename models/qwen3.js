@@ -476,32 +476,6 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
     return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1]);
   }
-  // INT4 embedding gather (the live path). Dequant: w ≈ (nibble-8)*scale, sequential-nibble
-  // layout (column c → bits 4*(c%8) of word c/8) — same packing quantizeInt4Bf16 produces.
-  const EMBEDQ_WGSL = `
-enable f16;
-struct P { T:u32, H:u32, idOff:u32, _b:u32 };
-@group(0) @binding(0) var<storage, read>       ids : array<u32>;
-@group(0) @binding(1) var<storage, read>       W   : array<u32>;     // [vocab*H/8] packed nibbles
-@group(0) @binding(2) var<storage, read>       sc  : array<f16>;     // [vocab*H/QGROUP] scales
-@group(0) @binding(3) var<storage, read_write> y   : array<f32>;
-@group(0) @binding(4) var<uniform>             p   : P;
-@compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>){
-  let idx=gid.x; let total=p.T*p.H; if(idx>=total){return;}
-  let t=idx/p.H; let h=idx%p.H;
-  let id=ids[p.idOff + t];
-  let words=p.H/8u; let gpr=p.H/${QGROUP}u;
-  let word=W[id*words + h/8u];
-  let nib=(word >> (4u*(h%8u))) & 0xFu;
-  let s=f32(sc[id*gpr + h/${QGROUP}u]);
-  y[idx]=(f32(nib)-8.0)*s;
-}`;
-  function embedGatherQ(idsBuf, packBuf, scBuf, yBuf, T, H, idOff) {
-    const pipe = E.getPipeline('q3.embedQ', EMBEDQ_WGSL);
-    const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
-    return E.dispatch(pipe, [idsBuf, packBuf, scBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1]);
-  }
 
   // ============================================================
   // Kernel 4 — RoPE + per-head QK-norm (fused), for one tensor (q or k).
@@ -874,20 +848,6 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       check('gemvQ', maxAbs(got,y), 1e-2);
       [xb,pb,sb,yb].forEach(b=>b.destroy());
     }
-    // --- embedGatherQ (int4 embed gather) vs CPU dequant — the Adreno embed fix ---
-    {
-      const V=40,H=64,T=4;
-      const Ef=new Float32Array(V*H); for(let i=0;i<Ef.length;i++)Ef[i]=Math.sin(i*0.02);
-      const {pack,scales}=quantizeInt4Bf16(f32ToBf16(Ef),V,H);
-      const Edq=dequantInt4(pack,scales,V,H);
-      const ids=new Uint32Array([3,0,39,7]);
-      const ib=u32buf(ids),pb=qbuf(pack),sb=sbuf(scales),yb=E.createBuffer(T*H*4,ST(),'y');
-      await embedGatherQ(ib,pb,sb,yb,T,H,0);
-      const got=await E.readF32(yb,T*H); const y=new Float32Array(T*H);
-      for(let t=0;t<T;t++)for(let h=0;h<H;h++)y[t*H+h]=Edq[ids[t]*H+h];
-      check('embedGatherQ', maxAbs(got,y), 1e-2);
-      [ib,pb,sb,yb].forEach(b=>b.destroy());
-    }
     // --- matvecQ (int4 batched) vs CPU dequant ---
     {
       const T=5,N=96,K=128;
@@ -1131,10 +1091,6 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     return { pack, scales };
   }
-  // NOTE: embed_tokens stays f16 here. Quantizing it to int4 in-browser EVERY load costs ~3min
-  // (155M elems, no quant cache) — reverted. The phone needs an int4 embed (f16 311MB binding
-  // exceeds Adreno's maxStorageBufferBindingSize → silent zeros → all-"!"), but the right fix is
-  // an OPFS quant cache (quantize once) — not re-quantizing on every load. See chat.
   const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight';
 
   async function fetchModelBytes(onProgress) {
@@ -1275,7 +1231,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const embOff = chain ? posBase : 0;
     uniformReset();   // pooled uniforms get stable buffers per call-site → bind-group cache hits
     E.beginBatch();   // record the whole forward into ONE command buffer (1 submit vs ~364)
-    await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);   // f16 embed (works on big-limit GPUs; Adreno needs int4+quant-cache — see isQuantWeight note)
+    await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
