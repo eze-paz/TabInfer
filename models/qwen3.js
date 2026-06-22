@@ -29,14 +29,6 @@ const SandpieQwen3 = (function () {
     ropeTheta: 1000000, rmsEps: 1e-6,
     tieEmbeddings: true,
   };
-  // DENSE Qwen3 variants. Same architecture (Qwen3ForCausalLM: standard GQA self-attn, no
-  // DeltaNet) — only hidden/intermediate differ, so the existing forward runs both. These are
-  // the FAST-PREFILL alternative to the hybrid Qwen3.5 (no serial scan → fully parallel prefill).
-  const VARIANTS = {
-    '0.6B': { hidden: 1024, intermediate: 3072, repo: 'Qwen/Qwen3-0.6B' },
-    '1.7B': { hidden: 2048, intermediate: 6144, repo: 'Qwen/Qwen3-1.7B' },
-  };
-  let _variant = '0.6B';
 
   const U = GPUBufferUsage;
   const ST = () => (U.STORAGE | U.COPY_DST | U.COPY_SRC);
@@ -137,7 +129,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
   // stride K and reduce. 2D workgroup grid because N (151936 for lm_head)
   // exceeds the 65535 per-dimension dispatch limit.
   // Vectorized + subgroup-reduced + N_ROWS reuse. Reads weights as vec4<f16> and
-  // x as vec4<f32> (4 elems/load), reduces partials with a shared-mem tree reduce, and each
+  // x as vec4<f32> (4 elems/load), reduces partials with subgroupAdd, and each
   // workgroup computes GEMV_NR output rows — the activation chunk x[c] is read ONCE
   // and reused across all NR rows (fewer workgroups, the activation read amortized
   // NR×). Requires K % 4 == 0 (all Qwen3 matrices). N need not divide NR (row<N
@@ -146,6 +138,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
   const GEMV_NR = 4;   // output rows per workgroup
   const GEMV_WGSL = `
 enable f16;
+enable subgroups;
 struct D { N:u32, K:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       x : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       W : array<vec4<f16>>;
@@ -154,7 +147,8 @@ struct D { N:u32, K:u32, _a:u32, _b:u32 };
 var<workgroup> part : array<f32, ${GEMV_NR * GEMV_WG}>;   // part[r*WG + subgroupIdx]
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GEMV_NR}u;
   if (rowBase >= d.N) { return; }
   let K4 = d.K / 4u;
@@ -169,19 +163,21 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     c = c + ${GEMV_WG}u;
   }
-  // Portable shared-mem tree reduction (NO subgroups — Adreno-safe).
-  for (var r:u32=0u; r<${GEMV_NR}u; r=r+1u) { part[r*${GEMV_WG}u + lid.x] = acc[r]; }
-  workgroupBarrier();
-  var stride = ${GEMV_WG}u / 2u;
-  loop {
-    if (stride == 0u) { break; }
-    if (lid.x < stride) { for (var r:u32=0u; r<${GEMV_NR}u; r=r+1u) { part[r*${GEMV_WG}u + lid.x] = part[r*${GEMV_WG}u + lid.x] + part[r*${GEMV_WG}u + lid.x + stride]; } }
-    workgroupBarrier();
-    stride = stride / 2u;
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GEMV_NR}u; r=r+1u) {
+    let ssum = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ssum; }
   }
+  workgroupBarrier();
+  // NR threads each finalize one row.
   if (lid.x < ${GEMV_NR}u) {
     let row = rowBase + lid.x;
-    if (row < d.N) { y[row] = part[lid.x*${GEMV_WG}u]; }
+    if (row < d.N) {
+      let nsg = (${GEMV_WG}u + sgs - 1u) / sgs;
+      var tot : f32 = 0.0;
+      for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[lid.x*${GEMV_WG}u + i]; }
+      y[row] = tot;
+    }
   }
 }`;
   function gemv(xBuf, wBuf, yBuf, N, K) {
@@ -194,13 +190,14 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // ----- Batched matvec for small T (prefill / speculative verify) -----
   // y[T,N] = x[T,K]·W[N,K]ᵀ. One workgroup per output row n; each WEIGHT row is
   // read ONCE and reused across all T tokens (the T-analog of N_ROWS) → a T-token
-  // forward reads the weights once, like decode. vec4 loads + shared-mem tree reduce. The old
+  // forward reads the weights once, like decode. vec4 loads + subgroupAdd. The old
   // tiled GEMM read weights per 16-tile and was ~3.7× slower at T=8 (measured).
   // Handles T ≤ MATVEC_MAXT in one dispatch; K % 4 == 0.
   const MATVEC_WG = 64;
   const MATVEC_MAXT = 16;
   const MATVEC_WGSL = `
 enable f16;
+enable subgroups;
 struct D { T:u32, N:u32, K:u32, _p:u32 };
 @group(0) @binding(0) var<storage, read>       x : array<vec4<f32>>;   // [T, K/4]
 @group(0) @binding(1) var<storage, read>       W : array<vec4<f16>>;   // [N, K/4]
@@ -209,7 +206,8 @@ struct D { T:u32, N:u32, K:u32, _p:u32 };
 var<workgroup> part : array<f32, ${MATVEC_MAXT * MATVEC_WG}>;  // part[t*WG + subgroupIdx]
 @compute @workgroup_size(${MATVEC_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
   let n = wg.x + wg.y * nwg.x;
   if (n >= d.N) { return; }
   let K4 = d.K / 4u; let wbase = n*K4; let T = d.T;
@@ -222,19 +220,17 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     for (var t:u32=0u; t<T; t=t+1u) { acc[t] = acc[t] + dot(x[t*K4 + c], wv); }
     c = c + ${MATVEC_WG}u;
   }
-  // Portable shared-mem tree reduction (NO subgroups — Adreno-safe).
-  for (var t:u32=0u; t<T; t=t+1u) { part[t*${MATVEC_WG}u + lid.x] = acc[t]; }
-  workgroupBarrier();
-  var stride = ${MATVEC_WG}u / 2u;
-  loop {
-    if (stride == 0u) { break; }
-    if (lid.x < stride) { for (var t:u32=0u; t<T; t=t+1u) { part[t*${MATVEC_WG}u + lid.x] = part[t*${MATVEC_WG}u + lid.x] + part[t*${MATVEC_WG}u + lid.x + stride]; } }
-    workgroupBarrier();
-    stride = stride / 2u;
+  let sgIdx = lid.x / sgs;
+  for (var t:u32=0u; t<T; t=t+1u) {
+    let s = subgroupAdd(acc[t]);
+    if (sgi == 0u) { part[t*${MATVEC_WG}u + sgIdx] = s; }
   }
+  workgroupBarrier();
   if (lid.x < T) {
-    let t = lid.x;
-    y[t*d.N + n] = part[t*${MATVEC_WG}u];
+    let t = lid.x; let nsg = (${MATVEC_WG}u + sgs - 1u) / sgs;
+    var tot : f32 = 0.0;
+    for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[t*${MATVEC_WG}u + i]; }
+    y[t*d.N + n] = tot;
   }
 }`;
   function matvecT(xBuf, wBuf, yBuf, T, N, K) {
@@ -257,6 +253,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const GEMVQ_NR = 8;
   const GEMVQ_WGSL = `
 enable f16;
+enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused residual)
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [K/4]
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles
@@ -266,7 +263,8 @@ struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused
 var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GEMVQ_NR}u;
   if (rowBase >= d.N) { return; }
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
@@ -287,19 +285,19 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  // Portable shared-mem tree reduction (NO subgroups — Adreno computes subgroupAdd wrong → all "!").
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { part[r*${GEMV_WG}u + lid.x] = acc[r]; }
-  workgroupBarrier();
-  var stride = ${GEMV_WG}u / 2u;
-  loop {
-    if (stride == 0u) { break; }
-    if (lid.x < stride) { for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { part[r*${GEMV_WG}u + lid.x] = part[r*${GEMV_WG}u + lid.x] + part[r*${GEMV_WG}u + lid.x + stride]; } }
-    workgroupBarrier();
-    stride = stride / 2u;
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+    let ss = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
   }
+  workgroupBarrier();
   if (lid.x < ${GEMVQ_NR}u) {
     let row = rowBase + lid.x;
-    if (row < d.N) { y[row] = select(0.0, y[row], d.acc != 0u) + part[lid.x*${GEMV_WG}u]; }
+    if (row < d.N) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
+      y[row] = select(0.0, y[row], d.acc != 0u) + t;
+    }
   }
 }`;
   function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
@@ -317,6 +315,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const GUSQ_NR = 4;
   const GATEUPQ_WGSL = `
 enable f16;
+enable subgroups;
 struct D { I:u32, H:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [H/4]
 @group(0) @binding(1) var<storage, read>       gW : array<u32>;
@@ -329,7 +328,8 @@ var<workgroup> pg : array<f32, ${GUSQ_NR * GEMV_WG}>;
 var<workgroup> pu : array<f32, ${GUSQ_NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GUSQ_NR}u;
   if (rowBase >= d.I) { return; }
   let words = d.H / 8u; let gpr = d.H / ${QGROUP}u;
@@ -353,20 +353,17 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  // Portable shared-mem tree reduction (NO subgroups — Adreno-safe).
-  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) { pg[r*${GEMV_WG}u + lid.x] = ga[r]; pu[r*${GEMV_WG}u + lid.x] = ua[r]; }
-  workgroupBarrier();
-  var stride = ${GEMV_WG}u / 2u;
-  loop {
-    if (stride == 0u) { break; }
-    if (lid.x < stride) { for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) { pg[r*${GEMV_WG}u + lid.x] = pg[r*${GEMV_WG}u + lid.x] + pg[r*${GEMV_WG}u + lid.x + stride]; pu[r*${GEMV_WG}u + lid.x] = pu[r*${GEMV_WG}u + lid.x] + pu[r*${GEMV_WG}u + lid.x + stride]; } }
-    workgroupBarrier();
-    stride = stride / 2u;
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
+    let g = subgroupAdd(ga[r]); let u = subgroupAdd(ua[r]);
+    if (sgi == 0u) { pg[r*${GEMV_WG}u + sgIdx] = g; pu[r*${GEMV_WG}u + sgIdx] = u; }
   }
+  workgroupBarrier();
   if (lid.x < ${GUSQ_NR}u) {
     let row = rowBase + lid.x;
     if (row < d.I) {
-      let g = pg[lid.x*${GEMV_WG}u]; let u = pu[lid.x*${GEMV_WG}u];
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var g:f32=0.0; var u:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ g=g+pg[lid.x*${GEMV_WG}u+i]; u=u+pu[lid.x*${GEMV_WG}u+i]; }
       let silu = g / (1.0 + exp(-g));
       swi[row] = silu * u;
     }
@@ -383,6 +380,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
   const MATVECQ_WGSL = `
 enable f16;
+enable subgroups;
 struct D { T:u32, N:u32, K:u32, tBase:u32, acc:u32, _p0:u32, _p1:u32, _p2:u32 };  // acc=1 → y += result
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [(tBase+t)*K/4 + ...]
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;
@@ -392,7 +390,8 @@ struct D { T:u32, N:u32, K:u32, tBase:u32, acc:u32, _p0:u32, _p1:u32, _p2:u32 };
 var<workgroup> part : array<f32, ${MATVEC_MAXT * MATVEC_WG}>;
 @compute @workgroup_size(${MATVEC_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>) {
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
   let n = wg.x + wg.y * nwg.x;
   if (n >= d.N) { return; }
   let words = d.K / 8u; let wbase = n*words;
@@ -414,20 +413,17 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${MATVEC_WG}u;
   }
-  // Portable shared-mem tree reduction (NO subgroups — Adreno-safe).
-  for (var t:u32=0u; t<T; t=t+1u) { part[t*${MATVEC_WG}u + lid.x] = acc[t]; }
-  workgroupBarrier();
-  var stride = ${MATVEC_WG}u / 2u;
-  loop {
-    if (stride == 0u) { break; }
-    if (lid.x < stride) { for (var t:u32=0u; t<T; t=t+1u) { part[t*${MATVEC_WG}u + lid.x] = part[t*${MATVEC_WG}u + lid.x] + part[t*${MATVEC_WG}u + lid.x + stride]; } }
-    workgroupBarrier();
-    stride = stride / 2u;
+  let sgIdx = lid.x / sgs;
+  for (var t:u32=0u; t<T; t=t+1u) {
+    let ssum = subgroupAdd(acc[t]);
+    if (sgi == 0u) { part[t*${MATVEC_WG}u + sgIdx] = ssum; }
   }
+  workgroupBarrier();
   if (lid.x < T) {
-    let t = lid.x;
+    let t = lid.x; let nsg=(${MATVEC_WG}u+sgs-1u)/sgs; var tot:f32=0.0;
+    for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[t*${MATVEC_WG}u + i]; }
     let idx = (d.tBase + t)*d.N + n;
-    y[idx] = select(0.0, y[idx], d.acc != 0u) + part[t*${MATVEC_WG}u];
+    y[idx] = select(0.0, y[idx], d.acc != 0u) + tot;
   }
 }`;
   function matvecQ(xBuf, packBuf, scBuf, yBuf, T, N, K, tBase, acc) {
@@ -1003,21 +999,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Kernels read array<f16> and convert to f32 for the math (activations stay f32).
   // bf16→f16 goes via f32 (different exponent widths). Cached in Cache Storage.
   // ============================================================
-  let MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/';
+  const MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/';
   const CACHE_NAME = 'sandpie-webgpu-models';
   let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
-  // Switch dense variant: mutate CONFIG dims + repo. Frees the old model if a different variant
-  // was loaded (single active model). Same arch (layers/heads/headDim/vocab) — only hidden/inter.
-  function selectModel(v) {
-    if (!VARIANTS[v]) throw new Error('unknown dense variant ' + v);
-    if (v === _variant && _loaded) return;
-    if (_loaded) { try { unload(); } catch (_) { _loaded = false; _weights = null; } }
-    _variant = v;
-    CONFIG.hidden = VARIANTS[v].hidden;
-    CONFIG.intermediate = VARIANTS[v].intermediate;
-    MODEL_ROOT = 'https://huggingface.co/' + VARIANTS[v].repo + '/resolve/main/';
-  }
 
   // f32 → f16 bits (round-to-nearest), handling normals, subnormals, overflow.
   const _f32a = new Float32Array(1), _u32a = new Uint32Array(_f32a.buffer);
@@ -1110,8 +1095,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return out.buffer;
   }
 
-  async function loadModel({ onProgress, variant } = {}) {
-    if (variant) selectModel(variant);
+  async function loadModel({ onProgress } = {}) {
     if (_loaded) return;
     await E.init();
     await TOK.load(MODEL_ROOT);
@@ -1171,7 +1155,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // ============================================================
   // Forward graph + KV cache + generate
   // ============================================================
-  const MAX_SEQ = 4096;   // must hold the prompt (system + ~2.5k-tok tool preamble) + generation
+  const MAX_SEQ = 4096;
   let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
   let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
   let _scr = null;    // scratch buffers, sized to _scrT rows
@@ -1335,39 +1319,33 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return TOK.decode(outIds);
   }
 
-  // Free the model (the big memory) so the single-active-local invariant holds when the app
-  // switches to the hybrid engine or another variant. ensureKv/ensureScratch/loadModel rebuild.
+  // ============================================================
+  // App host contract — minimal shim over the fast subgroup generate().
+  // (Ported from the dense app build; runs the stale single-submit-prefill +
+  //  GEN_BATCH decode path, which uses subgroupAdd → fast on Iris Xe.)
+  // ============================================================
   function unload() {
-    try { for (const k in (_weights || {})) { const w = _weights[k]; try { (w.buf || w.pack)?.destroy(); w.scales?.destroy(); } catch (_) {} } } catch (_) {}
-    _weights = null; _loaded = false; _kv = null; _scr = null;
-  }
-  async function clearCache() {
-    try { if (typeof caches !== 'undefined') await caches.delete(CACHE_NAME); return true; } catch (_) { return false; }
+    try { if (_weights) for (const k in _weights) { const b = _weights[k] && _weights[k].buf; if (b && b.destroy) try { b.destroy(); } catch (_) {} } } catch (_) {}
+    try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
+    _weights = null; _kv = null; _scr = null; _loaded = false;
   }
 
-  // ============================================================
-  // App host contract — chunked prefill + streaming + the emit protocol conversations.js expects.
-  // SINGLE round (no agentic tool loop yet): tools are rendered into the system prompt so the
-  // PREFILL size matches the real app (the point of the dense test), and the response streams.
-  // No DeltaNet → prefill is fully parallel batched GEMM+attention (the fast path we're testing).
-  // ============================================================
-  const PCHUNK = () => (CONFIG.hidden >= 2048 ? 128 : 256);   // tokens per prefill submit (watchdog-safe; dense is fast)
+  // Stream from pre-encoded ids (same prefill+decode as generate(), but the
+  // caller supplies the full chat token sequence and gets clean UTF-8 deltas).
   async function _streamIds(ids, { maxTokens = 512, onToken, signal } = {}) {
+    await loadModel({});
     const L = ids.length;
-    if (L >= MAX_SEQ) throw new Error('prompt is ' + L + ' tokens but the dense WebGPU context is ' + MAX_SEQ + ' — shorten the conversation.');
-    // Chunked prefill: each forward(chunk, posBase) appends to the KV cache (posBase grows). The
-    // last chunk's argmax lands in _tokHist[L] = the first generated token. Bounds each submit
-    // under the GPU watchdog. (Dense per-token cost is low, so chunks can be large.)
-    const CH = PCHUNK(); let tok = 0;
-    for (let c = 0; c < L;) {
-      if (signal && signal.aborted) return [];
-      const end = Math.min(c + CH, L);
-      tok = await forward(ids.slice(c, end), c);
-      c = end;
-    }
-    const outIds = []; let pos = L;
-    const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
-    if (!emit(tok)) return outIds;
+    if (L >= MAX_SEQ) throw new Error('prompt too long: ' + L + ' tokens >= MAX_SEQ ' + MAX_SEQ);
+    const tok0 = await forward(ids, 0);                    // single-submit prefill
+    const outIds = []; let pos = L, prevText = '';
+    const pushTok = (t) => {
+      if (STOP(t)) return false;
+      outIds.push(t);
+      const txt = TOK.decode(outIds);                       // decode full seq → byte-accurate UTF-8
+      if (onToken && txt.length > prevText.length) { try { onToken(txt.slice(prevText.length)); } catch (_) {} }
+      prevText = txt; return true;
+    };
+    if (!pushTok(tok0)) return prevText;
     while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
       if (signal && signal.aborted) break;
       const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
@@ -1375,11 +1353,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
       const toks = await readU32Range(_tokHist, pos + 1, K);
       pos += K;
-      let brk = false; for (let k = 0; k < K; k++) { if (!emit(toks[k])) { brk = true; break; } }
+      let brk = false;
+      for (let k = 0; k < K; k++) { if (!pushTok(toks[k]) || outIds.length >= maxTokens) { brk = true; break; } }
       if (brk) break;
     }
-    return outIds;
+    return prevText;
   }
+
   function toolPreamble(tools) {
     const fns = (tools || []).filter(t => t && t.type === 'function').map(t => t.function).filter(Boolean);
     if (!fns.length) return '';
@@ -1387,14 +1367,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return ['You can call a tool by emitting a line: <tool_call>{"name":"...","arguments":{...}}</tool_call>', 'Available tools:', specs].join('\n');
   }
   const _cleanContent = (t) => (t || '').replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
-  // DENSE Qwen3 — fast-prefill in-browser model. Single-round streaming (see header note).
+
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
-    const variant = (provider && provider.endpoint) || '0.6B';
     const maxTokens = (provider && (provider.maxTokens | 0)) || 512;
     try {
-      emit({ type: 'info', message: 'Loading Qwen3 ' + variant + ' dense (WebGPU)… first run downloads the weights.' });
+      emit({ type: 'info', message: 'Loading Qwen3-0.6B dense (WebGPU)… first run downloads the weights.' });
       let lastPct = -1;
-      await loadModel({ variant, onProgress: (p) => {
+      await loadModel({ onProgress: (p) => {
         if (!p) return;
         if (p.phase === 'download') { const pct = p.pct | 0; if (pct === lastPct) return; lastPct = pct; emit({ type: 'info', message: 'Downloading… ' + pct + '%' + (p.recv ? ' (' + (p.recv / 1e9).toFixed(2) + 'GB)' : '') }); }
         else if (p.phase === 'parse') emit({ type: 'info', message: 'Preparing weights… ' + (p.pct || 0) + '%' });
@@ -1437,8 +1416,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     emit({ type: 'agent_done' });
   }
   const DEFAULT_MODELS = [
-    { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (fast prefill, ~0.4GB int4)' },
-    { id: 'qwen3-1.7b', modelId: '1.7B', label: 'Qwen3-1.7B dense (fast prefill, ~1GB int4)' },
+    { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (fast subgroup build)' },
   ];
   const DEFAULT_N_CTX = MAX_SEQ;
 
@@ -1447,8 +1425,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
-    selectModel, unload, clearCache, variant: () => _variant, VARIANTS,
-    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX,
+    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
