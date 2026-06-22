@@ -438,14 +438,102 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
   }
 
+  // ---- INT4 tiled GEMM (prefill): Y[T,N] = X[T,K]·dequant(W)[N,K]ᵀ ----
+  // Ported from llama.cpp ggml-webgpu mul_mat_reg_tile. A workgroup owns a BM×BN output
+  // block; the weight tile for its BN columns is dequantized int4→f32 into shared memory
+  // ONCE per K-tile and reused across ALL BM tokens. Unlike matvecQ (acc[MAXT] registers
+  // cap tokens-per-weight-read at ~32), here each thread holds only TILE_M×TILE_N outputs,
+  // so BM can be large with no register blowup → each weight read from VRAM serves BM tokens.
+  // Portable: no subgroups / subgroup-matrix → runs on Iris Xe gen-12lp.
+  const GEMM_WG_M = 16, GEMM_WG_N = 8, GEMM_TILE_M = 4, GEMM_TILE_N = 4, GEMM_TILE_K = 16;
+  const GEMM_BM = GEMM_WG_M * GEMM_TILE_M;   // 64 tokens/block
+  const GEMM_BN = GEMM_WG_N * GEMM_TILE_N;   // 32 outputs/block
+  const GEMMQ_WGSL = `
+enable f16;
+struct D { T:u32, N:u32, K:u32, acc:u32, _p0:u32, _p1:u32, _p2:u32, _p3:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<f32>;   // [T,K]
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // int4 packed, words=K/8 per row
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;   // scales, gpr=K/${QGROUP} per row
+@group(0) @binding(3) var<storage, read_write> y  : array<f32>;   // [T,N]
+@group(0) @binding(4) var<uniform>             d  : D;
+const WG_M=${GEMM_WG_M}u; const WG_N=${GEMM_WG_N}u; const TILE_M=${GEMM_TILE_M}u; const TILE_N=${GEMM_TILE_N}u; const TILE_K=${GEMM_TILE_K}u;
+const BM=WG_M*TILE_M; const BN=WG_N*TILE_N; const NTHREAD=WG_M*WG_N;
+var<workgroup> xs : array<f32, BM*TILE_K>;
+var<workgroup> ws : array<f32, BN*TILE_K>;
+@compute @workgroup_size(${GEMM_WG_M * GEMM_WG_N},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+  let tid = lidv.x;
+  let nBlkN = (d.N + BN - 1u)/BN;
+  let blk = wg.x + wg.y*nwg.x;
+  let blockM = (blk / nBlkN) * BM;
+  let blockN = (blk % nBlkN) * BN;
+  let lm = tid / WG_N; let ln = tid % WG_N;
+  let words = d.K/8u; let gpr = d.K/${QGROUP}u;
+  var acc : array<array<f32,TILE_N>,TILE_M>;
+  for (var i=0u;i<TILE_M;i=i+1u){ for(var j=0u;j<TILE_N;j=j+1u){ acc[i][j]=0.0; } }
+  var k0=0u;
+  loop {
+    if (k0 >= d.K) { break; }
+    var e = tid;
+    loop { if (e >= BM*TILE_K) { break; }                 // load X tile [BM,TILE_K]
+      let r = e / TILE_K; let c = e % TILE_K;
+      let gm = blockM + r; let gk = k0 + c;
+      xs[e] = select(0.0, x[gm*d.K + gk], gm < d.T && gk < d.K);
+      e = e + NTHREAD;
+    }
+    e = tid;
+    loop { if (e >= BN*TILE_K) { break; }                 // load + dequant W tile [BN,TILE_K]
+      let r = e / TILE_K; let c = e % TILE_K;
+      let gn = blockN + r; let gk = k0 + c;
+      var v = 0.0;
+      if (gn < d.N && gk < d.K) {
+        let nib = (W[gn*words + (gk>>3u)] >> (4u*(gk & 7u))) & 0xFu;
+        v = (f32(nib) - 8.0) * f32(sc[gn*gpr + gk/${QGROUP}u]);
+      }
+      ws[e] = v;
+      e = e + NTHREAD;
+    }
+    workgroupBarrier();
+    let kEnd = min(TILE_K, d.K - k0);
+    var kk=0u;
+    loop { if (kk >= kEnd) { break; }
+      var xr : array<f32,TILE_M>;
+      for (var i=0u;i<TILE_M;i=i+1u){ xr[i] = xs[(lm*TILE_M+i)*TILE_K + kk]; }
+      for (var j=0u;j<TILE_N;j=j+1u){
+        let wv = ws[(ln*TILE_N+j)*TILE_K + kk];
+        for (var i=0u;i<TILE_M;i=i+1u){ acc[i][j] = acc[i][j] + xr[i]*wv; }
+      }
+      kk = kk + 1u;
+    }
+    workgroupBarrier();
+    k0 = k0 + TILE_K;
+  }
+  for (var i=0u;i<TILE_M;i=i+1u){
+    let gm = blockM + lm*TILE_M + i;
+    if (gm < d.T) {
+      for (var j=0u;j<TILE_N;j=j+1u){
+        let gn = blockN + ln*TILE_N + j;
+        if (gn < d.N) {
+          let idx = gm*d.N + gn;
+          y[idx] = select(0.0, y[idx], d.acc != 0u) + acc[i][j];
+        }
+      }
+    }
+  }
+}`;
+  function gemmQ(xBuf, wrec, yBuf, T, N, K, acc) {
+    const pipe = E.getPipeline('q3.gemmQ', GEMMQ_WGSL);
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0, 0, 0, 0, 0]));
+    const blocks = Math.ceil(T / GEMM_BM) * Math.ceil(N / GEMM_BN);
+    const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
+    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [gx, gy, 1]);
+  }
+
   // Router for the int4 weight path. wrec = { pack, scales, N, K }. acc=true →
   // y += result (fused residual add, saves a separate addInPlace pass).
   async function linearQ(xBuf, wrec, yBuf, T, N, K, acc) {
     if (T === 1) return gemvQ(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
-    for (let t0 = 0; t0 < T; t0 += MATVEC_MAXT) {
-      const tc = Math.min(MATVEC_MAXT, T - t0);
-      await matvecQ(xBuf, wrec.pack, wrec.scales, yBuf, tc, N, K, t0, acc);
-    }
+    return gemmQ(xBuf, wrec, yBuf, T, N, K, acc);   // prefill → tiled GEMM (weights read once per BM tokens)
   }
 
   // (f16 path below — gemv/matvecT/linearT — retained for the f16 self-tests; the
@@ -865,6 +953,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const got=await E.readF32(yb,T*N); const y=new Float32Array(T*N);
       for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*Wdq[n*K+k];y[t*N+n]=a;}
       check('matvecQ', maxAbs(got,y), 1e-2);
+      [xb,pb,sb,yb].forEach(b=>b.destroy());
+    }
+    // --- gemmQ (int4 tiled GEMM, prefill) vs CPU dequant ---
+    {
+      const T=70,N=96,K=128;   // T>BM(64) and N>BN(32) → multi-block + tail rows
+      const x=new Float32Array(T*K),Wf=new Float32Array(N*K);
+      for(let i=0;i<x.length;i++)x[i]=Math.sin(i*0.05);
+      for(let i=0;i<Wf.length;i++)Wf[i]=Math.cos(i*0.017);
+      const {pack,scales}=quantizeInt4Bf16(f32ToBf16(Wf),N,K);
+      const Wdq=dequantInt4(pack,scales,N,K);
+      const xb=f32buf(x),pb=qbuf(pack),sb=sbuf(scales),yb=E.createBuffer(T*N*4,ST(),'y');
+      await gemmQ(xb,{pack:pb,scales:sb},yb,T,N,K);
+      const got=await E.readF32(yb,T*N); const y=new Float32Array(T*N);
+      for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*Wdq[n*K+k];y[t*N+n]=a;}
+      check('gemmQ', maxAbs(got,y), 1e-2);
       [xb,pb,sb,yb].forEach(b=>b.destroy());
     }
     // --- gateUpSiluQ (fused int4 gate+up+silu, T=1) vs CPU dequant ---
@@ -1327,6 +1430,30 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return TOK.decode(outIds);
   }
 
+  // Debug bench (no model load): time the tiled gemmQ vs the old matvecQ tile-loop at a
+  // realistic projection size, to confirm the GEMM actually speeds up prefill.
+  async function _benchMatmul({ T = 256, N = 3072, K = 1024, iters = 4 } = {}) {
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); scales.fill(0x3c00);   // bf16 ≈ 1.0
+    const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.01);
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bench'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), yb = E.createBuffer(T * N * 4, UF, 'ybench');
+    const wrec = { pack: pb, scales: sb };
+    const time = async (fn) => {
+      uniformReset(); await fn(); await E.device().queue.onSubmittedWorkDone();   // warm
+      const t0 = performance.now();
+      for (let i = 0; i < iters; i++) { uniformReset(); await fn(); }
+      await E.device().queue.onSubmittedWorkDone();
+      return (performance.now() - t0) / iters;
+    };
+    const gemm_ms = await time(() => gemmQ(xb, wrec, yb, T, N, K));
+    const matvec_ms = await time(async () => { for (let t0 = 0; t0 < T; t0 += MATVEC_MAXT) await matvecQ(xb, pb, sb, yb, Math.min(MATVEC_MAXT, T - t0), N, K, t0); });
+    [xb, pb, sb, yb].forEach(b => b.destroy());
+    return { T, N, K, iters, gemm_ms: +gemm_ms.toFixed(2), matvec_ms: +matvec_ms.toFixed(2), speedup: +(matvec_ms / gemm_ms).toFixed(2) };
+  }
+
   // ============================================================
   // App host contract — minimal shim over the fast subgroup generate().
   // (Ported from the dense app build; runs the stale single-submit-prefill +
@@ -1470,7 +1597,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
-    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload,
+    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
