@@ -194,7 +194,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // tiled GEMM read weights per 16-tile and was ~3.7× slower at T=8 (measured).
   // Handles T ≤ MATVEC_MAXT in one dispatch; K % 4 == 0.
   const MATVEC_WG = 64;
-  const MATVEC_MAXT = 16;
+  // Tokens per matvecQ dispatch. linearQ loops ceil(T/MAXT) tiles and RE-READS the
+  // full weight matrix each tile, so prefill VRAM traffic ∝ (T/MAXT)·weights. Raising
+  // MAXT amortizes each weight read over more tokens → fewer re-reads → faster prefill.
+  // Bounds: part[MAXT·WG] workgroup mem = MAXT·256B (≤16KB → MAXT≤64); final reduction
+  // maps thread lid.x→token so MAXT ≤ MATVEC_WG (64). 16→32 ≈ halves prefill re-reads.
+  const MATVEC_MAXT = 32;
   const MATVEC_WGSL = `
 enable f16;
 enable subgroups;
