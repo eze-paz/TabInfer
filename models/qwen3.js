@@ -445,8 +445,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // cap tokens-per-weight-read at ~32), here each thread holds only TILE_M×TILE_N outputs,
   // so BM can be large with no register blowup → each weight read from VRAM serves BM tokens.
   // Portable: no subgroups / subgroup-matrix → runs on Iris Xe gen-12lp.
-  const GEMM_WG_M = 16, GEMM_WG_N = 8, GEMM_TILE_M = 4, GEMM_TILE_N = 4, GEMM_TILE_K = 16;
-  const GEMM_BM = GEMM_WG_M * GEMM_TILE_M;   // 64 tokens/block
+  const GEMM_WG_M = 32, GEMM_WG_N = 8, GEMM_TILE_M = 4, GEMM_TILE_N = 4, GEMM_TILE_K = 16;
+  const GEMM_BM = GEMM_WG_M * GEMM_TILE_M;   // 128 tokens/block (more tokens amortize each weight read)
   const GEMM_BN = GEMM_WG_N * GEMM_TILE_N;   // 32 outputs/block
   const GEMMQ_WGSL = `
 enable f16;
@@ -1492,7 +1492,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // global position posBase+t — already proven by decode (T=1,posBase>0) — so KV
     // accumulates correctly across chunks. This does NOT reduce total work (the tiled-GEMM
     // + flash-attn ports do that); it only makes a long prefill safe instead of fatal.
-    const PREFILL_CHUNK = 64;
+    const PREFILL_CHUNK = 128;   // == GEMM_BM: each chunk fills one M-block → weights read once per chunk
     const _tp0 = performance.now();
     const _savedPerf = _PERF; _PERF = true;
     let tok0, _gpuMs = 0, _encMs = 0;
