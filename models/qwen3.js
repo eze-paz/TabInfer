@@ -462,15 +462,16 @@ struct P { T:u32, H:u32, idOff:u32, _b:u32 };   // reads ids[idOff + t] (decode:
 @group(0) @binding(2) var<storage, read_write> y     : array<f32>;
 @group(0) @binding(3) var<uniform>             p     : P;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>){
-  let idx=gid.x; let total=p.T*p.H; if(idx>=total){return;}
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let idx=gid.y*(nwg.x*64u)+gid.x; let total=p.T*p.H; if(idx>=total){return;}
   let t=idx/p.H; let h=idx%p.H;
   y[idx]=f32(embed[ids[p.idOff + t]*p.H + h]);
 }`;
   function embedGather(idsBuf, embedBuf, yBuf, T, H, idOff) {
     const pipe = E.getPipeline('q3.embed', EMBED_WGSL);
     const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
-    return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [Math.ceil((T*H)/64), 1, 1]);
+    const nWG = Math.ceil((T * H) / 64), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [gx, gy, 1]);
   }
 
   // ============================================================
@@ -616,14 +617,15 @@ struct P { n:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(2) var<storage, read_write> y    : array<f32>;
 @group(0) @binding(3) var<uniform>             p    : P;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>){
-  let i=gid.x; if(i>=p.n){return;}
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i=gid.y*(nwg.x*64u)+gid.x; if(i>=p.n){return;}
   let g=gate[i]; let silu=g/(1.0+exp(-g)); y[i]=silu*up[i];
 }`;
   function swiglu(gateBuf, upBuf, yBuf, n) {
     const pipe = E.getPipeline('q3.swiglu', SWIGLU_WGSL);
     const p = uniform(new Uint32Array([n, 0, 0, 0]));
-    return E.dispatch(pipe, [gateBuf, upBuf, yBuf, p], [Math.ceil(n/64), 1, 1]);
+    const nWG = Math.ceil(n / 64), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [gateBuf, upBuf, yBuf, p], [gx, gy, 1]);
   }
 
 
@@ -636,11 +638,12 @@ struct P { n:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(1) var<storage, read>       b : array<f32>;
 @group(0) @binding(2) var<uniform>             p : P;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let i=gid.x; if(i>=p.n){return;} a[i]=a[i]+b[i]; }`;
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){ let i=gid.y*(nwg.x*64u)+gid.x; if(i>=p.n){return;} a[i]=a[i]+b[i]; }`;
   function addInPlace(aBuf, bBuf, n) {
     const pipe = E.getPipeline('q3.add', ADD_WGSL);
     const p = uniform(new Uint32Array([n, 0, 0, 0]));
-    return E.dispatch(pipe, [aBuf, bBuf, p], [Math.ceil(n/64), 1, 1]);
+    const nWG = Math.ceil(n / 64), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [aBuf, bBuf, p], [gx, gy, 1]);
   }
 
   // ============================================================
