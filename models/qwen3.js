@@ -1357,11 +1357,26 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         console.log('[qwen3 dev] adapter=' + (ad ? JSON.stringify(ad) : '?') + ' | maxWGStorage=' + lim.maxComputeWorkgroupStorageSize + ' | MAX_SEQ=' + MAX_SEQ + ' | hasSubgroups=' + (cp ? !!cp.hasSubgroups : '?') + ' hasF16=' + (cp ? !!cp.hasF16 : '?') + ' enabled=' + (cp ? JSON.stringify(cp.enabled) : '?') + ' deviceFeatures=' + (feats ? JSON.stringify(feats) : '?'));
       }
     } catch (_) {}
+    // CHUNKED PREFILL — process the prompt in PREFILL_CHUNK-token blocks, each its OWN
+    // forward = its OWN queue.submit. A full-prompt forward is a single multi-second GPU
+    // submit; on an iGPU that trips the OS GPU watchdog (Windows TDR) → driver reset →
+    // whole-PC freeze. Bounding T per forward keeps every submit short (~1s). Correctness:
+    // RoPE, the KV write offset, and the attention causal mask (last=(S-T)+t) all key off
+    // global position posBase+t — already proven by decode (T=1,posBase>0) — so KV
+    // accumulates correctly across chunks. This does NOT reduce total work (the tiled-GEMM
+    // + flash-attn ports do that); it only makes a long prefill safe instead of fatal.
+    const PREFILL_CHUNK = 64;
     const _tp0 = performance.now();
-    const _savedPerf = _PERF; _PERF = true;                 // capture encode vs GPU-drain split for the prefill
-    const tok0 = await forward(ids, 0);                    // single-submit prefill
+    const _savedPerf = _PERF; _PERF = true;
+    let tok0, _gpuMs = 0, _encMs = 0;
+    for (let off = 0; off < L; off += PREFILL_CHUNK) {
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      const chunk = ids.slice(off, Math.min(off + PREFILL_CHUNK, L));
+      tok0 = await forward(chunk, off);                     // bounded submit (no TDR)
+      if (_perfData) { _gpuMs += _perfData.gpu_drain_ms; _encMs += _perfData.encode_ms; }
+    }
     _PERF = _savedPerf;
-    const _pf = _perfData;
+    const _pf = { encode_ms: +_encMs.toFixed(1), gpu_drain_ms: +_gpuMs.toFixed(1), map_ms: 0 };
     const _tp1 = performance.now();
     const outIds = []; let pos = L, prevText = '';
     const pushTok = (t) => {
