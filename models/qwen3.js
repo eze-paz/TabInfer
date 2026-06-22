@@ -1353,7 +1353,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const ad = cp && cp.adapter;
       if (lim && !_streamIds._dumped) {
         _streamIds._dumped = true;
-        console.log('[qwen3 dev] adapter=' + (ad ? JSON.stringify(ad) : '?') + ' | maxBufferSize=' + lim.maxBufferSize + ' maxStorageBinding=' + lim.maxStorageBufferBindingSize + ' maxWGStorage=' + lim.maxComputeWorkgroupStorageSize + ' | MAX_SEQ=' + MAX_SEQ + ' subgroups=' + (cp ? !!cp.subgroups : '?'));
+        const feats = dev && dev.features ? Array.from(dev.features) : null;
+        console.log('[qwen3 dev] adapter=' + (ad ? JSON.stringify(ad) : '?') + ' | maxWGStorage=' + lim.maxComputeWorkgroupStorageSize + ' | MAX_SEQ=' + MAX_SEQ + ' | hasSubgroups=' + (cp ? !!cp.hasSubgroups : '?') + ' hasF16=' + (cp ? !!cp.hasF16 : '?') + ' enabled=' + (cp ? JSON.stringify(cp.enabled) : '?') + ' deviceFeatures=' + (feats ? JSON.stringify(feats) : '?'));
       }
     } catch (_) {}
     const _tp0 = performance.now();
