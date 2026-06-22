@@ -1131,11 +1131,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     return { pack, scales };
   }
-  // embed_tokens is int4 too (gathered via embedGatherQ). As f16 it's vocab*H*2 = 311MB for
-  // 0.6B — over Adreno's maxStorageBufferBindingSize (~128-256MB) → the binding silently fails
-  // and the gather returns ZEROS → all-"!" on the phone. int4 = ~78MB, fits. (Iris Xe's limit is
-  // multi-GB so f16 worked there, masking the bug.)
-  const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight' || name === 'model.embed_tokens.weight';
+  // NOTE: embed_tokens stays f16 here. Quantizing it to int4 in-browser EVERY load costs ~3min
+  // (155M elems, no quant cache) — reverted. The phone needs an int4 embed (f16 311MB binding
+  // exceeds Adreno's maxStorageBufferBindingSize → silent zeros → all-"!"), but the right fix is
+  // an OPFS quant cache (quantize once) — not re-quantizing on every load. See chat.
+  const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight';
 
   async function fetchModelBytes(onProgress) {
     const url = MODEL_ROOT + 'model.safetensors';
@@ -1275,7 +1275,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const embOff = chain ? posBase : 0;
     uniformReset();   // pooled uniforms get stable buffers per call-site → bind-group cache hits
     E.beginBatch();   // record the whole forward into ONE command buffer (1 submit vs ~364)
-    { const e = Wq('model.embed_tokens.weight'); await embedGatherQ(embIds, e.pack, e.scales, s.x, T, H, embOff); }   // int4 embed (Adreno-safe; f16 311MB binding silently zeroed on Adreno)
+    await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);   // f16 embed (works on big-limit GPUs; Adreno needs int4+quant-cache — see isQuantWeight note)
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
@@ -1304,7 +1304,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
     // last token row → its own [H] buffer, then lm_head
     E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
-    await linearQ(s.last, Wq('lm_head.weight') || Wq('model.embed_tokens.weight'), s.logits, 1, C.vocab, H);   // tied: fall back to the int4 embed if no separate lm_head
+    await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
     // GPU-side greedy argmax → write the predicted token straight into the token
     // history at the NEXT position (posBase+T), so the next forward's embed reads it.
     await argmaxKernel(s.logits, _tokHist, C.vocab, posBase + T);
