@@ -637,8 +637,15 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   //   • output: hd threads (one per dim) each sum over keys → O[d]
   // Scores live in shared mem (capacity ATTN_MAXK = MAX_SEQ). hd ≤ ATTN_WG.
   // ============================================================
-  const ATTN_WG = 128;
-  const ATTN_MAXK = 4096;   // = MAX_SEQ; scores buffer size in shared memory (16KB f32)
+  // TILED FLASH attention (online softmax). The old kernel ran one workgroup per
+  // (query,head): for prefill the T queries of a head EACH re-streamed the entire KV
+  // cache from VRAM (~T× redundant) — measured 9.7s for ONE 128-token chunk at S=2790,
+  // i.e. attention (bandwidth-bound), not the matmul, dominated prefill. Here one
+  // workgroup owns a head × a block of QT(16) queries and streams K/V in KT(8)-key
+  // tiles loaded to shared memory ONCE and reused across all 16 queries (16× fewer KV
+  // reads), keeping a running max/sum/acc per query (online softmax). Portable (no
+  // subgroups). hd ≤ 128. Shared ≈ 25KB.
+  const ATTN_QT = 16, ATTN_KT = 8, ATTN_HDMAX = 128, ATTN_WG = 128;   // QT*KT == WG
   const ATTN_WGSL = `
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       Q : array<f32>;
@@ -646,58 +653,94 @@ struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(2) var<storage, read>       V : array<f32>;
 @group(0) @binding(3) var<storage, read_write> O : array<f32>;
 @group(0) @binding(4) var<uniform>             p : P;
-var<workgroup> qsh : array<f32, ${ATTN_WG}>;   // query row (hd ≤ ATTN_WG)
-var<workgroup> sc  : array<f32, ${ATTN_MAXK}>; // scores / probabilities per key
-var<workgroup> red : array<f32, ${ATTN_WG}>;   // reduction scratch
+const QT=${ATTN_QT}u; const KT=${ATTN_KT}u; const HDMAX=${ATTN_HDMAX}u; const WG=${ATTN_WG}u;
+var<workgroup> qsh : array<f32, QT*HDMAX>;   // QT queries × hd
+var<workgroup> ksh : array<f32, KT*HDMAX>;   // KT keys × hd (one tile)
+var<workgroup> vsh : array<f32, KT*HDMAX>;
+var<workgroup> acc : array<f32, QT*HDMAX>;   // running output per query
+var<workgroup> scr : array<f32, QT*KT>;      // score/prob tile
+var<workgroup> msh : array<f32, QT>;         // running max
+var<workgroup> lsh : array<f32, QT>;         // running denom
+var<workgroup> csh : array<f32, QT>;         // rescale factor this tile
 @compute @workgroup_size(${ATTN_WG},1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>) {
-  let lid = lidv.x;
-  let unit = wg.x;                       // 0 .. T*nHq-1
-  let t = unit / p.nHq; let hq = unit % p.nHq;
-  let hd = p.hd; let grp = p.nHq / p.nKv; let hk = hq / grp;
-  let qb = t*(p.nHq*hd) + hq*hd;
-  let kvstride = p.nKv*hd;
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+  let tid = lidv.x;
+  let hd = p.hd;
+  let nqb = (p.T + QT - 1u)/QT;
+  let blk = wg.x + wg.y*nwg.x;
+  let hq = blk / nqb;
+  if (hq >= p.nHq) { return; }
+  let qbase = (blk % nqb) * QT;
+  let grp = p.nHq / p.nKv; let hk = hq / grp;
+  let kvstride = p.nKv*hd; let qhstride = p.nHq*hd;
   let scale = 1.0/sqrt(f32(hd));
-  let last = (p.S - p.T) + t;            // inclusive last key
-  // load query row
-  if (lid < hd) { qsh[lid] = Q[qb+lid]; }
-  workgroupBarrier();
-  // scores: each thread handles a strided subset of keys
-  var key = lid;
-  loop {
-    if (key > last) { break; }
-    let kb = key*kvstride + hk*hd;
-    var dot : f32 = 0.0;
-    for (var i:u32=0u; i<hd; i=i+1u) { dot = dot + qsh[i]*K[kb+i]; }
-    sc[key] = dot*scale;
-    key = key + ${ATTN_WG}u;
+  // load Q tile + init acc
+  var e = tid;
+  loop { if (e >= QT*hd) { break; }
+    let qi = e/hd; let dd = e%hd; let gq = qbase+qi;
+    qsh[e] = select(0.0, Q[gq*qhstride + hq*hd + dd], gq < p.T);
+    acc[e] = 0.0;
+    e = e + WG;
   }
+  if (tid < QT) { msh[tid] = -3.0e38; lsh[tid] = 0.0; }
   workgroupBarrier();
-  // max-reduce over sc[0..last]
-  var lmax : f32 = -3.0e38;
-  key = lid; loop { if (key > last) { break; } lmax = max(lmax, sc[key]); key = key + ${ATTN_WG}u; }
-  red[lid] = lmax; workgroupBarrier();
-  var st = ${ATTN_WG}u/2u;
-  loop { if (st==0u){break;} if (lid<st){ red[lid]=max(red[lid],red[lid+st]); } workgroupBarrier(); st=st/2u; }
-  let m = red[0]; workgroupBarrier();
-  // exp + sum-reduce
-  var lsum : f32 = 0.0;
-  key = lid; loop { if (key > last) { break; } let e = exp(sc[key]-m); sc[key]=e; lsum=lsum+e; key=key+${ATTN_WG}u; }
-  red[lid] = lsum; workgroupBarrier();
-  st = ${ATTN_WG}u/2u;
-  loop { if (st==0u){break;} if (lid<st){ red[lid]=red[lid]+red[lid+st]; } workgroupBarrier(); st=st/2u; }
-  let denom = red[0]; workgroupBarrier();
-  // output: one thread per dim sums prob*V over all keys
-  if (lid < hd) {
-    var acc : f32 = 0.0;
-    for (var s:u32=0u; s<=last; s=s+1u) { acc = acc + sc[s]*V[s*kvstride + hk*hd + lid]; }
-    O[qb+lid] = acc/denom;
+  var k0 = 0u;
+  loop {
+    if (k0 >= p.S) { break; }
+    e = tid;                                   // load K/V tile
+    loop { if (e >= KT*hd) { break; }
+      let kj = e/hd; let dd = e%hd; let gk = k0+kj; let ok = gk < p.S;
+      ksh[e] = select(0.0, K[gk*kvstride + hk*hd + dd], ok);
+      vsh[e] = select(0.0, V[gk*kvstride + hk*hd + dd], ok);
+      e = e + WG;
+    }
+    workgroupBarrier();
+    { let qi = tid / KT; let kj = tid % KT;    // scores: 1 thread per (qi,kj), QT*KT==WG
+      var dot = 0.0;
+      for (var i=0u;i<hd;i=i+1u){ dot = dot + qsh[qi*hd+i]*ksh[kj*hd+i]; }
+      let gq = qbase+qi; let gk = k0+kj; let gqpos = (p.S - p.T) + gq;
+      let valid = (gq < p.T) && (gk < p.S) && (gk <= gqpos);
+      scr[tid] = select(-3.0e38, dot*scale, valid);
+    }
+    workgroupBarrier();
+    if (tid < QT) {                            // online-softmax update per query
+      let qi = tid;
+      var tm = -3.0e38;
+      for (var kj=0u;kj<KT;kj=kj+1u){ tm = max(tm, scr[qi*KT+kj]); }
+      let mnew = max(msh[qi], tm);
+      let corr = exp(msh[qi] - mnew);
+      var sum = 0.0;
+      for (var kj=0u;kj<KT;kj=kj+1u){
+        let pw = select(0.0, exp(scr[qi*KT+kj]-mnew), scr[qi*KT+kj] > -3.0e37);
+        scr[qi*KT+kj] = pw; sum = sum + pw;
+      }
+      lsh[qi] = lsh[qi]*corr + sum; msh[qi] = mnew; csh[qi] = corr;
+    }
+    workgroupBarrier();
+    e = tid;                                   // acc[qi][d] = acc*corr + Σ_kj prob*V
+    loop { if (e >= QT*hd) { break; }
+      let qi = e/hd; let dd = e%hd;
+      var a = acc[e]*csh[qi];
+      for (var kj=0u;kj<KT;kj=kj+1u){ a = a + scr[qi*KT+kj]*vsh[kj*hd+dd]; }
+      acc[e] = a;
+      e = e + WG;
+    }
+    workgroupBarrier();
+    k0 = k0 + KT;
+  }
+  e = tid;                                     // write O = acc / denom
+  loop { if (e >= QT*hd) { break; }
+    let qi = e/hd; let dd = e%hd; let gq = qbase+qi;
+    if (gq < p.T) { O[gq*qhstride + hq*hd + dd] = acc[e] / lsh[qi]; }
+    e = e + WG;
   }
 }`;
   function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
-    const pipe = E.getPipeline('q3.attn', ATTN_WGSL);
+    const pipe = E.getPipeline('q3.attnFlash', ATTN_WGSL);
     const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
-    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [T * nHq, 1, 1]);   // one workgroup per (t,head)
+    const blocks = nHq * Math.ceil(T / ATTN_QT);
+    const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
   }
 
   // ============================================================
@@ -866,6 +909,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         let den=0;const acc=new Float32Array(hd);for(let s=0;s<=last;s++){const kb2=s*(nKv*hd)+hk*hd;const vb2=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qb2+i]*Kk[kb2+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)acc[i]+=w*Vv[vb2+i];}
         for(let i=0;i<hd;i++)y[qb2+i]=acc[i]/den;}
       check('attention', maxAbs(got,y), 2e-3);
+      [qb,kb,vb,ob].forEach(b=>b.destroy());
+    }
+    // --- attention tiled (multi q-block + multi k-tile + GQA + causal + partial tiles) ---
+    {
+      const T=40,S=40,nHq=8,nKv=2,hd=128;
+      const Q=new Float32Array(T*nHq*hd),Kk=new Float32Array(S*nKv*hd),Vv=new Float32Array(S*nKv*hd);
+      for(let i=0;i<Q.length;i++)Q[i]=Math.sin(i*0.013);
+      for(let i=0;i<Kk.length;i++)Kk[i]=Math.cos(i*0.011);
+      for(let i=0;i<Vv.length;i++)Vv[i]=Math.sin(i*0.007+0.5);
+      const qb=f32buf(Q),kb=f32buf(Kk),vb=f32buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
+      await attention(qb,kb,vb,ob,T,S,nHq,nKv,hd);
+      const got=await E.readF32(ob,Q.length);
+      const y=new Float32Array(Q.length); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
+      for(let t=0;t<T;t++)for(let hq=0;hq<nHq;hq++){const hk=Math.floor(hq/grp);const qo=t*(nHq*hd)+hq*hd;const last=(S-T)+t;
+        let m=-1e38;for(let s=0;s<=last;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];d*=scale;if(d>m)m=d;}
+        let den=0;const a=new Float32Array(hd);for(let s=0;s<=last;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)a[i]+=w*Vv[ko+i];}
+        for(let i=0;i<hd;i++)y[qo+i]=a[i]/den;}
+      check('attentionTiled', maxAbs(got,y), 2e-3);
       [qb,kb,vb,ob].forEach(b=>b.destroy());
     }
     // --- swiglu ---
@@ -1454,6 +1515,23 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { T, N, K, iters, gemm_ms: +gemm_ms.toFixed(2), matvec_ms: +matvec_ms.toFixed(2), speedup: +(matvec_ms / gemm_ms).toFixed(2) };
   }
 
+  // Debug bench (no model load): time the tiled attention at a realistic prefill shape.
+  async function _benchAttn({ T = 128, S = 2790, nHq = 16, nKv = 8, hd = 128, iters = 3 } = {}) {
+    const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.01);
+    const Kk = new Float32Array(S * nKv * hd); for (let i = 0; i < Kk.length; i++) Kk[i] = Math.cos(i * 0.007);
+    const Vv = new Float32Array(S * nKv * hd); for (let i = 0; i < Vv.length; i++) Vv[i] = Math.sin(i * 0.005);
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'ba'); E.device().queue.writeBuffer(b, 0, a.buffer, 0, a.byteLength); return b; };
+    const qb = mk(Q), kb = mk(Kk), vb = mk(Vv), ob = E.createBuffer(Q.byteLength, UF, 'bo');
+    uniformReset(); await attention(qb, kb, vb, ob, T, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone();
+    const t0 = performance.now();
+    for (let i = 0; i < iters; i++) { uniformReset(); await attention(qb, kb, vb, ob, T, S, nHq, nKv, hd); }
+    await E.device().queue.onSubmittedWorkDone();
+    const ms = (performance.now() - t0) / iters;
+    [qb, kb, vb, ob].forEach(b => b.destroy());
+    return { T, S, nHq, nKv, hd, attn_ms: +ms.toFixed(2) };
+  }
+
   // ============================================================
   // App host contract — minimal shim over the fast subgroup generate().
   // (Ported from the dense app build; runs the stale single-submit-prefill +
@@ -1597,7 +1675,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
-    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul,
+    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
