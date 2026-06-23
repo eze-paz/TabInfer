@@ -313,6 +313,107 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
   }
 
+  // ---- DP4A int8 decode GEMV (T=1) ------------------------------------------
+  // gemvQ profiled at ~20-28 GB/s (peak ~50) → compute-limited by the f32 dequant+dot, not
+  // bandwidth. This path quantizes the activation to per-group int8 (QUANTQ8) then replaces
+  // the two f32 dot4 with two dot4I8Packed (DP4A) — ~4× less ALU on the inner dot, so the
+  // kernel can rise toward the weight-bandwidth ceiling. Weights stay int4 (same bytes);
+  // nibbles are unpacked + repacked to int8 in-shader. int32 accum per word × wscale × xscale.
+  // One workgroup per QGROUP (32 threads): parallel abs-max reduction, per-thread int8
+  // quantize, then threads 0..7 pack 4 int8 each → 8 u32. (The old 1-thread-per-group
+  // version ran ~32-96 threads total = pathological occupancy, 17-34us of pure overhead.)
+  const QUANTQ8_WGSL = `
+struct Q { K:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<f32>;     // [K]
+@group(0) @binding(1) var<storage, read_write> xq : array<u32>;     // [K/4] packed int8
+@group(0) @binding(2) var<storage, read_write> xs : array<f32>;     // [K/QGROUP] group scales
+@group(0) @binding(3) var<uniform>             q  : Q;
+var<workgroup> msh : array<f32, ${QGROUP}>;
+var<workgroup> qsh : array<i32, ${QGROUP}>;
+@compute @workgroup_size(${QGROUP},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let g = wg.x + wg.y*nwg.x; let ng = q.K / ${QGROUP}u; if (g >= ng) { return; }
+  let lid = lidv.x; let val = x[g*${QGROUP}u + lid];
+  msh[lid] = abs(val); workgroupBarrier();
+  var st = ${QGROUP / 2}u; loop { if(st==0u){break;} if(lid<st){ msh[lid]=max(msh[lid],msh[lid+st]); } workgroupBarrier(); st=st/2u; }
+  let scale = msh[0] / 127.0; let inv = select(0.0, 1.0/scale, scale > 0.0);
+  if (lid==0u) { xs[g] = scale; }
+  qsh[lid] = clamp(i32(round(val*inv)), -127, 127); workgroupBarrier();
+  if (lid < ${QGROUP / 4}u) {
+    xq[g*${QGROUP / 4}u + lid] = pack4xI8(vec4<i32>(qsh[lid*4u], qsh[lid*4u+1u], qsh[lid*4u+2u], qsh[lid*4u+3u]));
+  }
+}`;
+  const GEMVDP4_WGSL = `
+enable f16;
+enable subgroups;
+struct D { N:u32, K:u32, acc:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       xq : array<u32>;          // [K/4] packed int8 activations
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/QGROUP] weight scales
+@group(0) @binding(3) var<storage, read>       xs : array<f32>;          // [K/QGROUP] activation scales
+@group(0) @binding(4) var<storage, read_write> y  : array<f32>;          // [N]
+@group(0) @binding(5) var<uniform>             d  : D;
+var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${GEMVQ_NR}u;
+  if (rowBase >= d.N) { return; }
+  let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
+  var acc : array<f32, ${GEMVQ_NR}>;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { acc[r] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = xq[2u*w]; let xb = xq[2u*w + 1u];   // packed int8 activations — read once, reused across rows
+    let grp = (w*8u)/${QGROUP}u;
+    let xsc = xs[grp];
+    for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+      let row = rowBase + r;
+      let p = W[row*words + w];
+      let s = f32(sc[row*gpr + grp]) * xsc;
+      let lo = vec4<i32>(unpack4xU8(p & 0x0F0F0F0Fu));
+      let hi = vec4<i32>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu));
+      let wa = pack4xI8(vec4<i32>(lo.x, hi.x, lo.y, hi.y) - vec4<i32>(8));
+      let wb = pack4xI8(vec4<i32>(lo.z, hi.z, lo.w, hi.w) - vec4<i32>(8));
+      acc[r] = acc[r] + s * f32(dot4I8Packed(wa, xa) + dot4I8Packed(wb, xb));
+    }
+    w = w + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+    let ss = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${GEMVQ_NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.N) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
+      y[row] = select(0.0, y[row], d.acc != 0u) + t;
+    }
+  }
+}`;
+  let _dp4 = null;   // scratch {xq, xs, cap} for the quantized activation, sized to K
+  function ensureDp4(K) {
+    if (_dp4 && _dp4.cap >= K) return;
+    if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); }
+    _dp4 = { cap: K, xq: E.createBuffer((K / 4) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xq'), xs: E.createBuffer((K / QGROUP) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xs') };
+  }
+  function gemvDP4A(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
+    ensureDp4(K);
+    const qp = E.getPipeline('q3.quantq8', QUANTQ8_WGSL);
+    const qd = uniform(new Uint32Array([K, 0, 0, 0]));
+    const groups = K / QGROUP, qgx = Math.min(groups, 65535), qgy = Math.ceil(groups / qgx);
+    E.dispatch(qp, [xBuf, _dp4.xq, _dp4.xs, qd], [qgx, qgy, 1]);
+    const pipe = E.getPipeline('q3.gemvDP4', GEMVDP4_WGSL);
+    const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
+    const nWG = Math.ceil(N / GEMVQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [_dp4.xq, packBuf, scBuf, _dp4.xs, yBuf, d], [gx, gy, 1]);
+  }
+
   // ---- FUSED int4 gate+up+SwiGLU (T=1): swi[i] = silu(gate·x)*(up·x) ----
   // 3 decode passes (gate gemv, up gemv, swiglu) → 1. Reads x once per chunk and
   // dequant-dots it against BOTH gate and up weights; one fewer pass barrier ×2
@@ -532,7 +633,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   // Router for the int4 weight path. wrec = { pack, scales, N, K }. acc=true →
   // y += result (fused residual add, saves a separate addInPlace pass).
   async function linearQ(xBuf, wrec, yBuf, T, N, K, acc) {
-    if (T === 1) return gemvQ(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
+    if (T === 1) return (globalThis.__noDp4 ? gemvQ : gemvDP4A)(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
     return gemmQ(xBuf, wrec, yBuf, T, N, K, acc);   // prefill → tiled GEMM (weights read once per BM tokens)
   }
 
@@ -1091,6 +1192,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       check('gemvQ', maxAbs(got,y), 1e-2);
       [xb,pb,sb,yb].forEach(b=>b.destroy());
     }
+    // --- gemvDP4A (DP4A int8 activation) vs CPU dequant — relative tol (int8 quant ~1%) ---
+    {
+      const N=200,K=320;
+      const x=new Float32Array(K),Wf=new Float32Array(N*K);
+      for(let i=0;i<K;i++)x[i]=Math.sin(i*0.2);
+      for(let i=0;i<Wf.length;i++)Wf[i]=Math.cos(i*0.013);
+      const {pack,scales}=quantizeInt4Bf16(f32ToBf16(Wf),N,K);
+      const Wdq=dequantInt4(pack,scales,N,K);
+      const xb=f32buf(x),pb=qbuf(pack),sb=sbuf(scales),yb=E.createBuffer(N*4,ST(),'y');
+      await gemvDP4A(xb,pb,sb,yb,N,K);
+      const got=await E.readF32(yb,N); const y=new Float32Array(N); let ref=1e-9;
+      for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[k]*Wdq[n*K+k];y[n]=a;ref=Math.max(ref,Math.abs(a));}
+      check('gemvDP4A', maxAbs(got,y)/ref, 2e-2);
+      [xb,pb,sb,yb].forEach(b=>b.destroy());
+    }
     // --- matvecQ (int4 batched) vs CPU dequant ---
     {
       const T=5,N=96,K=128;
@@ -1622,6 +1738,53 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { T, S, nHq, nKv, hd, attn_ms: +ms.toFixed(2) };
   }
 
+  // Debug bench (no model load): time the int4 decode GEMV at N,K + report GB/s & GFLOP/s.
+  async function _benchGemv({ N = 2048, K = 1024, iters = 50 } = {}) {
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); scales.fill(0x3c00);
+    const x = new Float32Array(K); for (let i = 0; i < K; i++) x[i] = Math.sin(i * 0.01);
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bg'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), yb = E.createBuffer(N * 4, UF, 'yg');
+    uniformReset(); await gemvQ(xb, pb, sb, yb, N, K); await E.device().queue.onSubmittedWorkDone();   // warm
+    // GPU-timestamp the kernel itself (batched, no per-dispatch submit overhead)
+    E.beginProfile(iters + 8);
+    E.beginBatch();
+    for (let i = 0; i < iters; i++) await gemvQ(xb, pb, sb, yb, N, K);
+    await E.endBatch();
+    const prof = await E.endProfile();
+    [xb, pb, sb, yb].forEach(b => b.destroy());
+    const us = prof.filter(r => r.label === 'q3.gemvQ').reduce((s, r) => s + r.us, 0) / iters;
+    const ms = us / 1000;
+    const bytes = N * words * 4 + N * gpr * 2;
+    return { N, K, gpu_us: +us.toFixed(1), GBs: +(bytes / ms / 1e6).toFixed(1), GFLOPs: +(2 * N * K / ms / 1e6).toFixed(1) };
+  }
+
+  // Bench + correctness for the DP4A GEMV vs the f32-dequant gemvQ (same inputs).
+  async function _benchDP4({ N = 4096, K = 1024, iters = 50 } = {}) {
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); for (let i = 0; i < scales.length; i++) scales[i] = 0x3000 + (i % 7);   // ~0.12..
+    const x = new Float32Array(K); for (let i = 0; i < K; i++) x[i] = Math.sin(i * 0.017) * 0.8;
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bg'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), yq = E.createBuffer(N * 4, UF, 'yq'), yd = E.createBuffer(N * 4, UF, 'yd');
+    // correctness: gemvQ (f32 dequant) vs gemvDP4A (int8)
+    uniformReset(); await gemvQ(xb, pb, sb, yq, N, K);
+    uniformReset(); await gemvDP4A(xb, pb, sb, yd, N, K);
+    await E.device().queue.onSubmittedWorkDone();
+    const a = await E.readF32(yq, N), b = await E.readF32(yd, N);
+    let mx = 0, ref = 0; for (let i = 0; i < N; i++) { mx = Math.max(mx, Math.abs(a[i] - b[i])); ref = Math.max(ref, Math.abs(a[i])); }
+    const relErr = +(mx / ref).toExponential(2);
+    const timeLbls = async (fn, lbls) => { uniformReset(); await fn(); await E.device().queue.onSubmittedWorkDone(); E.beginProfile(iters * 3 + 8); E.beginBatch(); for (let i = 0; i < iters; i++) await fn(); await E.endBatch(); const p = await E.endProfile(); const o = {}; for (const l of lbls) o[l] = +(p.filter(r => r.label === l).reduce((s, r) => s + r.us, 0) / iters).toFixed(1); return o; };
+    const baseT = await timeLbls(() => gemvQ(xb, pb, sb, yq, N, K), ['q3.gemvQ']);
+    const dpT = await timeLbls(() => gemvDP4A(xb, pb, sb, yd, N, K), ['q3.quantq8', 'q3.gemvDP4']);
+    [xb, pb, sb, yq, yd].forEach(bf => bf.destroy());
+    const dpTotal = dpT['q3.quantq8'] + dpT['q3.gemvDP4'];
+    return { N, K, relErr, gemvQ_us: baseT['q3.gemvQ'], dp4_gemv_us: dpT['q3.gemvDP4'], dp4_quant_us: dpT['q3.quantq8'], dp4_total_us: +dpTotal.toFixed(1), speedup: +(baseT['q3.gemvQ'] / dpTotal).toFixed(2) };
+  }
+
   // ============================================================
   // App host contract — minimal shim over the fast subgroup generate().
   // (Ported from the dense app build; runs the stale single-submit-prefill +
@@ -1765,7 +1928,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
-    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn,
+    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
