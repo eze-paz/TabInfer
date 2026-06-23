@@ -475,12 +475,82 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
   }
 }`;
+  // DP4A int8 variant of the fused gate+up+SwiGLU (same win as gemvDP4A: int8 dot4I8Packed
+  // instead of f32 dot4). The int8 activation is read ONCE and dotted against BOTH gate and up.
+  const GATEUPDP4_WGSL = `
+enable f16;
+enable subgroups;
+struct D { I:u32, H:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       xq : array<u32>;          // [H/4] packed int8 activations
+@group(0) @binding(1) var<storage, read>       gW : array<u32>;
+@group(0) @binding(2) var<storage, read>       gS : array<f16>;
+@group(0) @binding(3) var<storage, read>       uW : array<u32>;
+@group(0) @binding(4) var<storage, read>       uS : array<f16>;
+@group(0) @binding(5) var<storage, read>       xs : array<f32>;          // [H/QGROUP] activation scales
+@group(0) @binding(6) var<storage, read_write> swi: array<f32>;          // [I]
+@group(0) @binding(7) var<uniform>             d  : D;
+var<workgroup> pg : array<f32, ${GUSQ_NR * GEMV_WG}>;
+var<workgroup> pu : array<f32, ${GUSQ_NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${GUSQ_NR}u;
+  if (rowBase >= d.I) { return; }
+  let words = d.H / 8u; let gpr = d.H / ${QGROUP}u;
+  var ga : array<f32, ${GUSQ_NR}>; var ua : array<f32, ${GUSQ_NR}>;
+  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) { ga[r]=0.0; ua[r]=0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = xq[2u*w]; let xb = xq[2u*w + 1u]; let grp = (w*8u)/${QGROUP}u; let xsc = xs[grp];
+    for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
+      let row = rowBase + r; let wi = row*words + w; let si = row*gpr + grp;
+      let gp = gW[wi]; let gsc = f32(gS[si])*xsc;
+      let glo = vec4<i32>(unpack4xU8(gp & 0x0F0F0F0Fu)); let ghi = vec4<i32>(unpack4xU8((gp >> 4u) & 0x0F0F0F0Fu));
+      let gwa = pack4xI8(vec4<i32>(glo.x,ghi.x,glo.y,ghi.y) - vec4<i32>(8));
+      let gwb = pack4xI8(vec4<i32>(glo.z,ghi.z,glo.w,ghi.w) - vec4<i32>(8));
+      ga[r] = ga[r] + gsc*f32(dot4I8Packed(gwa, xa) + dot4I8Packed(gwb, xb));
+      let up = uW[wi]; let usc = f32(uS[si])*xsc;
+      let ulo = vec4<i32>(unpack4xU8(up & 0x0F0F0F0Fu)); let uhi = vec4<i32>(unpack4xU8((up >> 4u) & 0x0F0F0F0Fu));
+      let uwa = pack4xI8(vec4<i32>(ulo.x,uhi.x,ulo.y,uhi.y) - vec4<i32>(8));
+      let uwb = pack4xI8(vec4<i32>(ulo.z,uhi.z,ulo.w,uhi.w) - vec4<i32>(8));
+      ua[r] = ua[r] + usc*f32(dot4I8Packed(uwa, xa) + dot4I8Packed(uwb, xb));
+    }
+    w = w + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
+    let g = subgroupAdd(ga[r]); let u = subgroupAdd(ua[r]);
+    if (sgi == 0u) { pg[r*${GEMV_WG}u + sgIdx] = g; pu[r*${GEMV_WG}u + sgIdx] = u; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${GUSQ_NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.I) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var g:f32=0.0; var u:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ g=g+pg[lid.x*${GEMV_WG}u+i]; u=u+pu[lid.x*${GEMV_WG}u+i]; }
+      let silu = g / (1.0 + exp(-g));
+      swi[row] = silu * u;
+    }
+  }
+}`;
   function gateUpSiluQ(xBuf, gRec, uRec, swiBuf, I, H) {
-    const pipe = E.getPipeline('q3.gateupQ', GATEUPQ_WGSL);
+    if (globalThis.__noDp4) {
+      const pipe = E.getPipeline('q3.gateupQ', GATEUPQ_WGSL);
+      const d = uniform(new Uint32Array([I, H, 0, 0]));
+      const nWG = Math.ceil(I / GUSQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+      return E.dispatch(pipe, [xBuf, gRec.pack, gRec.scales, uRec.pack, uRec.scales, swiBuf, d], [gx, gy, 1]);
+    }
+    ensureDp4(H);
+    const qp = E.getPipeline('q3.quantq8', QUANTQ8_WGSL);
+    const qd = uniform(new Uint32Array([H, 0, 0, 0]));
+    const groups = H / QGROUP, qgx = Math.min(groups, 65535), qgy = Math.ceil(groups / qgx);
+    E.dispatch(qp, [xBuf, _dp4.xq, _dp4.xs, qd], [qgx, qgy, 1]);
+    const pipe = E.getPipeline('q3.gateupDP4', GATEUPDP4_WGSL);
     const d = uniform(new Uint32Array([I, H, 0, 0]));
-    const nWG = Math.ceil(I / GUSQ_NR);
-    const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
-    return E.dispatch(pipe, [xBuf, gRec.pack, gRec.scales, uRec.pack, uRec.scales, swiBuf, d], [gx, gy, 1]);
+    const nWG = Math.ceil(I / GUSQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [_dp4.xq, gRec.pack, gRec.scales, uRec.pack, uRec.scales, _dp4.xs, swiBuf, d], [gx, gy, 1]);
   }
 
   // ---- INT4 batched matvec (T tokens, weight row unpacked once, reused) ----
@@ -1248,8 +1318,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const xb=f32buf(x), gW=qbuf(gq.pack), gS=sbuf(gq.scales), uW=qbuf(uq.pack), uS=sbuf(uq.scales), yb=E.createBuffer(I*4,ST(),'y');
       await gateUpSiluQ(xb, {pack:gW,scales:gS}, {pack:uW,scales:uS}, yb, I, H);
       const got=await E.readF32(yb,I); const y=new Float32Array(I);
-      for(let i=0;i<I;i++){let g=0,u=0;for(let k=0;k<H;k++){g+=x[k]*gdq[i*H+k];u+=x[k]*udq[i*H+k];}const silu=g/(1+Math.exp(-g));y[i]=silu*u;}
-      check('gateUpSiluQ', maxAbs(got,y), 1e-2);
+      let ref=1e-9; for(let i=0;i<I;i++){let g=0,u=0;for(let k=0;k<H;k++){g+=x[k]*gdq[i*H+k];u+=x[k]*udq[i*H+k];}const silu=g/(1+Math.exp(-g));y[i]=silu*u;ref=Math.max(ref,Math.abs(y[i]));}
+      check('gateUpSiluQ', maxAbs(got,y)/ref, 3e-2);   // DP4A default path → int8 activation quant, relative tol
       [xb,gW,gS,uW,uS,yb].forEach(b=>b.destroy());
     }
     // --- argmax ---
@@ -1785,6 +1855,31 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { N, K, relErr, gemvQ_us: baseT['q3.gemvQ'], dp4_gemv_us: dpT['q3.gemvDP4'], dp4_quant_us: dpT['q3.quantq8'], dp4_total_us: +dpTotal.toFixed(1), speedup: +(baseT['q3.gemvQ'] / dpTotal).toFixed(2) };
   }
 
+  // Interleaved-in-one-batch GPU-timestamp A/B for fused gate+up: DP4A (default) vs f32 (__noDp4).
+  async function _benchGateUp({ I = 3072, H = 1024, iters = 60 } = {}) {
+    const words = H / 8, gpr = H / QGROUP;
+    const mkPack = () => { const p = new Uint32Array(I * words); for (let i = 0; i < p.length; i++) p[i] = (Math.imul(i, 2654435761) >>> 0); return p; };
+    const scales = new Uint16Array(I * gpr); for (let i = 0; i < scales.length; i++) scales[i] = 0x3000 + (i % 7);
+    const x = new Float32Array(H); for (let i = 0; i < H; i++) x[i] = Math.sin(i * 0.017) * 0.8;
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bg'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), gW = mk(mkPack()), gS = mk(scales), uW = mk(mkPack()), uS = mk(scales), yb = E.createBuffer(I * 4, UF, 'yb');
+    const gRec = { pack: gW, scales: gS }, uRec = { pack: uW, scales: uS };
+    const saved = globalThis.__noDp4;
+    globalThis.__noDp4 = false; await gateUpSiluQ(xb, gRec, uRec, yb, I, H);
+    globalThis.__noDp4 = true;  await gateUpSiluQ(xb, gRec, uRec, yb, I, H);
+    await E.device().queue.onSubmittedWorkDone();
+    E.beginProfile(iters * 3 + 8); E.beginBatch();
+    for (let i = 0; i < iters; i++) { globalThis.__noDp4 = (i % 2 === 1); await gateUpSiluQ(xb, gRec, uRec, yb, I, H); }
+    await E.endBatch(); const p = await E.endProfile();
+    globalThis.__noDp4 = saved;
+    [xb, gW, gS, uW, uS, yb].forEach(bf => bf.destroy());
+    const half = iters / 2;
+    const sum = (l) => p.filter(r => r.label === l).reduce((s, r) => s + r.us, 0) / half;
+    const f32 = sum('q3.gateupQ'), dp4 = sum('q3.gateupDP4') + sum('q3.quantq8');
+    return { I, H, f32_us: +f32.toFixed(1), dp4_us: +dp4.toFixed(1), speedup: +(f32 / dp4).toFixed(3) };
+  }
+
   // ============================================================
   // App host contract — minimal shim over the fast subgroup generate().
   // (Ported from the dense app build; runs the stale single-submit-prefill +
@@ -1928,7 +2023,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
-    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4,
+    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
