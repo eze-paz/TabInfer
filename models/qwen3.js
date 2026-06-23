@@ -1732,17 +1732,48 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Debug: full logits readback (call right after a forward, before the next one).
   async function readLogits() { return E.readF32(_scr.logits, CONFIG.vocab); }
 
-  // Greedy generate, PIPELINED + GPU-resident. The decode loop chains through the
-  // GPU token history (argmax of pos P writes _tokHist[P+1]; embed at P+1 reads it),
-  // so the CPU never round-trips the token mid-loop. We submit the next forward
-  // (CPU encode, no drain wait) BEFORE reading the current token, so encode(N+1)
-  // overlaps GPU-run(N) — un-doing the serialization batching introduced.
+  // ---- Double-buffered GPU-resident decode -----------------------------------
+  // Decode tokens chain through _tokHist on the GPU (argmax@P writes _tokHist[P+1],
+  // embed@P+1 reads it), so a batch of GEN_BATCH chained forwards needs no readback
+  // between tokens. The defect this replaces: the old loop did `await readU32Range`
+  // after every batch, which DRAINS the queue — the GPU then sat idle through the CPU
+  // emit() (token decode + host markdown/stream render) and the re-encode of the next
+  // batch's first forward, every GEN_BATCH tokens. Chained forwards are strictly serial
+  // (token k+1 depends on k), so that batch boundary is the only schedulable slack.
+  // Here we SUBMIT batch N+1 before AWAITING batch N's readback, so the GPU runs the
+  // next batch while the CPU reads + emits the current one. The queue only drains at end.
+  //   emitTok(t) → false to stop (stop token); count() → tokens emitted so far.
+  // forward()s in a batch are awaited (each must finish encoding+submitting before the
+  // next, and before the readback copy is enqueued after them); the readback promise is
+  // created but NOT awaited here, so its copy submit lands right after the batch forwards.
+  async function decodeLoop(pos, maxTokens, emitTok, signal, count) {
+    const submitBatch = async () => {
+      if (signal && signal.aborted) return null;
+      const K = Math.min(GEN_BATCH, MAX_SEQ - 1 - pos);
+      if (K <= 0) return null;
+      const base = pos;
+      for (let k = 0; k < K; k++) await forward(null, base + k, { chain: true, submitOnly: true });
+      pos += K;
+      return { read: readU32Range(_tokHist, base + 1, K), K };   // copy submit enqueued AFTER the forwards
+    };
+    let inflight = (count() < maxTokens) ? await submitBatch() : null;
+    while (inflight) {
+      // Queue the next batch FIRST → GPU runs it while we read+emit the current one.
+      // Skip if the current batch already reaches maxTokens (avoids a wasted batch).
+      const next = (count() + inflight.K < maxTokens) ? await submitBatch() : null;
+      const toks = await inflight.read;
+      let stop = false;
+      for (let k = 0; k < inflight.K; k++) { if (!emitTok(toks[k]) || count() >= maxTokens) { stop = true; break; } }
+      inflight = stop ? null : next;   // a stop discards the already-computed `next` batch (≤1 wasted batch)
+    }
+  }
+
+  // Greedy generate — thin wrapper over the double-buffered decodeLoop (see above):
+  // GEN_BATCH chained forwards per batch (chained through _tokHist on the GPU, no
+  // mid-batch readback), and the next batch is submitted before the current batch's
+  // readback is awaited so the GPU never drains between batches.
   const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
   const GEN_BATCH = 8;   // tokens generated per GPU-resident batch (1 readback per batch)
-  // Batched GPU-resident greedy decode. Submit GEN_BATCH chained forwards back to
-  // back (no readback between — they chain through _tokHist on the GPU), so the K
-  // CPU encodes overlap the K GPU runs, then read all K tokens in ONE mapAsync.
-  // Removes the per-token readback sync that was capping the pipeline.
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     await loadModel({});
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
@@ -1751,19 +1782,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok0)) return TOK.decode(outIds);
-    while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
-      if (signal && signal.aborted) break;
-      const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
-      if (K <= 0) break;
-      // K chained forwards, GPU-resident: forward(pos+k) reads _tokHist[pos+k],
-      // writes _tokHist[pos+k+1]. submitOnly → CPU encodes ahead while GPU runs.
-      for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
-      const toks = await readU32Range(_tokHist, pos + 1, K);   // one readback for the batch
-      pos += K;
-      let brk = false;
-      for (let k = 0; k < K; k++) { if (!emit(toks[k]) || outIds.length >= maxTokens) { brk = true; break; } }
-      if (brk) break;
-    }
+    await decodeLoop(pos, maxTokens, emit, signal, () => outIds.length);
     return TOK.decode(outIds);
   }
 
@@ -1940,17 +1959,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       prevText = txt; return true;
     };
     if (!pushTok(tok0)) return prevText;
-    while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
-      if (signal && signal.aborted) break;
-      const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
-      if (K <= 0) break;
-      for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
-      const toks = await readU32Range(_tokHist, pos + 1, K);
-      pos += K;
-      let brk = false;
-      for (let k = 0; k < K; k++) { if (!pushTok(toks[k]) || outIds.length >= maxTokens) { brk = true; break; } }
-      if (brk) break;
-    }
+    await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length);
     const _te = performance.now();
     const _dms = _te - _tp1, _n = outIds.length;
     const _split = _pf ? (' | prefill split: encode=' + _pf.encode_ms + 'ms gpu=' + _pf.gpu_drain_ms + 'ms map=' + _pf.map_ms + 'ms') : '';

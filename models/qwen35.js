@@ -3088,6 +3088,35 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
   let _genBatch = 8;   // tokens per GPU-resident decode batch (1 readback per batch); tunable for A/B
 
+  // ---- Double-buffered GPU-resident decode (see webgpu-qwen3 for the rationale) ----
+  // Tokens chain through _tokHist on the GPU, so a batch of _genBatch chained forwards
+  // needs no readback between tokens. The old loop awaited the batch readback before
+  // submitting the next batch → the GPU DRAINED every _genBatch tokens and sat idle through
+  // the CPU emit() (decode + Thinking/markdown render) and the next batch's re-encode.
+  // Chained forwards are strictly serial (token k+1 depends on k), so that boundary is the
+  // only schedulable slack. Here we SUBMIT batch N+1 before AWAITING batch N's readback, so
+  // the GPU runs the next batch while the CPU reads + emits the current one. Drains only at end.
+  //   emitTok(t) → false to stop; count() → tokens emitted so far.
+  async function decodeLoop(pos, maxTokens, emitTok, signal, count) {
+    const submitBatch = async () => {
+      if (signal && signal.aborted) return null;
+      const K = Math.min(_genBatch, MAX_SEQ - 1 - pos);
+      if (K <= 0) return null;
+      const base = pos;
+      for (let k = 0; k < K; k++) await forward(null, base + k, { chain: true, submitOnly: true });
+      pos += K;
+      return { read: readU32Range(_tokHist, base + 1, K), K };   // copy submit enqueued AFTER the forwards
+    };
+    let inflight = (count() < maxTokens) ? await submitBatch() : null;
+    while (inflight) {
+      const next = (count() + inflight.K < maxTokens) ? await submitBatch() : null;
+      const toks = await inflight.read;
+      let stop = false;
+      for (let k = 0; k < inflight.K; k++) { if (!emitTok(toks[k]) || count() >= maxTokens) { stop = true; break; } }
+      inflight = stop ? null : next;   // a stop discards the already-computed `next` batch (≤1 wasted batch)
+    }
+  }
+
   // Core greedy decode over a prepared prompt id list. Prefill feeds the prompt
   // token-by-token (the DeltaNet recurrence is sequential), then a batched GPU-resident
   // decode loop chains GEN_BATCH forwards per readback. onToken(piece) gets each decoded
@@ -3307,16 +3336,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok)) { _recordDecodeStats(L, startPos, _tStart, _tFirst, _tFirst, outIds.length); return outIds; }
-    while (outIds.length < maxTokens && pos + 1 < MAX_SEQ) {
-      if (signal && signal.aborted) break;
-      const K = Math.min(_genBatch, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
-      if (K <= 0) break;
-      for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, submitOnly: true });
-      const toks = await readU32Range(_tokHist, pos + 1, K);   // one readback for the whole batch
-      pos += K;
-      let brk = false; for (let k = 0; k < K; k++) { if (!emit(toks[k])) { brk = true; break; } }
-      if (brk) break;
-    }
+    await decodeLoop(pos, maxTokens, emit, signal, () => outIds.length);
     _recordDecodeStats(L, startPos, _tStart, _tFirst, (typeof performance !== 'undefined') ? performance.now() : 0, outIds.length);
     return outIds;
   }
