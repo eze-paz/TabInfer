@@ -38,10 +38,9 @@
   <div style="margin:0.4rem 0;">
     <label style="color:#8b949e; font-size:0.85rem;">model
       <select id="model" style="background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:0.2rem;">
-        <option value="qwen35">Qwen3.5-0.8B (hybrid DeltaNet, ~1.75GB)</option>
-        <option value="qwen35-2b">Qwen3.5-2B (bf16 weights, ~4.5GB DL)</option>
-        <option value="qwen35-2b-awq">Qwen3.5-2B AWQ-int4 (pre-quantized, ~2.5GB DL)</option>
         <option value="qwen3">Qwen3-0.6B (~1.5GB)</option>
+        <option value="qwen3-1.7b">Qwen3-1.7B (~3.4GB)</option>
+        <option value="qwen3-4b">Qwen3-4B (~6.5GB)</option>
       </select>
     </label>
     <button id="gen">Load model &amp; generate</button>
@@ -70,7 +69,6 @@
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
 <script src="../modules/webgpu-engine.js?v=44"></script>
 <script src="../modules/webgpu-qwen3.js?v=72"></script>
-<script src="../modules/webgpu-qwen35.js?v=82"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -149,11 +147,11 @@
 
   async function runGen(stress) {
     const sel = $('model').value;
-    const Q = sel === 'qwen3' ? window.SandpieQwen3 : window.SandpieQwen35;
-    const variant = sel === 'qwen35-2b-awq' ? '2B-AWQ' : (sel === 'qwen35-2b' ? '2B' : (sel === 'qwen35' ? '0.8B' : undefined));
+    const Q = window.SandpieQwen3;
+    const variant = sel === 'qwen3-4b' ? '4B' : (sel === 'qwen3-1.7b' ? '1.7B' : undefined);
     $('gen').disabled = $('genStress').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
     try {
-      // (re)load if not loaded, or if the selected Qwen3.5 variant differs from the loaded one
+      // (re)load if not loaded, or if the selected variant differs from the loaded one
       const needLoad = !Q.isLoaded() || (variant && Q.variant && Q.variant() !== variant);
       if (needLoad) {
         $('genstat').textContent = 'loading model (first run downloads weights, cached after)…';
