@@ -396,10 +396,14 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
   }
 }`;
-  let _dp4 = null;   // scratch {xq, xs, cap} for the quantized activation, sized to K
+  let _dp4 = null, _dp4dead = [];   // scratch {xq, xs, cap} for the quantized activation, sized to K
   function ensureDp4(K) {
     if (_dp4 && _dp4.cap >= K) return;
-    if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); }
+    // DON'T destroy the old buffers here: with pipelined (submitOnly) forwards in flight,
+    // queued command buffers still reference them — destroying mid-flight triggers
+    // "[Buffer xs] used in submit while destroyed" and reads garbage. Defer to unload().
+    // (Reallocation happens at most once or twice ever — K only grows to intermediate.)
+    if (_dp4) { _dp4dead.push(_dp4.xq, _dp4.xs); }
     _dp4 = { cap: K, xq: E.createBuffer((K / 4) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xq'), xs: E.createBuffer((K / QGROUP) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xs') };
   }
   function gemvDP4A(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
@@ -1662,7 +1666,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const embIds = chain ? _tokHist : setIds(idsArray);
     const embOff = chain ? posBase : 0;
     uniformReset();   // pooled uniforms get stable buffers per call-site → bind-group cache hits
-    E.beginBatch();   // record the whole forward into ONE command buffer (1 submit vs ~364)
+    // DECODE (T=1): record the whole forward as ONE submit (no mid-forward flush) — ~14ms of
+    // GPU work, far under the watchdog, so the ~15 submit-boundary stalls/token vanish (they
+    // were ~half the per-token GPU idle). PREFILL (T>1): keep the 32-op flush (big kernels →
+    // a single multi-second submit would trip the OS GPU watchdog / TDR).
+    E.beginBatch(T === 1 ? Infinity : undefined);
     await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
@@ -1907,6 +1915,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   function unload() {
     try { if (_weights) for (const k in _weights) { const b = _weights[k] && _weights[k].buf; if (b && b.destroy) try { b.destroy(); } catch (_) {} } } catch (_) {}
     try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
+    try { for (const b of _dp4dead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
+    _dp4 = null; _dp4dead = [];
     _weights = null; _kv = null; _scr = null; _loaded = false;
   }
 

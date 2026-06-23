@@ -2973,7 +2973,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const Wq  = (n) => _weights[LP + n];        // int4 record
     const s = _scr;
     uniformReset();
-    E.beginBatch();
+    // forward() is always a SINGLE token (the batched multi-token prefill is forwardPrefill).
+    // Record the whole per-token forward as ONE submit (Infinity = no mid-forward flush): a
+    // single token is only ~ms of GPU work, far under the watchdog, and the ~15 submit
+    // boundaries the 32-op flush would insert each idle the iGPU between passes (~half the
+    // per-token GPU bubble). forwardPrefill keeps the default flush (big GEMM → TDR risk).
+    E.beginBatch(Infinity);
     const embIds = chain ? _tokHist : setIds([tokenId]);
     const embOff = chain ? pos : 0;
     const emb = _weights['__embed_int4'];

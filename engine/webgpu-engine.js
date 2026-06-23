@@ -294,12 +294,17 @@ const SandpieWebGPU = (function () {
   // and submit order is preserved, so this is correctness-neutral (mirrors llama.cpp's
   // 64-kernel COMMAND_SUBMIT_BATCH_SIZE). No drain between flushes (would serialize
   // CPU/GPU) — short command buffers alone let the GPU preempt and dodge the watchdog.
-  let _batchEncoder = null, _batchCount = 0;
+  let _batchEncoder = null, _batchCount = 0, _batchFlush = 32;
   const _BATCH_FLUSH = 32;
-  function beginBatch() { _batchEncoder = device().createCommandEncoder({ label: 'forward' }); _batchCount = 0; }
+  // beginBatch(flushEvery): flush the encoder every `flushEvery` GPU ops (default 32 —
+  // keeps each submit short so a long PREFILL can't trip the OS GPU watchdog). Pass a
+  // large value (e.g. Infinity) for short, safe batches like a single T=1 DECODE forward
+  // (~14ms of GPU work total) to record the whole forward as ONE submit — eliminating the
+  // ~15 submit-boundary stalls/token that otherwise idle the iGPU between passes.
+  function beginBatch(flushEvery) { _batchEncoder = device().createCommandEncoder({ label: 'forward' }); _batchCount = 0; _batchFlush = flushEvery || _BATCH_FLUSH; }
   function _batchTick() {
     if (!_batchEncoder) return;
-    if (++_batchCount >= _BATCH_FLUSH) {
+    if (++_batchCount >= _batchFlush) {
       device().queue.submit([_batchEncoder.finish()]);
       _batchEncoder = device().createCommandEncoder({ label: 'forward' });
       _batchCount = 0;
