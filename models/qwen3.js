@@ -22,9 +22,13 @@ const SandpieQwen3 = (function () {
 
   const E = (typeof window !== 'undefined') ? window.SandpieWebGPU : null;
 
+  // Dense Qwen3 (Qwen3ForCausalLM) ONLY — same arch family, just bigger. NOTE:
+  // there is NO dense "Qwen3-2B": Qwen/Qwen3-2B is a Qwen3.5-VL multimodal model
+  // with gated-DeltaNet (linear_attention) layers + head_dim 256, which this
+  // engine can't run. The closest dense, compatible model is Qwen3-1.7B.
   const CONFIGS = {
-    '0.6B': { numLayers:28, hidden:1024,  nHeads:16, nKvHeads:8, headDim:128, intermediate:3072,  vocab:151936, ropeTheta:1000000, rmsEps:1e-6, tieEmbeddings:true },
-    '2B':   { numLayers:36, hidden:2048,  nHeads:16, nKvHeads:8, headDim:128, intermediate:11008, vocab:151936, ropeTheta:1000000, rmsEps:1e-6, tieEmbeddings:true },
+    '0.6B': { numLayers:28, hidden:1024, nHeads:16, nKvHeads:8, headDim:128, intermediate:3072, vocab:151936, ropeTheta:1000000, rmsEps:1e-6, tieEmbeddings:true },
+    '1.7B': { numLayers:28, hidden:2048, nHeads:16, nKvHeads:8, headDim:128, intermediate:6144, vocab:151936, ropeTheta:1000000, rmsEps:1e-6, tieEmbeddings:true },
   };
   // Mutable in-place so all existing CONFIG.xxx references stay valid after variant switch.
   const CONFIG = Object.assign({}, CONFIGS['0.6B']);
@@ -1452,7 +1456,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // ============================================================
   const MODEL_ROOTS = {
     '0.6B': 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/',
-    '2B':   'https://huggingface.co/Qwen/Qwen3-2B/resolve/main/',
+    '1.7B': 'https://huggingface.co/Qwen/Qwen3-1.7B/resolve/main/',
   };
   let MODEL_ROOT = MODEL_ROOTS['0.6B'];
   let _variant = '0.6B';
@@ -1538,14 +1542,29 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
     if (cache) { const hit = await cache.match(url); if (hit) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await hit.arrayBuffer(); } }
     const resp = await fetch(url);
+    if (!resp.ok) throw new Error('download failed: HTTP ' + resp.status + ' for ' + url);
     const total = +(resp.headers.get('content-length') || 0);
-    const reader = resp.body.getReader(); const chunks = []; let recv = 0;
-    for (;;) {
-      const { done, value } = await reader.read(); if (done) break;
-      chunks.push(value); recv += value.length;
-      if (total) onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
+    const reader = resp.body.getReader();
+    let recv = 0, out;
+    if (total) {
+      // Known size → preallocate ONE buffer and write directly into it. The
+      // multi-GB shards (Qwen3-1.7B = 3.28GB) would otherwise need the chunks[]
+      // array AND a second copy buffer alive at once (~2× peak) → "Array buffer
+      // allocation failed" on a 16GB box.
+      out = new Uint8Array(total);
+      for (;;) {
+        const { done, value } = await reader.read(); if (done) break;
+        out.set(value, recv); recv += value.length;
+        onProgress && onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
+      }
+    } else {
+      const chunks = [];
+      for (;;) {
+        const { done, value } = await reader.read(); if (done) break;
+        chunks.push(value); recv += value.length;
+      }
+      out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
     }
-    const out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
     if (cache) { try { await cache.put(url, new Response(out, { headers: { 'content-length': String(recv) } })); } catch (_) {} }
     return out.buffer;
   }
@@ -2081,7 +2100,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
   const DEFAULT_MODELS = [
     { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (~1.1GB download)' },
-    { id: 'qwen3-2b',   modelId: '2B',   label: 'Qwen3-2B dense (~4.9GB download)'   },
+    { id: 'qwen3-1.7b', modelId: '1.7B', label: 'Qwen3-1.7B dense (~3.9GB download)' },
   ];
   const DEFAULT_N_CTX = MAX_SEQ;
 

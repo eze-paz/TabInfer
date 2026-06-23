@@ -39,7 +39,7 @@
     <label style="color:#8b949e; font-size:0.85rem;">model
       <select id="model" style="background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:0.2rem;">
         <option value="qwen3">Qwen3-0.6B (~1.1GB)</option>
-        <option value="qwen3-2b">Qwen3-2B (~4.9GB)</option>
+        <option value="qwen3-1.7b">Qwen3-1.7B (~3.9GB)</option>
       </select>
     </label>
     <button id="gen">Load model &amp; generate</button>
@@ -67,7 +67,7 @@
 
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
 <script src="../modules/webgpu-engine.js?v=44"></script>
-<script src="../modules/webgpu-qwen3.js?v=74"></script>
+<script src="../modules/webgpu-qwen3.js?v=75"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -147,7 +147,7 @@
   async function runGen(stress) {
     const sel = $('model').value;
     const Q = window.SandpieQwen3;
-    const variant = sel === 'qwen3-2b' ? '2B' : '0.6B';
+    const variant = sel === 'qwen3-1.7b' ? '1.7B' : '0.6B';
     $('gen').disabled = $('genStress').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
     try {
       // (re)load if not loaded, or if the selected variant differs from the loaded one
