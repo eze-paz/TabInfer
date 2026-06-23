@@ -2030,7 +2030,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
     const maxTokens = (provider && (provider.maxTokens | 0)) || 512;
-    const variant = (provider && provider.modelId && CONFIGS[provider.modelId]) ? provider.modelId : '0.6B';
+    // conversations.js stores the dropdown's modelId in provider.endpoint (the
+    // model picker sets spEndpoint = modelId). Accept either field.
+    const _wantV = (provider && (provider.endpoint || provider.modelId)) || '';
+    const variant = CONFIGS[_wantV] ? _wantV : '0.6B';
     try {
       emit({ type: 'info', message: 'Loading Qwen3-' + variant + ' dense (WebGPU)… first run downloads the weights.' });
       let lastPct = -1;
