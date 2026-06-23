@@ -22,13 +22,12 @@ const SandpieQwen3 = (function () {
 
   const E = (typeof window !== 'undefined') ? window.SandpieWebGPU : null;
 
-  const CONFIG = {
-    numLayers: 28, hidden: 1024,
-    nHeads: 16, nKvHeads: 8, headDim: 128,
-    intermediate: 3072, vocab: 151936,
-    ropeTheta: 1000000, rmsEps: 1e-6,
-    tieEmbeddings: true,
+  const CONFIGS = {
+    '0.6B': { numLayers:28, hidden:1024,  nHeads:16, nKvHeads:8, headDim:128, intermediate:3072,  vocab:151936, ropeTheta:1000000, rmsEps:1e-6, tieEmbeddings:true },
+    '2B':   { numLayers:36, hidden:2048,  nHeads:16, nKvHeads:8, headDim:128, intermediate:11008, vocab:151936, ropeTheta:1000000, rmsEps:1e-6, tieEmbeddings:true },
   };
+  // Mutable in-place so all existing CONFIG.xxx references stay valid after variant switch.
+  const CONFIG = Object.assign({}, CONFIGS['0.6B']);
 
   const U = GPUBufferUsage;
   const ST = () => (U.STORAGE | U.COPY_DST | U.COPY_SRC);
@@ -1451,7 +1450,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Kernels read array<f16> and convert to f32 for the math (activations stay f32).
   // bf16→f16 goes via f32 (different exponent widths). Cached in Cache Storage.
   // ============================================================
-  const MODEL_ROOT = 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/';
+  const MODEL_ROOTS = {
+    '0.6B': 'https://huggingface.co/Qwen/Qwen3-0.6B/resolve/main/',
+    '2B':   'https://huggingface.co/Qwen/Qwen3-2B/resolve/main/',
+  };
+  let MODEL_ROOT = MODEL_ROOTS['0.6B'];
+  let _variant = '0.6B';
   const CACHE_NAME = 'sandpie-webgpu-models';
   let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
@@ -1530,8 +1534,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
   const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight';
 
-  async function fetchModelBytes(onProgress) {
-    const url = MODEL_ROOT + 'model.safetensors';
+  async function fetchModelBytes(url, onProgress) {
     let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
     if (cache) { const hit = await cache.match(url); if (hit) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await hit.arrayBuffer(); } }
     const resp = await fetch(url);
@@ -1547,17 +1550,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return out.buffer;
   }
 
-  async function loadModel({ onProgress } = {}) {
-    if (_loaded) return;
-    await E.init();
-    await TOK.load(MODEL_ROOT);
-    onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
-    const ab = await fetchModelBytes(onProgress);
-    onProgress && onProgress({ phase: 'parse', pct: 0 });
+  // Parse a single safetensors ArrayBuffer and upload all tensors into _weights.
+  function _parseSafetensors(ab, onPct) {
     const headerLen = Number(new DataView(ab, 0, 8).getBigUint64(0, true));
     const header = JSON.parse(dec_(new Uint8Array(ab, 8, headerLen)));
     const dataStart = 8 + headerLen;
-    _weights = {};
     const names = Object.keys(header).filter(n => n !== '__metadata__');
     for (let i = 0; i < names.length; i++) {
       const name = names[i], info = header[name];
@@ -1566,7 +1563,6 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const raw = new Uint8Array(ab, dataStart + begin, end - begin);
       if (info.dtype !== 'BF16' && isQuantWeight(name)) throw new Error('quant path expects BF16 for ' + name);
       if (isQuantWeight(name)) {
-        // INT4: [N,K] = shape. Pack + scales.
         const N = info.shape[0], K = info.shape[1];
         const { pack, scales } = quantizeInt4Bf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
         const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.pack');
@@ -1584,8 +1580,55 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         E.device().queue.writeBuffer(buf, 0, f16bits);
         _weights[name] = { buf, shape: info.shape, numel };
       }
-      if ((i & 15) === 0) onProgress && onProgress({ phase: 'parse', pct: Math.round(i / names.length * 100) });
+      if ((i & 15) === 0) onPct && onPct(Math.round(i / names.length * 100));
     }
+    onPct && onPct(100);
+  }
+
+  async function loadModel({ onProgress, variant = '0.6B' } = {}) {
+    if (_loaded && _variant === variant) return;
+    if (_loaded) unload();
+    if (!(variant in CONFIGS)) throw new Error('unknown Qwen3 variant: ' + variant);
+    Object.assign(CONFIG, CONFIGS[variant]);
+    MODEL_ROOT = MODEL_ROOTS[variant];
+    _variant = variant;
+    await E.init();
+    await TOK.load(MODEL_ROOT);
+    onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
+
+    // Discover shards via index.json; fall back to single model.safetensors.
+    let shardFiles = null;
+    try {
+      const r = await fetch(MODEL_ROOT + 'model.safetensors.index.json');
+      if (r.ok) {
+        const idx = await r.json();
+        const seen = new Set();
+        shardFiles = [];
+        for (const fn of Object.values(idx.weight_map || {})) {
+          if (!seen.has(fn)) { seen.add(fn); shardFiles.push(fn); }
+        }
+        shardFiles.sort();
+      }
+    } catch (_) {}
+
+    _weights = {};
+    if (shardFiles && shardFiles.length > 0) {
+      for (let s = 0; s < shardFiles.length; s++) {
+        const url = MODEL_ROOT + shardFiles[s];
+        const ab = await fetchModelBytes(url, p => {
+          if (!p) return;
+          const base = s / shardFiles.length, step = 1 / shardFiles.length;
+          if (p.phase === 'download') onProgress && onProgress({ phase: 'download', pct: Math.round((base + step * p.pct / 100) * 100), recv: p.recv, total: p.total });
+          else if (p.phase === 'cache') onProgress && onProgress({ phase: 'cache', pct: 100 });
+        });
+        _parseSafetensors(ab, pct => onProgress && onProgress({ phase: 'parse', pct: Math.round((s + pct / 100) / shardFiles.length * 100) }));
+      }
+    } else {
+      const ab = await fetchModelBytes(MODEL_ROOT + 'model.safetensors', onProgress);
+      onProgress && onProgress({ phase: 'parse', pct: 0 });
+      _parseSafetensors(ab, pct => onProgress && onProgress({ phase: 'parse', pct }));
+    }
+
     onProgress && onProgress({ phase: 'parse', pct: 100 });
     _loaded = true;
   }
@@ -1783,7 +1826,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
   const GEN_BATCH = 8;   // tokens generated per GPU-resident batch (1 readback per batch)
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
-    await loadModel({});
+    await loadModel({ variant: _variant });
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     const L = ids.length;
     const tok0 = await forward(ids, 0);          // prefill → _tokHist[L]=token0
@@ -1913,7 +1956,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   //  GEN_BATCH decode path, which uses subgroupAdd → fast on Iris Xe.)
   // ============================================================
   function unload() {
-    try { if (_weights) for (const k in _weights) { const b = _weights[k] && _weights[k].buf; if (b && b.destroy) try { b.destroy(); } catch (_) {} } } catch (_) {}
+    try { if (_weights) for (const k in _weights) { const w = _weights[k]; if (!w) continue; if (w.pack && w.pack.destroy) try { w.pack.destroy(); } catch (_) {} if (w.scales && w.scales.destroy) try { w.scales.destroy(); } catch (_) {} if (w.buf && w.buf.destroy) try { w.buf.destroy(); } catch (_) {} } } catch (_) {}
     try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
     try { for (const b of _dp4dead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
     _dp4 = null; _dp4dead = [];
@@ -1923,7 +1966,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // Stream from pre-encoded ids (same prefill+decode as generate(), but the
   // caller supplies the full chat token sequence and gets clean UTF-8 deltas).
   async function _streamIds(ids, { maxTokens = 512, onToken, signal } = {}) {
-    await loadModel({});
+    await loadModel({ variant: _variant });
     const L = ids.length;
     if (L >= MAX_SEQ) throw new Error('prompt too long: ' + L + ' tokens >= MAX_SEQ ' + MAX_SEQ);
     // One-time device fingerprint — compare against the harness to spot a different
@@ -1987,10 +2030,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
     const maxTokens = (provider && (provider.maxTokens | 0)) || 512;
+    const variant = (provider && provider.modelId && CONFIGS[provider.modelId]) ? provider.modelId : '0.6B';
     try {
-      emit({ type: 'info', message: 'Loading Qwen3-0.6B dense (WebGPU)… first run downloads the weights.' });
+      emit({ type: 'info', message: 'Loading Qwen3-' + variant + ' dense (WebGPU)… first run downloads the weights.' });
       let lastPct = -1;
-      await loadModel({ onProgress: (p) => {
+      await loadModel({ variant, onProgress: (p) => {
         if (!p) return;
         if (p.phase === 'download') { const pct = p.pct | 0; if (pct === lastPct) return; lastPct = pct; emit({ type: 'info', message: 'Downloading… ' + pct + '%' + (p.recv ? ' (' + (p.recv / 1e9).toFixed(2) + 'GB)' : '') }); }
         else if (p.phase === 'parse') emit({ type: 'info', message: 'Preparing weights… ' + (p.pct || 0) + '%' });
@@ -2033,7 +2077,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     emit({ type: 'agent_done' });
   }
   const DEFAULT_MODELS = [
-    { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (fast subgroup build)' },
+    { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (~1.1GB download)' },
+    { id: 'qwen3-2b',   modelId: '2B',   label: 'Qwen3-2B dense (~4.9GB download)'   },
   ];
   const DEFAULT_N_CTX = MAX_SEQ;
 
@@ -2041,7 +2086,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
-    TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded,
+    TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
     runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
