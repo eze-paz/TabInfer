@@ -626,85 +626,118 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const GEMM_WG_M = 32, GEMM_WG_N = 8, GEMM_TILE_M = 4, GEMM_TILE_N = 4, GEMM_TILE_K = 16;
   const GEMM_BM = GEMM_WG_M * GEMM_TILE_M;   // 128 tokens/block (BM=256 hurt occupancy on Iris Xe; T=256 fills 2 blocks "free")
   const GEMM_BN = GEMM_WG_N * GEMM_TILE_N;   // 32 outputs/block
-  const GEMMQ_WGSL = `
+  // FAST GEMM (ported verbatim from the deleted Qwen3.5 fork, where it measured ~548
+  // GFLOP/s on THIS Iris Xe gen-12lp). The dense engine had been left on an older
+  // 128×32 / BK=16 / f32-scalar kernel at ~193 GFLOP/s — that was the ~3× prefill gap
+  // vs llama.cpp. 64×64 output tile/workgroup, BK=QGROUP=32 deep: each k-step stages a
+  // 64-tok×32 X tile + a 64-row×32 dequantized W tile into f16 shared mem (weights
+  // dequant ONCE), then each thread accumulates a 4×4 register block via vec4 dot().
+  // Accumulators are codegen-UNROLLED to static scalars (acc0..15) — a WGSL array<>
+  // here spills to memory and tanks throughput (a naive array-based vectorize measured
+  // 84 GFLOP/s, SLOWER than the f32 original). f16math = native-f16 dot (×2 FMA rate),
+  // cross-K accumulate in f32; picked by probeF16Gemm (defaults to caps.hasF16). Bank-
+  // pad OFF (measured 10% regression on gen-12lp). No subgroup/coop-matrix (gated off).
+  const GEMMQ_BM = 64, GEMMQ_BN = 64, GEMMQ_BK = QGROUP, GEMMQ_TM = 4, GEMMQ_TN = 4;
+  let _f16Math = null;   // null = auto (caps.hasF16); set by probeF16Gemm / _setF16Math
+  function _useF16Math() { return _f16Math !== null ? _f16Math : !!(E.caps && E.caps() && E.caps().hasF16); }
+  const _gemmPad = false;   // bank-conflict padding — MEASURED 10% regression on gen-12lp → off
+  function gemmqWgsl(f16math, pad) {
+    const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = GEMMQ_BK, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
+    const NTH = (BM / TM) * (BN / TN), TILEA4 = BM * BK4, TILEB4 = BN * BK4, RN = BN / TN;
+    const SW = BK4 + (pad ? 1 : 0);
+    let s = `
 enable f16;
-struct D { T:u32, N:u32, K:u32, acc:u32, _p0:u32, _p1:u32, _p2:u32, _p3:u32 };
-@group(0) @binding(0) var<storage, read>       x  : array<f32>;   // [T,K]
-@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // int4 packed, words=K/8 per row
-@group(0) @binding(2) var<storage, read>       sc : array<f16>;   // scales, gpr=K/${QGROUP} per row
-@group(0) @binding(3) var<storage, read_write> y  : array<f32>;   // [T,N]
+struct D { T:u32, N:u32, K:u32, acc:u32 };
+@group(0) @binding(0) var<storage, read>       X  : array<vec4<f32>>;   // [T*K/4]
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles (q+8)
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/${QGROUP}]
+@group(0) @binding(3) var<storage, read_write> Y  : array<f32>;          // [T*N]
 @group(0) @binding(4) var<uniform>             d  : D;
-const WG_M=${GEMM_WG_M}u; const WG_N=${GEMM_WG_N}u; const TILE_M=${GEMM_TILE_M}u; const TILE_N=${GEMM_TILE_N}u; const TILE_K=${GEMM_TILE_K}u;
-const BM=WG_M*TILE_M; const BN=WG_N*TILE_N; const NTHREAD=WG_M*WG_N;
-var<workgroup> xs : array<f32, BM*TILE_K>;
-var<workgroup> ws : array<f32, BN*TILE_K>;
-@compute @workgroup_size(${GEMM_WG_M * GEMM_WG_N},1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
-  let tid = lidv.x;
-  let nBlkN = (d.N + BN - 1u)/BN;
-  let blk = wg.x + wg.y*nwg.x;
-  let blockM = (blk / nBlkN) * BM;
-  let blockN = (blk % nBlkN) * BN;
-  let lm = tid / WG_N; let ln = tid % WG_N;
-  let words = d.K/8u; let gpr = d.K/${QGROUP}u;
-  var acc : array<array<f32,TILE_N>,TILE_M>;
-  for (var i=0u;i<TILE_M;i=i+1u){ for(var j=0u;j<TILE_N;j=j+1u){ acc[i][j]=0.0; } }
-  var k0=0u;
-  loop {
-    if (k0 >= d.K) { break; }
-    var e = tid;
-    loop { if (e >= BM*TILE_K) { break; }                 // load X tile [BM,TILE_K]
-      let r = e / TILE_K; let c = e % TILE_K;
-      let gm = blockM + r; let gk = k0 + c;
-      xs[e] = select(0.0, x[gm*d.K + gk], gm < d.T && gk < d.K);
-      e = e + NTHREAD;
+var<workgroup> As : array<vec4<f16>, ${BM * SW}>;
+var<workgroup> Bs : array<vec4<f16>, ${BN * SW}>;
+@compute @workgroup_size(${NTH}, 1, 1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
+  let mBase = wg.y*${BM}u; let nBase = wg.x*${BN}u;
+  let WPR = d.K/8u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u; let nTiles = (d.K + ${BK}u - 1u)/${BK}u;
+`;
+    for (let r = 0; r < TM * TN; r++) s += `  var acc${r}:f32=0.0;\n`;
+    s += `  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
+    let k0 = kt*${BK}u;
+    for (var r:u32=0u; r<${TILEA4 / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let lt = idx/${BK4}u; let kk4 = idx%${BK4}u; let gt = mBase+lt;
+      As[lt*${SW}u + kk4] = select(vec4<f16>(0.0), vec4<f16>(X[gt*K4 + k0/4u + kk4]), gt<d.T);
     }
-    e = tid;
-    loop { if (e >= BN*TILE_K) { break; }                 // load + dequant W tile [BN,TILE_K]
-      let r = e / TILE_K; let c = e % TILE_K;
-      let gn = blockN + r; let gk = k0 + c;
-      var v = 0.0;
-      if (gn < d.N && gk < d.K) {
-        let nib = (W[gn*words + (gk>>3u)] >> (4u*(gk & 7u))) & 0xFu;
-        v = (f32(nib) - 8.0) * f32(sc[gn*gpr + gk/${QGROUP}u]);
+    for (var r:u32=0u; r<${TILEB4 / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
+      var v:vec4<f32> = vec4<f32>(0.0);
+      if (gn<d.N) {
+        let word = W[gn*WPR + k0/8u + kk4/2u];
+        let lo = vec4<f32>(unpack4xU8(word & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+        let hi = vec4<f32>(unpack4xU8((word >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+        let sv = f32(sc[gn*gpr + kt]);
+        if ((kk4 & 1u) == 0u) { v = vec4<f32>(lo.x,hi.x,lo.y,hi.y) * sv; } else { v = vec4<f32>(lo.z,hi.z,lo.w,hi.w) * sv; }
       }
-      ws[e] = v;
-      e = e + NTHREAD;
+      Bs[ln*${SW}u + kk4] = vec4<f16>(v);
     }
     workgroupBarrier();
-    let kEnd = min(TILE_K, d.K - k0);
-    var kk=0u;
-    loop { if (kk >= kEnd) { break; }
-      var xr : array<f32,TILE_M>;
-      for (var i=0u;i<TILE_M;i=i+1u){ xr[i] = xs[(lm*TILE_M+i)*TILE_K + kk]; }
-      for (var j=0u;j<TILE_N;j=j+1u){
-        let wv = ws[(ln*TILE_N+j)*TILE_K + kk];
-        for (var i=0u;i<TILE_M;i=i+1u){ acc[i][j] = acc[i][j] + xr[i]*wv; }
-      }
-      kk = kk + 1u;
-    }
+    for (var kk4:u32=0u; kk4<${BK4}u; kk4=kk4+1u) {
+`;
+    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u + ${i}u)*${SW}u + kk4];\n`;
+    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u + ${j}u)*${SW}u + kk4];\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += f16math
+      ? `      acc${i * TN + j} = acc${i * TN + j} + f32(dot(a${i}, b${j}));\n`
+      : `      acc${i * TN + j} = acc${i * TN + j} + dot(vec4<f32>(a${i}), vec4<f32>(b${j}));\n`;
+    s += `    }
     workgroupBarrier();
-    k0 = k0 + TILE_K;
   }
-  for (var i=0u;i<TILE_M;i=i+1u){
-    let gm = blockM + lm*TILE_M + i;
-    if (gm < d.T) {
-      for (var j=0u;j<TILE_N;j=j+1u){
-        let gn = blockN + ln*TILE_N + j;
-        if (gn < d.N) {
-          let idx = gm*d.N + gn;
-          y[idx] = select(0.0, y[idx], d.acc != 0u) + acc[i][j];
-        }
-      }
-    }
+`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `  { let gm=mBase+tM*${TM}u+${i}u; let gn=nBase+tN*${TN}u+${j}u; if (gm<d.T && gn<d.N) { let idx=gm*d.N+gn; Y[idx]=select(0.0,Y[idx],d.acc!=0u)+acc${i * TN + j}; } }\n`;
+    s += `}`;
+    return s;
   }
-}`;
   function gemmQ(xBuf, wrec, yBuf, T, N, K, acc) {
-    const pipe = E.getPipeline('q3.gemmQ', GEMMQ_WGSL);
-    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0, 0, 0, 0, 0]));
-    const blocks = Math.ceil(T / GEMM_BM) * Math.ceil(N / GEMM_BN);
-    const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
-    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [gx, gy, 1]);
+    const f16 = _useF16Math(), pad = _gemmPad;
+    const key = (f16 ? 'q3.gemmQ.f16' : 'q3.gemmQ') + (pad ? '.p' : '');
+    const pipe = E.getPipeline(key, gemmqWgsl(f16, pad));
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
+    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
+  }
+  // Verify the f16-dot GEMM vs the f32-dot reference at load; a GPU that computes f16
+  // wrong falls back to f32. Defaults to caps.hasF16 if never called.
+  let _f16Probed = false;
+  async function probeF16Gemm() {
+    if (_f16Probed) return; _f16Probed = true;
+    if (_f16Math !== null) return;
+    if (!(E.caps && E.caps() && E.caps().hasF16)) { _f16Math = false; return; }
+    let bufs = [];
+    try {
+      const T = 8, N = 64, K = 256;
+      const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.17);
+      const Wf = new Float32Array(N * K); for (let i = 0; i < Wf.length; i++) Wf[i] = Math.cos(i * 0.013);
+      const u16 = new Uint16Array(Wf.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < Wf.length; i++) { t[0] = Wf[i]; u16[i] = ti[0] >>> 16; }
+      const { pack, scales } = quantizeInt4Bf16(u16, N, K);
+      const xb = f32buf(x);
+      const pb = E.createBuffer(pack.byteLength, ST(), 'f16probe.pk'); E.device().queue.writeBuffer(pb, 0, pack);
+      const sb = E.createBuffer(scales.byteLength, ST(), 'f16probe.sc'); E.device().queue.writeBuffer(sb, 0, scales);
+      const yb = E.createBuffer(T * N * 4, ST(), 'f16probe.y');
+      const wrec = { pack: pb, scales: sb };
+      bufs = [xb, pb, sb, yb];
+      _f16Math = true;  await gemmQ(xb, wrec, yb, T, N, K, false); const yF16 = Array.from(await E.readF32(yb, T * N));
+      _f16Math = false; await gemmQ(xb, wrec, yb, T, N, K, false); const yRef = Array.from(await E.readF32(yb, T * N));
+      _f16Math = null;
+      let maxErr = 0, ref = 0;
+      for (let i = 0; i < T * N; i++) { maxErr = Math.max(maxErr, Math.abs(yF16[i] - yRef[i])); ref = Math.max(ref, Math.abs(yRef[i])); }
+      const rel = maxErr / (ref || 1);
+      if (rel > 3e-2) { _f16Math = false; console.warn('[qwen3] f16 prefill GEMM WRONG (rel ' + rel.toFixed(3) + ') — using f32 dot'); }
+      else console.log('[qwen3] f16 prefill GEMM verified (rel ' + rel.toExponential(1) + ') — keeping f16 dot');
+    } catch (e) {
+      _f16Math = false;
+      console.warn('[qwen3] f16 GEMM probe failed — using f32 dot:', (e && e.message) || e);
+    } finally {
+      for (const b of bufs) { try { b.destroy(); } catch (_) {} }
+    }
   }
 
   // ---- DP4A int8 tiled GEMM (prefill) — experimental A/B vs gemmQ ----
@@ -1451,7 +1484,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await gemmQ(xb,{pack:pb,scales:sb},yb,T,N,K);
       const got=await E.readF32(yb,T*N); const y=new Float32Array(T*N);
       for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*Wdq[n*K+k];y[t*N+n]=a;}
-      check('gemmQ', maxAbs(got,y), 1e-2);
+      let _ref=0; for(let i=0;i<y.length;i++)_ref=Math.max(_ref,Math.abs(y[i]));
+      check('gemmQ', maxAbs(got,y)/(_ref||1), 3e-2);   // RELATIVE — f16 shared tiles round ~0.3%
       [xb,pb,sb,yb].forEach(b=>b.destroy());
     }
     // --- gateUpSiluQ (fused int4 gate+up+silu, T=1) vs CPU dequant ---
@@ -1826,6 +1860,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     MODEL_ROOT = MODEL_ROOTS[variant];
     _variant = variant;
     await E.init();
+    try { await probeF16Gemm(); } catch (_) {}   // pick f16 vs f32 prefill-GEMM dot for this GPU
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
 
