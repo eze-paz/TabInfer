@@ -1569,7 +1569,34 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return out.buffer;
   }
 
-  // Parse a single safetensors ArrayBuffer and upload all tensors into _weights.
+  // Quantize-or-f16 a single tensor's raw bytes and upload it into _weights.
+  // `raw` is a Uint8Array covering EXACTLY this tensor (any byteOffset).
+  function _uploadTensor(name, info, raw) {
+    const numel = info.shape.reduce((a, b) => a * b, 1);
+    if (info.dtype !== 'BF16' && isQuantWeight(name)) throw new Error('quant path expects BF16 for ' + name);
+    if (isQuantWeight(name)) {
+      const N = info.shape[0], K = info.shape[1];
+      const { pack, scales } = quantizeInt4Bf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
+      const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.pack');
+      const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.sc');
+      E.device().queue.writeBuffer(packBuf, 0, pack);
+      E.device().queue.writeBuffer(scBuf, 0, scales);
+      _weights[name] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
+    } else {
+      let f16bits;
+      if (info.dtype === 'BF16') f16bits = bf16ToF16bits(new Uint16Array(raw.buffer, raw.byteOffset, numel));
+      else if (info.dtype === 'F16') f16bits = new Uint16Array(raw.buffer, raw.byteOffset, numel);
+      else if (info.dtype === 'F32') f16bits = f32ToF16bits(new Float32Array(raw.buffer, raw.byteOffset, numel));
+      else throw new Error('unsupported dtype ' + info.dtype + ' for ' + name);
+      const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
+      E.device().queue.writeBuffer(buf, 0, f16bits);
+      _weights[name] = { buf, shape: info.shape, numel };
+    }
+  }
+
+  // Parse a single safetensors ArrayBuffer (whole shard in RAM) — used for the
+  // small single-file path (0.6B, ~1.1GB). Big sharded models go through the
+  // OPFS slice path (_parseSafetensorsFile) to avoid a multi-GB contiguous alloc.
   function _parseSafetensors(ab, onPct) {
     const headerLen = Number(new DataView(ab, 0, 8).getBigUint64(0, true));
     const header = JSON.parse(dec_(new Uint8Array(ab, 8, headerLen)));
@@ -1578,28 +1605,75 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let i = 0; i < names.length; i++) {
       const name = names[i], info = header[name];
       const [begin, end] = info.data_offsets;
-      const numel = info.shape.reduce((a, b) => a * b, 1);
-      const raw = new Uint8Array(ab, dataStart + begin, end - begin);
-      if (info.dtype !== 'BF16' && isQuantWeight(name)) throw new Error('quant path expects BF16 for ' + name);
-      if (isQuantWeight(name)) {
-        const N = info.shape[0], K = info.shape[1];
-        const { pack, scales } = quantizeInt4Bf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
-        const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.pack');
-        const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.sc');
-        E.device().queue.writeBuffer(packBuf, 0, pack);
-        E.device().queue.writeBuffer(scBuf, 0, scales);
-        _weights[name] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
-      } else {
-        let f16bits;
-        if (info.dtype === 'BF16') f16bits = bf16ToF16bits(new Uint16Array(raw.buffer, raw.byteOffset, numel));
-        else if (info.dtype === 'F16') f16bits = new Uint16Array(raw.buffer, raw.byteOffset, numel);
-        else if (info.dtype === 'F32') f16bits = f32ToF16bits(new Float32Array(raw.buffer, raw.byteOffset, numel));
-        else throw new Error('unsupported dtype ' + info.dtype + ' for ' + name);
-        const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
-        E.device().queue.writeBuffer(buf, 0, f16bits);
-        _weights[name] = { buf, shape: info.shape, numel };
-      }
+      _uploadTensor(name, info, new Uint8Array(ab, dataStart + begin, end - begin));
       if ((i & 15) === 0) onPct && onPct(Math.round(i / names.length * 100));
+    }
+    onPct && onPct(100);
+  }
+
+  // ---- Chunked shard streaming (big sharded models) ------------------------
+  // A single contiguous ArrayBuffer for a multi-GB shard fails to allocate on a
+  // RAM-constrained box ("Array buffer allocation failed") — and OPFS/CacheStorage
+  // write-through needs that many GB of *storage* quota, which is often tighter
+  // than RAM. Instead we hold the shard as a LIST of small chunks (each alloc is
+  // tiny; total is fine in RAM) and read each tensor's byte-range ACROSS chunks.
+  // Caching is best-effort (Cache Storage via a Blob — no contiguous alloc); if
+  // quota blocks it we just re-download next time. No single >2GB buffer ever.
+  async function _streamToChunks(body, total, onProgress) {
+    const reader = body.getReader(); const chunks = []; let recv = 0;
+    for (;;) {
+      const { done, value } = await reader.read(); if (done) break;
+      chunks.push(value); recv += value.length;
+      if (total && onProgress) onProgress({ phase: 'download', pct: Math.round(recv / total * 100), recv, total });
+    }
+    return chunks;
+  }
+  // Download a shard as a chunk list. Best-effort Cache Storage read/write.
+  async function _fetchShardChunks(url, onProgress) {
+    let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
+    if (cache) {
+      const hit = await cache.match(url);
+      if (hit && hit.body) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await _streamToChunks(hit.body, 0, null); }
+    }
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('download failed: HTTP ' + resp.status + ' for ' + url);
+    const total = +(resp.headers.get('content-length') || 0);
+    const chunks = await _streamToChunks(resp.body, total, onProgress);
+    if (cache) { try { await cache.put(url, new Response(new Blob(chunks), { headers: { 'content-length': String(chunks.reduce((a, c) => a + c.length, 0)) } })); } catch (_) {} }
+    return chunks;
+  }
+  // Random-access reader over a chunk list — assembles a contiguous Uint8Array
+  // for any [begin,end) byte range, copying across chunk boundaries.
+  function _chunkReader(chunks) {
+    const starts = new Array(chunks.length); let off = 0;
+    for (let i = 0; i < chunks.length; i++) { starts[i] = off; off += chunks[i].length; }
+    return function readRange(begin, end) {
+      const len = end - begin, out = new Uint8Array(len);
+      // binary-search the chunk containing `begin`
+      let lo = 0, hi = chunks.length - 1, ci = 0;
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (starts[mid] <= begin) { ci = mid; lo = mid + 1; } else hi = mid - 1; }
+      let w = 0;
+      for (let i = ci; i < chunks.length && w < len; i++) {
+        const cStart = starts[i], cEnd = cStart + chunks[i].length;
+        const from = Math.max(begin, cStart) - cStart;
+        const to = Math.min(end, cEnd) - cStart;
+        if (to > from) { out.set(chunks[i].subarray(from, to), w); w += (to - from); }
+      }
+      return out;
+    };
+  }
+  // Parse a safetensors shard held as a chunk list (no whole-shard alloc).
+  function _parseSafetensorsChunks(chunks, onPct) {
+    const read = _chunkReader(chunks);
+    const headLen = Number(new DataView(read(0, 8).buffer).getBigUint64(0, true));
+    const header = JSON.parse(dec_(read(8, 8 + headLen)));
+    const dataStart = 8 + headLen;
+    const names = Object.keys(header).filter(n => n !== '__metadata__');
+    for (let i = 0; i < names.length; i++) {
+      const name = names[i], info = header[name];
+      const [begin, end] = info.data_offsets;
+      _uploadTensor(name, info, read(dataStart + begin, dataStart + end));
+      if ((i & 7) === 0) onPct && onPct(Math.round(i / names.length * 100));
     }
     onPct && onPct(100);
   }
@@ -1634,13 +1708,18 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (shardFiles && shardFiles.length > 0) {
       for (let s = 0; s < shardFiles.length; s++) {
         const url = MODEL_ROOT + shardFiles[s];
-        const ab = await fetchModelBytes(url, p => {
+        const base = s / shardFiles.length, step = 1 / shardFiles.length;
+        const dlProg = p => {
           if (!p) return;
-          const base = s / shardFiles.length, step = 1 / shardFiles.length;
           if (p.phase === 'download') onProgress && onProgress({ phase: 'download', pct: Math.round((base + step * p.pct / 100) * 100), recv: p.recv, total: p.total });
           else if (p.phase === 'cache') onProgress && onProgress({ phase: 'cache', pct: 100 });
-        });
-        _parseSafetensors(ab, pct => onProgress && onProgress({ phase: 'parse', pct: Math.round((s + pct / 100) / shardFiles.length * 100) }));
+        };
+        const parseProg = pct => onProgress && onProgress({ phase: 'parse', pct: Math.round((s + pct / 100) / shardFiles.length * 100) });
+        // Hold the shard as a chunk LIST + range-read per tensor — never a
+        // contiguous multi-GB buffer (the "Array buffer allocation failed" cause).
+        let chunks = await _fetchShardChunks(url, dlProg);
+        _parseSafetensorsChunks(chunks, parseProg);
+        chunks = null;   // free this shard before downloading the next
       }
     } else {
       const ab = await fetchModelBytes(MODEL_ROOT + 'model.safetensors', onProgress);
