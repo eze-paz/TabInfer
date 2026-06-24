@@ -1753,6 +1753,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
   let _scr = null;    // scratch buffers, sized to _scrT rows
   let _scrT = 0;
+  // PREFIX CACHE: the exact token sequence currently resident in KV[0..length).
+  // A new prompt that shares a leading run with this (same tokens at the same
+  // absolute positions → identical RoPE phase) reuses that KV and only prefills
+  // the differing tail. Invalidated on unload and on any generate() (which
+  // clobbers KV from position 0). See [[reference_qwen3-dense-webgpu-variants]].
+  let _cachedIds = null;
   let _idsBuf = null, _idsCap = 0;
   let _tokHist = null;   // GPU token history: argmax of pos P writes [P+1]; decode embed at pos P reads [P]. Enables GPU-resident chaining (no per-token CPU readback in the loop).
 
@@ -1925,6 +1931,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const GEN_BATCH = 8;   // tokens generated per GPU-resident batch (1 readback per batch)
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     await loadModel({ variant: _variant });
+    _cachedIds = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     const L = ids.length;
     const tok0 = await forward(ids, 0);          // prefill → _tokHist[L]=token0
@@ -2058,7 +2065,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
     try { for (const b of _dp4dead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
     _dp4 = null; _dp4dead = [];
-    _weights = null; _kv = null; _scr = null; _loaded = false;
+    _weights = null; _kv = null; _scr = null; _loaded = false; _cachedIds = null;
   }
 
   // Stream from pre-encoded ids (same prefill+decode as generate(), but the
@@ -2088,16 +2095,38 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // global position posBase+t — already proven by decode (T=1,posBase>0) — so KV
     // accumulates correctly across chunks. This does NOT reduce total work (the tiled-GEMM
     // + flash-attn ports do that); it only makes a long prefill safe instead of fatal.
+    // PREFIX CACHE — find the longest leading token run shared with the KV that's
+    // already resident, and prefill only from there. The shared tokens sit at the
+    // SAME absolute positions in both turns (common prefix starts at pos 0), so
+    // their cached KV (RoPE-encoded by position) is bit-exact reusable. Always run
+    // at least the final token so we get fresh logits to start decoding from.
+    let P = 0;
+    if (_cachedIds) {
+      const m = Math.min(_cachedIds.length, L);
+      while (P < m && _cachedIds[P] === ids[P]) P++;
+    }
+    if (P > L - 1) P = L - 1;
+    const _reused = P;
     const PREFILL_CHUNK = 256;   // == GEMM_BM: each chunk fills one M-block; engine submit-split keeps TDR safe
     const _tp0 = performance.now();
     const _savedPerf = _PERF; _PERF = true;
     let tok0, _gpuMs = 0, _encMs = 0;
-    for (let off = 0; off < L; off += PREFILL_CHUNK) {
-      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-      const chunk = ids.slice(off, Math.min(off + PREFILL_CHUNK, L));
-      tok0 = await forward(chunk, off);                     // bounded submit (no TDR)
-      if (_perfData) { _gpuMs += _perfData.gpu_drain_ms; _encMs += _perfData.encode_ms; }
+    try {
+      for (let off = P; off < L; off += PREFILL_CHUNK) {
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        const chunk = ids.slice(off, Math.min(off + PREFILL_CHUNK, L));
+        tok0 = await forward(chunk, off);                     // bounded submit (no TDR)
+        if (_perfData) { _gpuMs += _perfData.gpu_drain_ms; _encMs += _perfData.encode_ms; }
+      }
+    } catch (e) {
+      _cachedIds = null;   // KV prefix now partial/uncertain → force a full prefill next turn
+      _PERF = _savedPerf;
+      throw e;
     }
+    // KV[0..L) now holds exactly `ids`. The decode loop below writes KV[L..) which
+    // does NOT touch this prefix, so the next turn (which appends after the current
+    // assistant turn) cleanly extends it.
+    _cachedIds = ids.slice(0, L);
     _PERF = _savedPerf;
     const _pf = { encode_ms: +_encMs.toFixed(1), gpu_drain_ms: +_gpuMs.toFixed(1), map_ms: 0 };
     const _tp1 = performance.now();
@@ -2114,7 +2143,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const _te = performance.now();
     const _dms = _te - _tp1, _n = outIds.length;
     const _split = _pf ? (' | prefill split: encode=' + _pf.encode_ms + 'ms gpu=' + _pf.gpu_drain_ms + 'ms map=' + _pf.map_ms + 'ms') : '';
-    console.log('[qwen3 perf] prompt=' + L + ' tok | prefill=' + ((_tp1 - _tp0) / 1000).toFixed(2) + 's (' + (L / ((_tp1 - _tp0) / 1000)).toFixed(0) + ' tok/s) | decode=' + _n + ' tok in ' + (_dms / 1000).toFixed(2) + 's (' + (_n / (_dms / 1000)).toFixed(1) + ' tok/s) | maxTokens=' + maxTokens + _split);
+    const _newTok = L - _reused;
+    console.log('[qwen3 perf] prompt=' + L + ' tok (cached ' + _reused + ', prefilled ' + _newTok + ') | prefill=' + ((_tp1 - _tp0) / 1000).toFixed(2) + 's (' + (_newTok / ((_tp1 - _tp0) / 1000)).toFixed(0) + ' tok/s) | decode=' + _n + ' tok in ' + (_dms / 1000).toFixed(2) + 's (' + (_n / (_dms / 1000)).toFixed(1) + ' tok/s) | maxTokens=' + maxTokens + _split);
     return prevText;
   }
 
