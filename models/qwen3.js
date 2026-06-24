@@ -2076,25 +2076,37 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // forward()s in a batch are awaited (each must finish encoding+submitting before the
   // next, and before the readback copy is enqueued after them); the readback promise is
   // created but NOT awaited here, so its copy submit lands right after the batch forwards.
+  // DEEP-PIPELINED decode. The single yield point — `await read` (mapAsync) — is
+  // VSYNC-PACED and contended by foreground compositing when the tab is VISIBLE, so
+  // its resolution lags far behind the GPU's compute (measured: decode ~3.4× slower
+  // focused vs backgrounded — 2.9 vs 9.8 tok/s @3200 ctx — even with the engine in a
+  // worker, because this is GPU-process/device-tick pacing, not JS-thread contention).
+  // Two defenses: (1) GEN_BATCH=32 → 4× fewer readback syncs, so each throttled
+  // resolution delivers 4× more tokens; (2) keep PIPE_DEPTH batches in flight so the
+  // GPU always has queued compute and never idles waiting for a readback. Each token
+  // is still its own bounded submit (no single giant submit → no TDR). On stop/abort
+  // we stop emitting immediately and discard the ≤PIPE_DEPTH-1 already-queued batches
+  // (bounded wasted compute + bounded KV overrun, both harmless).
   async function decodeLoop(pos, maxTokens, emitTok, signal, count) {
+    let submitted = 0;
     const submitBatch = async () => {
       if (signal && signal.aborted) return null;
-      const K = Math.min(GEN_BATCH, MAX_SEQ - 1 - pos);
+      const K = Math.min(GEN_BATCH, MAX_SEQ - 1 - pos, maxTokens + GEN_BATCH - submitted);
       if (K <= 0) return null;
       const base = pos;
       for (let k = 0; k < K; k++) await forward(null, base + k, { chain: true, submitOnly: true });
-      pos += K;
+      pos += K; submitted += K;
       return { read: readU32Range(_tokHist, base + 1, K), K };   // copy submit enqueued AFTER the forwards
     };
-    let inflight = (count() < maxTokens) ? await submitBatch() : null;
-    while (inflight) {
-      // Queue the next batch FIRST → GPU runs it while we read+emit the current one.
-      // Skip if the current batch already reaches maxTokens (avoids a wasted batch).
-      const next = (count() + inflight.K < maxTokens) ? await submitBatch() : null;
-      const toks = await inflight.read;
-      let stop = false;
-      for (let k = 0; k < inflight.K; k++) { if (!emitTok(toks[k]) || count() >= maxTokens) { stop = true; break; } }
-      inflight = stop ? null : next;   // a stop discards the already-computed `next` batch (≤1 wasted batch)
+    const inflight = [];
+    while (inflight.length < PIPE_DEPTH) { const b = await submitBatch(); if (!b) break; inflight.push(b); }
+    while (inflight.length) {
+      const cur = inflight.shift();
+      const toks = await cur.read;
+      let stop = !!(signal && signal.aborted);
+      if (!stop) for (let k = 0; k < cur.K; k++) { if (!emitTok(toks[k]) || count() >= maxTokens) { stop = true; break; } }
+      if (stop) break;                                          // discard remaining in-flight batches
+      const b = await submitBatch(); if (b) inflight.push(b);   // top the pipeline back up
     }
   }
 
@@ -2103,7 +2115,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // mid-batch readback), and the next batch is submitted before the current batch's
   // readback is awaited so the GPU never drains between batches.
   const STOP = (t) => t === SPECIAL.im_end || t === SPECIAL.endoftext;
-  const GEN_BATCH = 8;   // tokens generated per GPU-resident batch (1 readback per batch)
+  const GEN_BATCH = 32;   // tokens/GPU-resident batch (1 readback each) — big to amortize the
+                          // vsync-throttled readback when the tab is focused (see decodeLoop).
+  const PIPE_DEPTH = 3;   // batches kept in flight so the GPU never idles awaiting a readback.
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     await loadModel({ variant: _variant });
     _cachedIds = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
