@@ -35,12 +35,29 @@
   }
   const _busyOff = () => setBusy(false);
 
+  // Execute a tool the worker requested, on the MAIN thread (./sandpie-tool is page-relative
+  // and the tool worker lives here), then reply to the worker. Mirrors the other backends.
+  async function runTool(m) {
+    let result = '', artifacts = null;
+    try {
+      const res = await fetch('./sandpie-tool', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: m.name, args: m.args, conversation_file_name: m.convId }),
+      });
+      const out = res.ok ? await res.json() : { result: 'Error: tool endpoint ' + res.status };
+      result = (out && out.result != null) ? out.result : '';
+      artifacts = (out && out.artifacts) || null;
+    } catch (e) { result = 'Error: ' + ((e && e.message) || e); }
+    try { _worker && _worker.postMessage({ t: 'toolResult', reqId: m.reqId, result, artifacts }); } catch (_) {}
+  }
+
   function worker() {
     if (_worker) return _worker;
-    _worker = new Worker('modules/webgpu-worker.js?v=4');
+    _worker = new Worker('modules/webgpu-worker.js?v=5');
     _worker.onmessage = (e) => {
       const m = e.data || {};
       if (m.t === 'fatal') { console.error('[webgpu-host]', m.message); return; }
+      if (m.t === 'tool') { runTool(m); return; }   // worker asked us to execute a tool on the main thread
       const r = _runs.get(m.id);
       if (!r) return;
       if (m.t === 'emit') { try { r.emit(m.ev); } catch (_) {} }

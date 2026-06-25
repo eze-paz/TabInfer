@@ -16,7 +16,7 @@ self.window = self;
 let _ok = false;
 try {
   // KEEP the ?v= in sync with sandpie.html when these modules are bumped.
-  importScripts('webgpu-engine.js?v=44', 'webgpu-qwen3.js?v=84');
+  importScripts('webgpu-engine.js?v=44', 'webgpu-qwen3.js?v=85');
   _ok = !!self.SandpieQwen3;
 } catch (e) {
   self.postMessage({ t: 'fatal', message: 'worker import failed: ' + ((e && e.message) || e) });
@@ -25,9 +25,27 @@ try {
 const Q = self.SandpieQwen3;
 const _ctrls = new Map();   // run id -> AbortController
 
+// Tool calls must run on the MAIN thread (./sandpie-tool is page-relative + the tool
+// worker lives there). Proxy each call to the host and await its reply.
+const _toolReqs = new Map();   // reqId -> { resolve, reject }
+let _toolSeq = 0;
+if (_ok && Q && Q.setToolRunner) {
+  Q.setToolRunner((name, args, convId, signal) => new Promise((resolve, reject) => {
+    const reqId = 'tool_' + (++_toolSeq);
+    _toolReqs.set(reqId, { resolve, reject });
+    const onAbort = () => { if (_toolReqs.delete(reqId)) reject(new DOMException('aborted', 'AbortError')); };
+    if (signal) { if (signal.aborted) { onAbort(); return; } signal.addEventListener('abort', onAbort, { once: true }); }
+    self.postMessage({ t: 'tool', reqId, name, args, convId });
+  }));
+}
+
 self.onmessage = async (e) => {
   const msg = e.data || {};
   const id = msg.id;
+  if (msg.t === 'toolResult') {
+    const r = _toolReqs.get(msg.reqId); if (r) { _toolReqs.delete(msg.reqId); r.resolve({ result: msg.result, artifacts: msg.artifacts }); }
+    return;
+  }
   if (msg.t === 'run') {
     if (!_ok || !Q || !Q.runConversation) {
       self.postMessage({ t: 'err', id, name: 'Error', message: 'WebGPU worker engine failed to load' });

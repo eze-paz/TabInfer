@@ -2485,6 +2485,46 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
   const _cleanContent = (t) => (t || '').replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
 
+  // Streaming 3-state splitter for Qwen3 output: <think>…</think> → onReason (the live
+  // Thinking box), <tool_call>…</tool_call> → buffered into toolCalls[] (machine payload,
+  // NOT streamed to the user), everything else → onContent. Holds a 12-char guard tail so
+  // a tag split across token pieces is still detected. (Ported from the Qwen3.5 fork.)
+  function makeRoundParser(onReason, onContent) {
+    let buf = '', state = 'normal', cur = '';   // state ∈ normal|think|tool
+    const acc = { content: '', reasoning: '', toolCalls: [] };
+    const NEEDLES = { normal: ['<think>', '<tool_call>'], think: ['</think>'], tool: ['</tool_call>'] };
+    const out = (text) => {
+      if (!text) return;
+      if (state === 'think') { acc.reasoning += text; onReason(text); }
+      else if (state === 'tool') { cur += text; }
+      else { acc.content += text; onContent(text); }
+    };
+    const step = () => {
+      for (;;) {
+        let bi = -1, bn = null;
+        for (const n of NEEDLES[state]) { const idx = buf.indexOf(n); if (idx !== -1 && (bi === -1 || idx < bi)) { bi = idx; bn = n; } }
+        if (bi === -1) break;
+        out(buf.slice(0, bi)); buf = buf.slice(bi + bn.length);
+        if (bn === '<think>') state = 'think';
+        else if (bn === '</think>') state = 'normal';
+        else if (bn === '<tool_call>') { state = 'tool'; cur = ''; }
+        else if (bn === '</tool_call>') { state = 'normal'; if (cur.trim()) acc.toolCalls.push(cur.trim()); cur = ''; }
+      }
+      if (buf.length > 12) { out(buf.slice(0, buf.length - 12)); buf = buf.slice(buf.length - 12); }
+    };
+    return {
+      push(t) { buf += t; step(); },
+      flush() { out(buf); buf = ''; if (state === 'tool' && cur.trim()) acc.toolCalls.push(cur.trim()); },
+      get content() { return acc.content; }, get reasoning() { return acc.reasoning; }, get toolCalls() { return acc.toolCalls; },
+    };
+  }
+
+  // Tool executor — injected by the host/worker (which can reach ./sandpie-tool on the
+  // main thread). null = no tools (e.g. the bench harness). (name, args, convId, signal) →
+  // Promise<{ result, artifacts? }>.
+  let _toolRunner = null;
+  function setToolRunner(fn) { _toolRunner = (typeof fn === 'function') ? fn : null; }
+
   // ---- Persistent prefill (KV) cache for the stable system+tools prefix ----
   // The KV for the system block [0..P) never changes within a conversation (decode writes
   // ≥ L > P) and is IDENTICAL across conversations that share the same system+tools (same
@@ -2591,44 +2631,85 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       emit({ type: 'error', message: 'Qwen3 dense: ' + ((e && e.message) || e) }); emit({ type: 'agent_done' }); return;
     }
     let sys = (systemPrompt && typeof systemPrompt === 'object') ? (systemPrompt.content || '') : (systemPrompt || '');
-    const pre = toolPreamble(Array.isArray(tools) ? tools : []);
+    const toolList = (Array.isArray(tools) ? tools : []).filter(t => t && t.type === 'function');
+    const pre = toolPreamble(toolList);
     if (pre) sys = sys ? (sys + '\n\n' + pre) : pre;
-    const work = [];
-    if (sys) work.push({ role: 'system', content: sys });
-    for (const m of (messages || [])) {
-      if (!m || !m.role) continue;
+    // Render every message to PLAIN TEXT for the (text-only) encoder: assistant tool_calls
+    // and tool results become Hermes <tool_call>/<tool_response> text so the model sees them
+    // on re-prefill.
+    const tcText = (tcs) => (tcs || []).map(tc => '<tool_call>\n{"name": "' + ((tc.function && tc.function.name) || '') + '", "arguments": ' + ((tc.function && tc.function.arguments) || '{}') + '}\n</tool_call>').join('\n');
+    const norm = (m) => {
       let c = m.content;
       if (Array.isArray(c)) c = c.filter(p => p && p.type === 'text').map(p => p.text || '').join('\n');
-      work.push({ role: (m.role === 'tool' ? 'user' : m.role), content: c == null ? '' : String(c) });
-    }
+      c = (c == null) ? '' : String(c);
+      if (m.role === 'tool') return { role: 'user', content: '<tool_response>\n' + c + '\n</tool_response>' };
+      if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) c = c ? (c + '\n' + tcText(m.tool_calls)) : tcText(m.tool_calls);
+      return { role: m.role, content: c };
+    };
+    const work = [];
+    if (sys) work.push({ role: 'system', content: sys });
+    for (const m of (messages || [])) { if (m && m.role) work.push(norm(m)); }
+
+    const MAX_ROUNDS = toolList.length ? 8 : 1;
+    let pSys = 0, ids0 = null;
     try {
-      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-      emit({ type: 'round_start' });
-      let firstTok = false, full = '';
-      const ids = TOK.encodeChat(work);
-      // Stable system+tools prefix length = the leading tokens shared with a system-only
-      // render (they diverge at the first user token / the generation prompt).
-      let pSys = 0;
-      if (sys) { try { pSys = _lcpLen(TOK.encodeChat([{ role: 'system', content: sys }]), ids); } catch (_) { pSys = 0; } }
-      // If the in-memory KV doesn't already cover the system prefix (fresh load / model
-      // switch), try restoring it from disk so the system prompt isn't re-prefilled.
-      if (pSys >= 16 && (!_cachedIds || _lcpLen(_cachedIds, ids) < pSys)) {
-        try { const r = await restoreKvPrefix(variant, ids, pSys); if (r) emit({ type: 'info', message: 'Restored cached prompt…' }); } catch (_) {}
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        emit({ type: 'round_start' });
+        let firstTok = false;
+        const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
+        const parser = makeRoundParser(
+          (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },   // <think> → Thinking box
+          (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },     // answer → streamed content
+        );
+        const ids = TOK.encodeChat(work);
+        if (round === 0) {
+          ids0 = ids;
+          // Persistent prompt cache: restore the stable system+tools prefix KV (skips its prefill).
+          if (sys) { try { pSys = _lcpLen(TOK.encodeChat([{ role: 'system', content: sys }]), ids); } catch (_) { pSys = 0; } }
+          if (pSys >= 16 && (!_cachedIds || _lcpLen(_cachedIds, ids) < pSys)) {
+            try { const r = await restoreKvPrefix(variant, ids, pSys); if (r) emit({ type: 'info', message: 'Restored cached prompt…' }); } catch (_) {}
+          }
+        }
+        await _streamIds(ids, { maxTokens, signal, onToken: (p) => parser.push(p) });
+        parser.flush();
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        emit({ type: 'info', message: null });
+
+        const content = parser.content.replace(/^\s+/, '');
+        const toolCalls = [];
+        parser.toolCalls.forEach((raw, k) => {
+          try { const o = JSON.parse(raw); if (o && o.name) toolCalls.push({ id: 'call_' + round + '_' + k, type: 'function', function: { name: o.name, arguments: JSON.stringify(o.arguments || {}) } }); } catch (_) {}
+        });
+        // Synthesize the tool_calls delta so conversations.js builds the call bubbles.
+        if (toolCalls.length) emit({ type: 'delta', delta: { tool_calls: toolCalls.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } })) } });
+        emit({ type: 'round_end', content });
+        const asst = { role: 'assistant', content };
+        if (toolCalls.length) asst.tool_calls = toolCalls;
+        emit({ type: 'message_added', message: asst });
+        work.push(norm(asst));   // text-render the assistant turn (incl. tool_calls) for re-prefill
+        if (!toolCalls.length) break;   // no tools → turn complete
+
+        if (!_toolRunner) { emit({ type: 'info', message: null }); break; }   // can't run tools in this context
+        for (const tc of toolCalls) {
+          if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+          emit({ type: 'tool_started', tc });
+          let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (_) {}
+          let out;
+          try { out = await _toolRunner(tc.function.name, args, convId, signal); }
+          catch (e) { if (e && e.name === 'AbortError') throw e; out = { result: 'Error: ' + ((e && e.message) || e) }; }
+          const toolResult = (out && out.result != null) ? out.result : '';
+          emit({ type: 'tool_result', id: tc.id, result: toolResult, artifacts: out && out.artifacts });
+          work.push(norm({ role: 'tool', tool_call_id: tc.id, content: toolResult }));
+          emit({ type: 'message_added', message: { role: 'tool', tool_call_id: tc.id, content: toolResult } });
+        }
       }
-      await _streamIds(ids, { maxTokens, signal, onToken: (piece) => {
-        if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); }
-        full += piece; emit({ type: 'delta', delta: { content: piece } });
-      } });
-      emit({ type: 'info', message: null });
-      const content = _cleanContent(full);
-      emit({ type: 'round_end', content });
-      emit({ type: 'message_added', message: { role: 'assistant', content } });
-      if (pSys >= 16) scheduleWriteKvPrefix(variant, ids, pSys);   // persist for next session (deferred, no-op if cached)
     } catch (e) {
       if (e && e.name === 'AbortError') throw e;
       emit({ type: 'info', message: null });
       emit({ type: 'error', message: 'Qwen3 dense: ' + ((e && e.message) || e) });
     }
+    if (pSys >= 16 && ids0) scheduleWriteKvPrefix(variant, ids0, pSys);   // persist system-prefix KV (deferred, no-op if cached)
     emit({ type: 'agent_done' });
   }
   const DEFAULT_MODELS = [
@@ -2642,7 +2723,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4,
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
