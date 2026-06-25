@@ -949,8 +949,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // y += result (fused residual add, saves a separate addInPlace pass).
   async function linearQ(xBuf, wrec, yBuf, T, N, K, acc) {
     if (T === 1) return (globalThis.__noDp4 ? gemvQ : gemvDP4A)(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
-    if (globalThis.__useDp4Gemm) return gemmDP4A(xBuf, wrec, yBuf, T, N, K, acc);
-    return gemmQ(xBuf, wrec, yBuf, T, N, K, acc);   // prefill → tiled GEMM (weights read once per BM tokens)
+    // Prefill: int8 DP4A GEMM by default — GPU-timestamp min-of-14 measured 1.25–1.57× over
+    // the f16 GEMM on EVERY 0.6B/1.7B shape (gen-12lp's native matmul path is DP4A); the
+    // activation-quantize is <2% of the GEMM. __noDp4Gemm forces the f16 path.
+    return (globalThis.__noDp4Gemm ? gemmQ : gemmDP4A)(xBuf, wrec, yBuf, T, N, K, acc);
   }
 
   // (f16 path below — gemv/matvecT/linearT — retained for the f16 self-tests; the
@@ -2360,6 +2362,42 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { T, N, K, relErr, gemmQ_ms: +q_ms.toFixed(2), gemmDP4_ms: +dp_ms.toFixed(2), speedup: +(q_ms / dp_ms).toFixed(2) };
   }
 
+  // RELIABLE A/B: GPU-TIMESTAMP, MIN-of-reps (the only stable method on this throttling
+  // iGPU — wall-clock swings ±50%). Times pure GPU compute per call and separates the DP4A
+  // activation-quantize (label *quant*) from the GEMM, so dp4gemm = the cost if the quantize
+  // is fused/amortized (the real forward shares one rmsnorm output across q/k/v), and
+  // dp4full = the current per-call cost. min over reps ≈ the cool/unthrottled floor.
+  async function _benchGemmTS({ T = 256, N = 6144, K = 2048, iters = 10, reps = 14 } = {}) {
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); for (let i = 0; i < scales.length; i++) scales[i] = 0x3000 + (i % 7);
+    const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.013) * 0.7;
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bg'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), yb = E.createBuffer(T * N * 4, UF, 'yb');
+    const wrec = { pack: pb, scales: sb };
+    uniformReset(); await gemmQ(xb, wrec, yb, T, N, K); uniformReset(); await gemmDP4A(xb, wrec, yb, T, N, K);
+    await E.device().queue.onSubmittedWorkDone();
+    const prof = async (fn, cap) => { uniformReset(); E.beginProfile(cap); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); return await E.endProfile(); };
+    const sum = (p, pred) => p.filter(pred).reduce((s, r) => s + r.us, 0) / iters;
+    let qUs = Infinity, gUs = Infinity, quUs = Infinity;
+    for (let r = 0; r < reps; r++) {
+      const pq = await prof(() => gemmQ(xb, wrec, yb, T, N, K), iters + 8);
+      qUs = Math.min(qUs, sum(pq, () => true));
+      const pd = await prof(() => gemmDP4A(xb, wrec, yb, T, N, K), iters * 2 + 8);
+      quUs = Math.min(quUs, sum(pd, x => /quant/i.test(x.label)));
+      gUs = Math.min(gUs, sum(pd, x => !/quant/i.test(x.label)));
+    }
+    [xb, pb, sb, yb].forEach(b => b.destroy());
+    const gflops = (us) => +(2 * T * N * K / us / 1e3).toFixed(0);
+    return { T, N, K, reps,
+      f16_us: +qUs.toFixed(1), f16_gflops: gflops(qUs),
+      dp4gemm_us: +gUs.toFixed(1), dp4gemm_gflops: gflops(gUs),
+      dp4quant_us: +quUs.toFixed(1),
+      speedup_gemmOnly: +(qUs / gUs).toFixed(2),       // if activation-quantize is fused/amortized
+      speedup_perCall: +(qUs / (gUs + quUs)).toFixed(2) };   // current per-call (quant each time)
+  }
+
   // Debug bench (no model load): time the tiled attention at a realistic prefill shape.
   async function _benchAttn({ T = 128, S = 2790, nHq = 16, nKv = 8, hd = 128, iters = 3 } = {}) {
     const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.01);
@@ -2801,7 +2839,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4,
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
