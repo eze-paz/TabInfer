@@ -2485,6 +2485,91 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
   const _cleanContent = (t) => (t || '').replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
 
+  // ---- Persistent prefill (KV) cache for the stable system+tools prefix ----
+  // The KV for the system block [0..P) never changes within a conversation (decode writes
+  // ≥ L > P) and is IDENTICAL across conversations that share the same system+tools (same
+  // tokens at the same positions ⇒ same RoPE phase). We snapshot it to Cache Storage (f32,
+  // 64MB chunks, restore is then a plain writeBuffer — no conversion) keyed by the system
+  // prefix tokens, so a FRESH page load / model switch restores it straight to GPU and skips
+  // the system-prompt prefill entirely (only the user's message is prefilled). ONE snapshot
+  // per variant. Complements the in-memory prefix cache (which only spans a live session).
+  const KVCACHE_NAME = 'sandpie-webgpu-kv';
+  const KVCACHE_VER = 1;
+  const _kvUrl = (variant, part) => 'https://sandpie.kv/v' + KVCACHE_VER + '/' + variant + '/' + part;
+  function _fnv1a(ids, n) { let h = 0x811c9dc5; for (let i = 0; i < n; i++) { let v = ids[i]; for (let b = 0; b < 3; b++) { h ^= (v & 0xff); h = Math.imul(h, 0x01000193); v >>>= 8; } } return (h >>> 0).toString(16); }
+  function _lcpLen(a, b) { const m = Math.min(a.length, b.length); let i = 0; while (i < m && a[i] === b[i]) i++; return i; }
+  let _kvWriting = false;
+
+  // Restore the cached system-prefix KV into the live _kv buffers if the snapshot for this
+  // variant matches the incoming prompt's leading tokens. Sets _cachedIds. Returns P or 0.
+  async function restoreKvPrefix(variant, ids, P) {
+    if (!P || P < 16) return 0;
+    let cache; try { cache = await caches.open(KVCACHE_NAME); } catch (_) { return 0; }
+    const mr = await cache.match(_kvUrl(variant, 'current'));
+    if (!mr) return 0;
+    let m; try { m = await mr.json(); } catch (_) { return 0; }
+    const C = CONFIG;
+    if (!m || m.ver !== KVCACHE_VER || m.variant !== variant || m.P > P ||
+        m.qver !== QCACHE_VER || m.qgroup !== QGROUP ||   // KV depends on the quantized weights
+        m.nKvHeads !== C.nKvHeads || m.headDim !== C.headDim || m.numLayers !== C.numLayers) return 0;
+    for (let i = 0; i < m.P; i++) if (ids[i] !== m.ids[i]) return 0;   // prompt must start with the cached prefix
+    ensureKv();
+    const tgt = m.segs.map(sg => _kv[sg.layer][sg.role]);
+    const q = E.device().queue;
+    let ci = 0;
+    const readChunk = async (idx) => {
+      const r = await cache.match(_kvUrl(variant, 'c' + idx)); if (!r) throw new Error('kv chunk ' + idx + ' missing');
+      const u8 = new Uint8Array(await r.arrayBuffer());
+      const cStart = idx * QCHUNK, cEnd = cStart + u8.byteLength;
+      for (let i = 0; i < m.segs.length; i++) {
+        const sg = m.segs[i]; if (sg.off >= cEnd) break; if (sg.off + _ceil16(sg.len) <= cStart) continue;
+        const ov0 = Math.max(sg.off, cStart), ov1 = Math.min(sg.off + sg.len, cEnd);
+        if (ov1 > ov0) q.writeBuffer(tgt[i], ov0 - sg.off, u8, ov0 - cStart, ov1 - ov0);
+      }
+    };
+    const pool = [];
+    for (let w = 0; w < Math.min(QREAD_CONC, m.nChunks); w++) pool.push((async () => { for (;;) { const my = ci++; if (my >= m.nChunks) break; await readChunk(my); } })());
+    await Promise.all(pool);
+    _cachedIds = ids.slice(0, m.P);
+    return m.P;
+  }
+
+  // Snapshot the current system-prefix KV[0..P) to Cache Storage (fire-and-forget; one
+  // 672KiB→MB readback per layer×{k,v}, deferred so it never blocks decode). No-op if the
+  // snapshot for this prefix already exists. Single-flight via _kvWriting.
+  function scheduleWriteKvPrefix(variant, ids, P) {
+    if (_kvWriting || !P || P < 16 || !_kv) return;
+    _kvWriting = true;
+    (async () => {
+      try {
+        const cache = await caches.open(KVCACHE_NAME);
+        const hash = _fnv1a(ids, P);
+        const cur = await cache.match(_kvUrl(variant, 'current'));
+        if (cur) { try { const cm = await cur.json(); if (cm && cm.hash === hash && cm.P === P) return; } catch (_) {} }
+        const C = CONFIG, perElems = P * C.nKvHeads * C.headDim;
+        await cache.delete(_kvUrl(variant, 'current'));   // invalidate old snapshot first (manifest = commit point)
+        let buf = new Uint8Array(QCHUNK), used = 0, chunkIdx = 0, globalOff = 0;
+        const segs = [];
+        const flush = async () => { if (!used) return; await cache.put(_kvUrl(variant, 'c' + chunkIdx), new Response(new Blob([buf.subarray(0, used)]))); chunkIdx++; buf = new Uint8Array(QCHUNK); used = 0; };
+        const writeBytes = async (u8) => { let s = 0; while (s < u8.byteLength) { if (used === QCHUNK) await flush(); const n = Math.min(QCHUNK - used, u8.byteLength - s); buf.set(u8.subarray(s, s + n), used); used += n; s += n; } };
+        for (let l = 0; l < C.numLayers; l++) {
+          for (const role of ['k', 'v']) {
+            const f32 = await E.readF32(_kv[l][role], perElems);
+            const bytes = new Uint8Array(f32.buffer, 0, f32.byteLength);
+            const pad = _ceil16(globalOff) - globalOff; if (pad) { await writeBytes(new Uint8Array(pad)); globalOff += pad; }
+            segs.push({ layer: l, role, off: globalOff, len: bytes.byteLength });
+            await writeBytes(bytes); globalOff += bytes.byteLength;
+          }
+        }
+        await flush();
+        const manifest = { ver: KVCACHE_VER, qver: QCACHE_VER, qgroup: QGROUP, variant, hash, P, ids: Array.from(ids.slice(0, P)), nKvHeads: C.nKvHeads, headDim: C.headDim, numLayers: C.numLayers, chunkSize: QCHUNK, nChunks: chunkIdx, totalBytes: globalOff, segs };
+        await cache.put(_kvUrl(variant, 'current'), new Response(JSON.stringify(manifest), { headers: { 'content-type': 'application/json' } }));
+        console.log('[qwen3] KV prefix cached: ' + P + ' tok, ' + (globalOff / 1048576).toFixed(0) + 'MB, ' + chunkIdx + ' chunks');
+      } catch (e) { console.warn('[qwen3] KV prefix cache write failed:', (e && e.message) || e); }
+      finally { _kvWriting = false; }
+    })();
+  }
+
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
     const maxTokens = (provider && (provider.maxTokens | 0)) || 512;
     // conversations.js stores the dropdown's modelId in provider.endpoint (the
@@ -2521,6 +2606,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       emit({ type: 'round_start' });
       let firstTok = false, full = '';
       const ids = TOK.encodeChat(work);
+      // Stable system+tools prefix length = the leading tokens shared with a system-only
+      // render (they diverge at the first user token / the generation prompt).
+      let pSys = 0;
+      if (sys) { try { pSys = _lcpLen(TOK.encodeChat([{ role: 'system', content: sys }]), ids); } catch (_) { pSys = 0; } }
+      // If the in-memory KV doesn't already cover the system prefix (fresh load / model
+      // switch), try restoring it from disk so the system prompt isn't re-prefilled.
+      if (pSys >= 16 && (!_cachedIds || _lcpLen(_cachedIds, ids) < pSys)) {
+        try { const r = await restoreKvPrefix(variant, ids, pSys); if (r) emit({ type: 'info', message: 'Restored cached prompt…' }); } catch (_) {}
+      }
       await _streamIds(ids, { maxTokens, signal, onToken: (piece) => {
         if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); }
         full += piece; emit({ type: 'delta', delta: { content: piece } });
@@ -2529,6 +2623,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const content = _cleanContent(full);
       emit({ type: 'round_end', content });
       emit({ type: 'message_added', message: { role: 'assistant', content } });
+      if (pSys >= 16) scheduleWriteKvPrefix(variant, ids, pSys);   // persist for next session (deferred, no-op if cached)
     } catch (e) {
       if (e && e.name === 'AbortError') throw e;
       emit({ type: 'info', message: null });
