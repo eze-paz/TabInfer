@@ -2388,13 +2388,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // (Ported from the dense app build; runs the stale single-submit-prefill +
   //  GEN_BATCH decode path, which uses subgroupAdd → fast on Iris Xe.)
   // ============================================================
-  function unload() {
+  // Free ALL GPU buffers (weights, KV, scratch, token history, ids, DP4A scratch). With
+  // deep=true (backend switch — Qwen3 ↔ Gemma), also drop the uniform pool + DESTROY the
+  // WebGPU device so ZERO GPU memory lingers and there's no two-backend overload; E.init()
+  // + loadModel rebuild everything on next use. deep=false (variant swap) keeps the device.
+  async function unload(deep) {
     try { if (_weights) for (const k in _weights) { const w = _weights[k]; if (!w) continue; if (w.pack && w.pack.destroy) try { w.pack.destroy(); } catch (_) {} if (w.scales && w.scales.destroy) try { w.scales.destroy(); } catch (_) {} if (w.buf && w.buf.destroy) try { w.buf.destroy(); } catch (_) {} } } catch (_) {}
     try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
+    try { if (_scr) for (const b of Object.values(_scr)) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } } catch (_) {}
+    try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
+    try { if (_idsBuf && _idsBuf.destroy) _idsBuf.destroy(); } catch (_) {}
     try { for (const b of _dp4dead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
     try { for (const b of _dp4gDead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4g) { _dp4g.xq.destroy(); _dp4g.xs.destroy(); } } catch (_) {}
     _dp4 = null; _dp4dead = []; _dp4g = null; _dp4gDead = [];
-    _weights = null; _kv = null; _scr = null; _loaded = false; _cachedIds = null;
+    _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null;
+    if (deep) {
+      _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
+      _f16Probed = false; _f16Math = null;    // re-probe against the rebuilt device
+      try { await E.unload && E.unload(); } catch (_) {}
+    }
   }
 
   // Stream from pre-encoded ids (same prefill+decode as generate(), but the

@@ -17,6 +17,7 @@
 
   let _worker = null, _seq = 0;
   const _runs = new Map();   // id -> { emit, resolve, reject }
+  const _unloadWaiters = new Map();   // ackId -> resolve (deep-unload acknowledgements)
 
   // While local inference is running, add body.sp-decoding so CSS can kill the
   // GPU-compositor work that competes with the WebGPU decode loop for the shared
@@ -53,11 +54,12 @@
 
   function worker() {
     if (_worker) return _worker;
-    _worker = new Worker('modules/webgpu-worker.js?v=5');
+    _worker = new Worker('modules/webgpu-worker.js?v=6');
     _worker.onmessage = (e) => {
       const m = e.data || {};
       if (m.t === 'fatal') { console.error('[webgpu-host]', m.message); return; }
       if (m.t === 'tool') { runTool(m); return; }   // worker asked us to execute a tool on the main thread
+      if (m.t === 'unloadDone') { const f = _unloadWaiters.get(m.ackId); if (f) f(); return; }
       const r = _runs.get(m.id);
       if (!r) return;
       if (m.t === 'emit') { try { r.emit(m.ev); } catch (_) {} }
@@ -76,7 +78,13 @@
 
   // Same signature/semantics as the real engine's runConversation: resolves after
   // it finishes (agent_done already emitted), rejects with AbortError on abort.
-  function runConversation(config, emit) {
+  async function runConversation(config, emit) {
+    // Single active local backend: deep-free the OTHER local LLMs' GPU (incl. their
+    // WebGPU devices) and WAIT for it BEFORE loading/running Qwen3, so two backends never
+    // hold GPU at once (the Gemma↔Qwen overload). Each is a cheap no-op if not loaded.
+    try { await window.SandpieLiteRTLM?.unload?.(); } catch (_) {}
+    try { await window.SandpieWllama?.unload?.(); } catch (_) {}
+    try { await window.SandpieTransformersJS?.unload?.(); } catch (_) {}
     const w = worker();
     const id = ++_seq;
     const signal = config && config.signal;
@@ -100,7 +108,21 @@
     return p;
   }
 
-  function unload() { try { if (_worker) _worker.postMessage({ t: 'unload' }); } catch (_) {} }
+  // Deep-free the worker's GPU (buffers + device) and RESOLVE only once the worker acks,
+  // so callers (LiteRT / applyActiveProvider) can await the GPU actually being freed before
+  // they load. No-op (resolved) if the worker was never created. 4s timeout so it can't hang.
+  function unload() {
+    const w = _worker;
+    if (!w) return Promise.resolve();
+    return new Promise((resolve) => {
+      const ackId = ++_seq;
+      let done = false;
+      const finish = () => { if (done) return; done = true; _unloadWaiters.delete(ackId); resolve(); };
+      _unloadWaiters.set(ackId, finish);
+      setTimeout(finish, 4000);
+      try { w.postMessage({ t: 'unload', ackId }); } catch (_) { finish(); }
+    });
+  }
 
   window.SandpieQwen3 = { DEFAULT_MODELS, DEFAULT_N_CTX, runConversation, unload, _viaWorker: true };
 })();

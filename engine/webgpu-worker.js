@@ -16,7 +16,7 @@ self.window = self;
 let _ok = false;
 try {
   // KEEP the ?v= in sync with sandpie.html when these modules are bumped.
-  importScripts('webgpu-engine.js?v=44', 'webgpu-qwen3.js?v=85');
+  importScripts('webgpu-engine.js?v=44', 'webgpu-qwen3.js?v=86');
   _ok = !!self.SandpieQwen3;
 } catch (e) {
   self.postMessage({ t: 'fatal', message: 'worker import failed: ' + ((e && e.message) || e) });
@@ -68,6 +68,9 @@ self.onmessage = async (e) => {
   } else if (msg.t === 'abort') {
     const c = _ctrls.get(id); if (c) { try { c.abort(); } catch (_) {} }
   } else if (msg.t === 'unload') {
-    try { Q && Q.unload && Q.unload(); } catch (_) {}
+    // Deep clean (backend switch): free all buffers AND destroy the device, then ACK so
+    // the host can wait for the GPU to be freed before the other backend loads.
+    try { if (Q && Q.unload) await Q.unload(true); } catch (_) {}
+    self.postMessage({ t: 'unloadDone', ackId: msg.ackId });
   }
 };
