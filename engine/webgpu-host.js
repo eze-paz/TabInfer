@@ -18,6 +18,23 @@
   let _worker = null, _seq = 0;
   const _runs = new Map();   // id -> { emit, resolve, reject }
 
+  // While local inference is running, add body.sp-decoding so CSS can kill the
+  // GPU-compositor work that competes with the WebGPU decode loop for the shared
+  // GPU — chiefly backdrop-filter:blur() (recomputes EVERY frame the streamed text
+  // changes) and infinite CSS animations. This was the focused-tab decode collapse
+  // (GPU ~20% focused / 100% backgrounded): the decode loop itself is fine (matches
+  // the reference engine's depth-N per-token pipeline), but foreground compositing
+  // of expensive blurs over the changing message area starves the GPU when visible.
+  let _busy = 0;
+  function setBusy(on) {
+    try {
+      const b = document.body; if (!b) return;
+      if (on) { if (_busy++ === 0) b.classList.add('sp-decoding'); }
+      else { _busy = Math.max(0, _busy - 1); if (_busy === 0) b.classList.remove('sp-decoding'); }
+    } catch (_) {}
+  }
+  const _busyOff = () => setBusy(false);
+
   function worker() {
     if (_worker) return _worker;
     _worker = new Worker('modules/webgpu-worker.js?v=2');
@@ -53,7 +70,7 @@
       tools: config.tools,
       convId: config.convId,
     };
-    return new Promise((resolve, reject) => {
+    const p = new Promise((resolve, reject) => {
       _runs.set(id, { emit: emit || (function () {}), resolve, reject });
       if (signal) {
         signal.addEventListener('abort', () => { try { w.postMessage({ t: 'abort', id }); } catch (_) {} }, { once: true });
@@ -61,6 +78,9 @@
       w.postMessage({ t: 'run', id, config: cfg });
       if (signal && signal.aborted) { try { w.postMessage({ t: 'abort', id }); } catch (_) {} }
     });
+    setBusy(true);              // suppress GPU-compositor competition (backdrop-filter/anim) during inference
+    p.then(_busyOff, _busyOff);
+    return p;
   }
 
   function unload() { try { if (_worker) _worker.postMessage({ t: 'unload' }); } catch (_) {} }
