@@ -1635,6 +1635,18 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let MODEL_ROOT = MODEL_ROOTS['0.6B'];
   let _variant = '0.6B';
   const CACHE_NAME = 'sandpie-webgpu-models';
+  // QUANTIZED-WEIGHTS CACHE: after the first download+quantize we serialize the
+  // GPU-ready bytes (int4 packs/scales + f16 tensors) into fixed 64MB chunks in
+  // Cache Storage + a manifest. Subsequent loads skip download AND re-quantize:
+  // read the chunks in parallel and writeBuffer their slices STRAIGHT into the GPU
+  // buffers (peak host memory = one 64MB chunk per in-flight read, no whole-model
+  // or whole-tensor materialization). Bump QCACHE_VER to invalidate the format.
+  const QCACHE_NAME = 'sandpie-webgpu-quant';
+  const QCACHE_VER = 1;
+  const QCHUNK = 64 * 1024 * 1024;       // 64 MiB cache chunk
+  const QREAD_CONC = 4;                  // chunks read+uploaded in parallel
+  const _qUrl = (variant, part) => 'https://sandpie.quant/v' + QCACHE_VER + '/' + variant + '/' + part;
+  const _ceil16 = (n) => (n + 15) & ~15;
   let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
 
@@ -1712,19 +1724,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
   const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight';
 
+  // Single-file download (no raw-safetensors caching — the quantized-weights cache
+  // supersedes it). Preallocates one buffer when the size is known.
   async function fetchModelBytes(url, onProgress) {
-    let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
-    if (cache) { const hit = await cache.match(url); if (hit) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await hit.arrayBuffer(); } }
     const resp = await fetch(url);
     if (!resp.ok) throw new Error('download failed: HTTP ' + resp.status + ' for ' + url);
     const total = +(resp.headers.get('content-length') || 0);
     const reader = resp.body.getReader();
     let recv = 0, out;
     if (total) {
-      // Known size → preallocate ONE buffer and write directly into it. The
-      // multi-GB shards (Qwen3-1.7B = 3.28GB) would otherwise need the chunks[]
-      // array AND a second copy buffer alive at once (~2× peak) → "Array buffer
-      // allocation failed" on a 16GB box.
       out = new Uint8Array(total);
       for (;;) {
         const { done, value } = await reader.read(); if (done) break;
@@ -1739,13 +1747,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
       out = new Uint8Array(recv); let off = 0; for (const c of chunks) { out.set(c, off); off += c.length; }
     }
-    if (cache) { try { await cache.put(url, new Response(out, { headers: { 'content-length': String(recv) } })); } catch (_) {} }
     return out.buffer;
   }
 
   // Quantize-or-f16 a single tensor's raw bytes and upload it into _weights.
   // `raw` is a Uint8Array covering EXACTLY this tensor (any byteOffset).
-  function _uploadTensor(name, info, raw) {
+  // Quantize/convert one tensor → GPU buffer(s) and record it. If `sink` is given,
+  // also stream the GPU-ready bytes into the quantized-weights cache (so future
+  // loads skip download + quantize). sink.add is async (flushes 64MB chunks).
+  async function _uploadTensor(name, info, raw, sink) {
     const numel = info.shape.reduce((a, b) => a * b, 1);
     if (info.dtype !== 'BF16' && isQuantWeight(name)) throw new Error('quant path expects BF16 for ' + name);
     if (isQuantWeight(name)) {
@@ -1756,6 +1766,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       E.device().queue.writeBuffer(packBuf, 0, pack);
       E.device().queue.writeBuffer(scBuf, 0, scales);
       _weights[name] = { pack: packBuf, scales: scBuf, N, K, int4: true, shape: info.shape, numel };
+      if (sink) { await sink.add(name, 'pack', new Uint8Array(pack.buffer, pack.byteOffset, pack.byteLength), { kind: 'int4', shape: info.shape, numel, N, K }); await sink.add(name, 'scales', new Uint8Array(scales.buffer, scales.byteOffset, scales.byteLength), { kind: 'int4', shape: info.shape, numel, N, K }); }
     } else {
       let f16bits;
       if (info.dtype === 'BF16') f16bits = bf16ToF16bits(new Uint16Array(raw.buffer, raw.byteOffset, numel));
@@ -1765,13 +1776,14 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const buf = E.createBuffer(numel * 2, U.STORAGE | U.COPY_DST | U.COPY_SRC, name);
       E.device().queue.writeBuffer(buf, 0, f16bits);
       _weights[name] = { buf, shape: info.shape, numel };
+      if (sink) await sink.add(name, 'buf', new Uint8Array(f16bits.buffer, f16bits.byteOffset, f16bits.byteLength), { kind: 'f16', shape: info.shape, numel });
     }
   }
 
   // Parse a single safetensors ArrayBuffer (whole shard in RAM) — used for the
   // small single-file path (0.6B, ~1.1GB). Big sharded models go through the
   // OPFS slice path (_parseSafetensorsFile) to avoid a multi-GB contiguous alloc.
-  function _parseSafetensors(ab, onPct) {
+  async function _parseSafetensors(ab, onPct, sink) {
     const headerLen = Number(new DataView(ab, 0, 8).getBigUint64(0, true));
     const header = JSON.parse(dec_(new Uint8Array(ab, 8, headerLen)));
     const dataStart = 8 + headerLen;
@@ -1779,7 +1791,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let i = 0; i < names.length; i++) {
       const name = names[i], info = header[name];
       const [begin, end] = info.data_offsets;
-      _uploadTensor(name, info, new Uint8Array(ab, dataStart + begin, end - begin));
+      await _uploadTensor(name, info, new Uint8Array(ab, dataStart + begin, end - begin), sink);
       if ((i & 15) === 0) onPct && onPct(Math.round(i / names.length * 100));
     }
     onPct && onPct(100);
@@ -1802,19 +1814,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     return chunks;
   }
-  // Download a shard as a chunk list. Best-effort Cache Storage read/write.
+  // Download a shard as a chunk list (no raw-safetensors caching — the quantized-weights
+  // cache supersedes it). Pure downloader: stream the body into a list of small chunks.
   async function _fetchShardChunks(url, onProgress) {
-    let cache = null; try { cache = await caches.open(CACHE_NAME); } catch (_) {}
-    if (cache) {
-      const hit = await cache.match(url);
-      if (hit && hit.body) { onProgress && onProgress({ phase: 'cache', pct: 100 }); return await _streamToChunks(hit.body, 0, null); }
-    }
     const resp = await fetch(url);
     if (!resp.ok) throw new Error('download failed: HTTP ' + resp.status + ' for ' + url);
     const total = +(resp.headers.get('content-length') || 0);
-    const chunks = await _streamToChunks(resp.body, total, onProgress);
-    if (cache) { try { await cache.put(url, new Response(new Blob(chunks), { headers: { 'content-length': String(chunks.reduce((a, c) => a + c.length, 0)) } })); } catch (_) {} }
-    return chunks;
+    return await _streamToChunks(resp.body, total, onProgress);
   }
   // Random-access reader over a chunk list — assembles a contiguous Uint8Array
   // for any [begin,end) byte range, copying across chunk boundaries.
@@ -1837,7 +1843,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     };
   }
   // Parse a safetensors shard held as a chunk list (no whole-shard alloc).
-  function _parseSafetensorsChunks(chunks, onPct) {
+  async function _parseSafetensorsChunks(chunks, onPct, sink) {
     const read = _chunkReader(chunks);
     const headLen = Number(new DataView(read(0, 8).buffer).getBigUint64(0, true));
     const header = JSON.parse(dec_(read(8, 8 + headLen)));
@@ -1846,10 +1852,101 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let i = 0; i < names.length; i++) {
       const name = names[i], info = header[name];
       const [begin, end] = info.data_offsets;
-      _uploadTensor(name, info, read(dataStart + begin, dataStart + end));
+      await _uploadTensor(name, info, read(dataStart + begin, dataStart + end), sink);
       if ((i & 7) === 0) onPct && onPct(Math.round(i / names.length * 100));
     }
     onPct && onPct(100);
+  }
+
+  // Dims that define the quantized layout — a cache built for one must not load for another.
+  const _cfgKey = (c) => ({ numLayers: c.numLayers, hidden: c.hidden, nHeads: c.nHeads, nKvHeads: c.nKvHeads, headDim: c.headDim, intermediate: c.intermediate, vocab: c.vocab });
+
+  // ---- Quantized-weights cache WRITER ----
+  // Streams GPU-ready segment bytes into 64MB Cache Storage chunks + a manifest. Each
+  // segment is 16-aligned in the global byte stream so every reader writeBuffer slice is
+  // 4-aligned (a WebGPU requirement). The manifest is the commit point: deleted first, so
+  // a partial write is never read; written LAST on finalize. Best-effort (caller ignores throws).
+  async function _makeQuantSink(variant) {
+    const cache = await caches.open(QCACHE_NAME);
+    await cache.delete(_qUrl(variant, 'manifest'));      // invalidate any prior cache up-front
+    let buf = new Uint8Array(QCHUNK), used = 0, chunkIdx = 0, globalOff = 0;
+    const segs = [];
+    const flush = async () => {
+      if (used === 0) return;
+      await cache.put(_qUrl(variant, 'c' + chunkIdx), new Response(new Blob([buf.subarray(0, used)])));
+      chunkIdx++; buf = new Uint8Array(QCHUNK); used = 0;
+    };
+    const writeBytes = async (u8) => {
+      let src = 0;
+      while (src < u8.byteLength) {
+        if (used === QCHUNK) await flush();
+        const n = Math.min(QCHUNK - used, u8.byteLength - src);
+        buf.set(u8.subarray(src, src + n), used); used += n; src += n;
+      }
+    };
+    return {
+      async add(name, role, u8, meta) {
+        const pad = _ceil16(globalOff) - globalOff;     // 16-align this segment's start
+        if (pad) { await writeBytes(new Uint8Array(pad)); globalOff += pad; }
+        segs.push({ name, role, off: globalOff, len: u8.byteLength, kind: meta.kind, shape: meta.shape, numel: meta.numel, N: meta.N, K: meta.K });
+        await writeBytes(u8); globalOff += u8.byteLength;
+      },
+      async finalize() {
+        await flush();
+        const manifest = { ver: QCACHE_VER, variant, qgroup: QGROUP, chunkSize: QCHUNK, nChunks: chunkIdx, totalBytes: globalOff, config: _cfgKey(CONFIG), segs };
+        await cache.put(_qUrl(variant, 'manifest'), new Response(JSON.stringify(manifest), { headers: { 'content-type': 'application/json' } }));
+      },
+    };
+  }
+
+  // ---- Quantized-weights cache READER (fast load) ----
+  // Reads the manifest, allocates every GPU buffer, then reads the 64MB chunks in
+  // PARALLEL and writeBuffer()s their slices STRAIGHT into the GPU buffers — peak host
+  // memory = QREAD_CONC chunks (64MB each), no whole-model / whole-tensor staging, no
+  // re-download, no re-quantize. Returns false (cold) if no valid cache for this variant.
+  async function loadQuantCache(variant, onProgress) {
+    let cache; try { cache = await caches.open(QCACHE_NAME); } catch (_) { return false; }
+    const mResp = await cache.match(_qUrl(variant, 'manifest'));
+    if (!mResp) return false;
+    let m; try { m = await mResp.json(); } catch (_) { return false; }
+    if (!m || m.ver !== QCACHE_VER || m.variant !== variant || m.qgroup !== QGROUP || m.chunkSize !== QCHUNK) return false;
+    const want = _cfgKey(CONFIG);
+    for (const k in want) if (m.config[k] !== want[k]) return false;
+    // Allocate buffers + rebuild _weights records from the manifest.
+    _weights = {};
+    const segBufs = new Array(m.segs.length);
+    for (let i = 0; i < m.segs.length; i++) {
+      const sg = m.segs[i];
+      const b = E.createBuffer(_ceil16(sg.len), U.STORAGE | U.COPY_DST | U.COPY_SRC, sg.name + '.' + sg.role);
+      segBufs[i] = b;
+      if (sg.kind === 'int4') {
+        let rec = _weights[sg.name] || (_weights[sg.name] = { int4: true, N: sg.N, K: sg.K, shape: sg.shape, numel: sg.numel });
+        if (sg.role === 'pack') rec.pack = b; else rec.scales = b;
+      } else {
+        _weights[sg.name] = { buf: b, shape: sg.shape, numel: sg.numel };
+      }
+    }
+    const q = E.device().queue;
+    let done = 0, ci = 0;
+    const readChunk = async (idx) => {
+      const r = await cache.match(_qUrl(variant, 'c' + idx));
+      if (!r) throw new Error('quant cache missing chunk ' + idx);
+      const u8 = new Uint8Array(await r.arrayBuffer());
+      const cStart = idx * QCHUNK, cEnd = cStart + u8.byteLength;
+      // binary-search the first segment that reaches into this chunk (segs sorted by off)
+      let lo = 0, hi = m.segs.length - 1, first = m.segs.length;
+      while (lo <= hi) { const mid = (lo + hi) >> 1; if (m.segs[mid].off + _ceil16(m.segs[mid].len) > cStart) { first = mid; hi = mid - 1; } else lo = mid + 1; }
+      for (let i = first; i < m.segs.length; i++) {
+        const sg = m.segs[i]; if (sg.off >= cEnd) break;
+        const ov0 = Math.max(sg.off, cStart), ov1 = Math.min(sg.off + sg.len, cEnd);
+        if (ov1 > ov0) q.writeBuffer(segBufs[i], ov0 - sg.off, u8, ov0 - cStart, ov1 - ov0);
+      }
+      done++; onProgress && onProgress({ phase: 'parse', pct: Math.round(done / m.nChunks * 100) });
+    };
+    const pool = [];
+    for (let w = 0; w < Math.min(QREAD_CONC, m.nChunks); w++) pool.push((async () => { for (;;) { const my = ci++; if (my >= m.nChunks) break; await readChunk(my); } })());
+    await Promise.all(pool);
+    return true;
   }
 
   async function loadModel({ onProgress, variant = '0.6B' } = {}) {
@@ -1863,6 +1960,22 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     try { await probeF16Gemm(); } catch (_) {}   // pick f16 vs f32 prefill-GEMM dot for this GPU
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
+
+    // FAST PATH: quantized-weights cache (skips download AND re-quantize; streams the
+    // 64MB chunks in parallel straight into GPU buffers).
+    try {
+      onProgress && onProgress({ phase: 'cache', pct: 0 });
+      if (await loadQuantCache(variant, onProgress)) {
+        onProgress && onProgress({ phase: 'parse', pct: 100 });
+        _loaded = true; return;
+      }
+    } catch (e) { console.warn('[qwen3] quant cache load failed — re-downloading:', (e && e.message) || e); }
+
+    // SLOW PATH (first load / cache miss): download + quantize, capturing GPU-ready bytes
+    // into the quant cache so the NEXT load takes the fast path. We no longer cache the raw
+    // safetensors (the quant cache supersedes it); drop any stale raw cache to reclaim space.
+    let sink = null; try { sink = await _makeQuantSink(variant); } catch (_) { sink = null; }
+    try { await caches.delete(CACHE_NAME); } catch (_) {}
 
     // Discover shards via index.json; fall back to single model.safetensors.
     let shardFiles = null;
@@ -1893,15 +2006,16 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         // Hold the shard as a chunk LIST + range-read per tensor — never a
         // contiguous multi-GB buffer (the "Array buffer allocation failed" cause).
         let chunks = await _fetchShardChunks(url, dlProg);
-        _parseSafetensorsChunks(chunks, parseProg);
+        await _parseSafetensorsChunks(chunks, parseProg, sink);
         chunks = null;   // free this shard before downloading the next
       }
     } else {
       const ab = await fetchModelBytes(MODEL_ROOT + 'model.safetensors', onProgress);
       onProgress && onProgress({ phase: 'parse', pct: 0 });
-      _parseSafetensors(ab, pct => onProgress && onProgress({ phase: 'parse', pct }));
+      await _parseSafetensors(ab, pct => onProgress && onProgress({ phase: 'parse', pct }), sink);
     }
 
+    if (sink) { try { await sink.finalize(); } catch (e) { console.warn('[qwen3] quant cache write failed (will re-quantize next load):', (e && e.message) || e); } }
     onProgress && onProgress({ phase: 'parse', pct: 100 });
     _loaded = true;
   }
