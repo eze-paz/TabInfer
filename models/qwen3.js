@@ -858,6 +858,74 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     }
   }
 }`;
+  // CODEGEN-UNROLLED DP4A int8 GEMM (v2). The first gemmDP4A used array<> accumulators,
+  // which WGSL SPILLS to memory (the exact trap that capped the naive f16 port at 84
+  // GFLOP/s). This mirrors the fast f16 gemmqWgsl: 64×64 block, BK=QGROUP=32 (one quant
+  // group/tile → one int32→f32 flush/tile), TM×TN=4×4 register block, static unrolled
+  // scalar accumulators (i0..15 int32 per tile, f0..15 f32 across tiles). int8 inner via
+  // dot4I8Packed — gen-12lp's NATIVE matrix path is DP4A, so the headroom is real if the
+  // accumulators stay in registers. A/B vs f16 gemmQ via _benchGemmDP4.
+  function gemmdp4Wgsl() {
+    const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = QGROUP, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
+    const NTH = (BM / TM) * (BN / TN), RN = BN / TN, TILEA = BM * BK4, TILEB = BN * BK4;
+    let s = `
+enable f16;
+struct D { T:u32, N:u32, K:u32, acc:u32 };
+@group(0) @binding(0) var<storage, read>       xq : array<u32>;   // [T,K/4] packed int8 activations
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // int4 packed (q+8), K/8 per row
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;   // [N, K/${QGROUP}]
+@group(0) @binding(3) var<storage, read>       xs : array<f32>;   // [T, K/${QGROUP}]
+@group(0) @binding(4) var<storage, read_write> Y  : array<f32>;   // [T,N]
+@group(0) @binding(5) var<uniform>             d  : D;
+var<workgroup> As : array<u32, ${TILEA}>;   // [BM][BK4] packed int8 activations
+var<workgroup> Bs : array<u32, ${TILEB}>;   // [BN][BK4] packed int8 weights (int4→int8)
+@compute @workgroup_size(${NTH}, 1, 1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
+  let mBase = wg.y*${BM}u; let nBase = wg.x*${BN}u;
+  let WPR = d.K/8u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u; let nTiles = d.K/${BK}u;
+`;
+    for (let r = 0; r < TM * TN; r++) s += `  var f${r}:f32=0.0;\n`;
+    s += `  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
+    let k0 = kt*${BK}u;
+    for (var r:u32=0u; r<${TILEA / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let lt = idx/${BK4}u; let kk4 = idx%${BK4}u; let gt = mBase+lt;
+      As[idx] = select(0u, xq[gt*K4 + k0/4u + kk4], gt<d.T);
+    }
+    for (var r:u32=0u; r<${TILEB / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
+      var packed = 0u;
+      if (gn < d.N) {
+        let kk = k0 + kk4*4u; let word = W[gn*WPR + (kk>>3u)]; let b = (kk & 7u);
+        let n0 = i32((word >> (4u*(b+0u))) & 0xFu) - 8;
+        let n1 = i32((word >> (4u*(b+1u))) & 0xFu) - 8;
+        let n2 = i32((word >> (4u*(b+2u))) & 0xFu) - 8;
+        let n3 = i32((word >> (4u*(b+3u))) & 0xFu) - 8;
+        packed = pack4xI8(vec4<i32>(n0,n1,n2,n3));
+      }
+      Bs[idx] = packed;
+    }
+    workgroupBarrier();
+`;
+    for (let r = 0; r < TM * TN; r++) s += `    var i${r}:i32=0;\n`;
+    s += `    for (var cc:u32=0u; cc<${BK4}u; cc=cc+1u) {
+`;
+    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u+${i}u)*${BK4}u + cc];\n`;
+    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u+${j}u)*${BK4}u + cc];\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      i${i * TN + j} = i${i * TN + j} + dot4I8Packed(a${i}, b${j});\n`;
+    s += `    }
+`;
+    for (let i = 0; i < TM; i++) s += `    let xs${i} = select(0.0, xs[(mBase+tM*${TM}u+${i}u)*gpr + kt], (mBase+tM*${TM}u+${i}u)<d.T);\n`;
+    for (let j = 0; j < TN; j++) s += `    let ws${j} = select(0.0, f32(sc[(nBase+tN*${TN}u+${j}u)*gpr + kt]), (nBase+tN*${TN}u+${j}u)<d.N);\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `    f${i * TN + j} = f${i * TN + j} + f32(i${i * TN + j}) * xs${i} * ws${j};\n`;
+    s += `    workgroupBarrier();
+  }
+`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `  { let gm=mBase+tM*${TM}u+${i}u; let gn=nBase+tN*${TN}u+${j}u; if (gm<d.T && gn<d.N) { let idx=gm*d.N+gn; Y[idx]=select(0.0,Y[idx],d.acc!=0u)+f${i * TN + j}; } }\n`;
+    s += `}`;
+    return s;
+  }
+
   let _dp4g = null, _dp4gDead = [];   // scratch {xq,xs,cap} for the [T,K] int8 activation
   function ensureDp4G(T, K) {
     const need = T * K;
@@ -872,11 +940,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     const qd = uniform(new Uint32Array([K, gpr, ng, 0]));
     const qgx = Math.min(ng, 65535), qgy = Math.ceil(ng / qgx);
     E.dispatch(qp, [xBuf, _dp4g.xq, _dp4g.xs, qd], [qgx, qgy, 1]);
-    const pipe = E.getPipeline('q3.gemmDP4', GEMMDP4_WGSL);
-    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0, 0, 0, 0, 0]));
-    const blocks = Math.ceil(T / GEMM_BM) * Math.ceil(N / GEMM_BN);
-    const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
-    return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [gx, gy, 1]);
+    const pipe = E.getPipeline('q3.gemmDP4v2', gemmdp4Wgsl());
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
+    return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
 
   // Router for the int4 weight path. wrec = { pack, scales, N, K }. acc=true →
