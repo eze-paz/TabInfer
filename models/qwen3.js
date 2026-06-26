@@ -409,16 +409,26 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if (_dp4) { _dp4dead.push(_dp4.xq, _dp4.xs); }
     _dp4 = { cap: K, xq: E.createBuffer((K / 4) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xq'), xs: E.createBuffer((K / QGROUP) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xs') };
   }
-  function gemvDP4A(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
+  // Quantize the activation vector x[K] → _dp4.xq (packed int8) + _dp4.xs (group scales).
+  // Split out of gemvDP4A so several projections that share the SAME activation (q/k/v all
+  // read the rmsnorm output) can quantize ONCE and reuse — see the q/k/v fusion in forward().
+  function quantQ8(xBuf, K) {
     ensureDp4(K);
     const qp = E.getPipeline('q3.quantq8', QUANTQ8_WGSL);
     const qd = uniform(new Uint32Array([K, 0, 0, 0]));
     const groups = K / QGROUP, qgx = Math.min(groups, 65535), qgy = Math.ceil(groups / qgx);
     E.dispatch(qp, [xBuf, _dp4.xq, _dp4.xs, qd], [qgx, qgy, 1]);
+  }
+  // GEMV against the CURRENTLY-quantized activation in _dp4 (caller ran quantQ8 first).
+  function gemvDP4_only(packBuf, scBuf, yBuf, N, K, acc) {
     const pipe = E.getPipeline('q3.gemvDP4', GEMVDP4_WGSL);
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
     const nWG = Math.ceil(N / GEMVQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [_dp4.xq, packBuf, scBuf, _dp4.xs, yBuf, d], [gx, gy, 1]);
+  }
+  function gemvDP4A(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
+    quantQ8(xBuf, K);
+    return gemvDP4_only(packBuf, scBuf, yBuf, N, K, acc);
   }
 
   // ---- FUSED int4 gate+up+SwiGLU (T=1): swi[i] = silu(gate·x)*(up·x) ----
@@ -2194,9 +2204,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      await linearQ(s.normed, Wq(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
-      await linearQ(s.normed, Wq(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
-      await linearQ(s.normed, Wq(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+      // q/k/v all read the SAME normed activation, and the DP4A gemv quantizes its input
+      // internally — so the default path re-quantized the identical vector 3×. On decode
+      // (T=1, dispatch-overhead-bound) quantize ONCE and reuse, saving 2 dispatches/layer.
+      // Provably identical output (same kernels, same data). __noQkvFuse / __noDp4 fall back.
+      if (T === 1 && !globalThis.__noQkvFuse && !globalThis.__noDp4) {
+        const qW = Wq(p + 'self_attn.q_proj.weight'), kW = Wq(p + 'self_attn.k_proj.weight'), vW = Wq(p + 'self_attn.v_proj.weight');
+        quantQ8(s.normed, H);
+        gemvDP4_only(qW.pack, qW.scales, s.q, nHq * hd, H);
+        gemvDP4_only(kW.pack, kW.scales, s.k, nKv * hd, H);
+        gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
+      } else {
+        await linearQ(s.normed, Wq(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+        await linearQ(s.normed, Wq(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+        await linearQ(s.normed, Wq(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+      }
       // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
       // read and a read_write binding is undefined behavior in WebGPU (miscompiles
       // on Intel). Write rope output to a separate buffer.
