@@ -36,20 +36,31 @@
   }
   const _busyOff = () => setBusy(false);
 
-  // Execute a tool the worker requested, on the MAIN thread (./sandpie-tool is page-relative
-  // and the tool worker lives here), then reply to the worker. Mirrors the other backends.
-  async function runTool(m) {
-    let result = '', artifacts = null;
-    try {
-      const res = await fetch('./sandpie-tool', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: m.name, args: m.args, conversation_file_name: m.convId }),
-      });
-      const out = res.ok ? await res.json() : { result: 'Error: tool endpoint ' + res.status };
-      result = (out && out.result != null) ? out.result : '';
-      artifacts = (out && out.artifacts) || null;
-    } catch (e) { result = 'Error: ' + ((e && e.message) || e); }
-    try { _worker && _worker.postMessage({ t: 'toolResult', reqId: m.reqId, result, artifacts }); } catch (_) {}
+  // Execute a tool the engine worker requested by routing it through the SHARED in-page
+  // sandpie-worker.js (the SAME Web Worker the cloud agent loop and LiteRT use — it reads
+  // OPFS directly and handles every tool incl. load_skill), then reply to the engine
+  // worker. NOT via fetch('./sandpie-tool'): sandpie-worker is a dedicated Worker, not a
+  // service worker, so nothing intercepts that path and it 404s against the server — which
+  // is why ONLY the WebGPU backend's tools (incl. load_skill) were failing while cloud +
+  // Gemma worked. Mirrors litertlm.js toolViaWorker.
+  let _toolReqSeq = 0;
+  const TOOL_TIMEOUT_MS = 5 * 60 * 1000;
+  function runTool(m) {
+    const reply = (result, artifacts) => {
+      try { _worker && _worker.postMessage({ t: 'toolResult', reqId: m.reqId, result, artifacts: artifacts || null }); } catch (_) {}
+    };
+    const sw = window._sandpieWorker;
+    if (!sw) { reply('Error: sandpie-worker not ready — reload the page.', null); return; }
+    const id = 'wg-' + (++_toolReqSeq);
+    let settled = false;
+    const finish = (result, artifacts) => { if (settled) return; settled = true; cleanup(); reply(result, artifacts); };
+    const onMsg = (e) => { const r = e.data || {}; if (r.id !== id || r.type !== 'tool_result') return; finish(r.result || '', r.artifacts || null); };
+    const onErr = () => finish('Error: sandpie-worker crashed — retry (it restarts automatically).', null);
+    const timer = setTimeout(() => finish('Error: tool timed out after ' + (TOOL_TIMEOUT_MS / 1000) + 's — the worker may be stuck.', null), TOOL_TIMEOUT_MS);
+    function cleanup() { clearTimeout(timer); sw.removeEventListener('message', onMsg); sw.removeEventListener('error', onErr); }
+    sw.addEventListener('message', onMsg);
+    sw.addEventListener('error', onErr);
+    sw.postMessage({ type: 'tool', id, name: m.name, args: m.args, conversation_file_name: m.convId });
   }
 
   function worker() {
@@ -95,6 +106,13 @@
       tools: config.tools,
       convId: config.convId,
     };
+    // Debug: the exact request the local model will see (system prompt + messages + tool
+    // defs). Always stashed on window.SandpieLastRequest for inspection; also logged every
+    // turn when localStorage 'sandpie-llm-debug' === '1'.
+    try {
+      window.SandpieLastRequest = cfg;
+      if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg);
+    } catch (_) {}
     const p = new Promise((resolve, reject) => {
       _runs.set(id, { emit: emit || (function () {}), resolve, reject });
       if (signal) {
