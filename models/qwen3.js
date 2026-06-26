@@ -2017,9 +2017,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return true;
   }
 
-  async function loadModel({ onProgress, variant = '0.6B' } = {}) {
-    if (_loaded && _variant === variant) return;
+  async function loadModel({ onProgress, variant = '0.6B', nCtx } = {}) {
+    const ctx = _clampCtx(nCtx);
+    if (_loaded && _variant === variant) {
+      if (ctx !== MAX_SEQ) {
+        // Same weights, different context window: drop the KV buffers (they're sized to
+        // MAX_SEQ) so ensureKv() reallocs at the new size; weights/scratch are unaffected.
+        MAX_SEQ = ctx;
+        try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
+        try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
+        _kv = null; _tokHist = null; _cachedIds = null;   // prefix cache invalid (KV cleared)
+      }
+      return;
+    }
     if (_loaded) unload();
+    MAX_SEQ = ctx;   // set BEFORE any KV/tokHist allocation (ensureKv reads it)
     if (!(variant in CONFIGS)) throw new Error('unknown Qwen3 variant: ' + variant);
     Object.assign(CONFIG, CONFIGS[variant]);
     MODEL_ROOT = MODEL_ROOTS[variant];
@@ -2105,7 +2117,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // ============================================================
   // Forward graph + KV cache + generate
   // ============================================================
-  const MAX_SEQ = 4096;
+  let MAX_SEQ = 4096;   // context window = KV buffer size; configurable per-provider at load
+  // KV is f32 and scales linearly with MAX_SEQ (the shared 8-kv-head × 128 × 28-layer geometry
+  // is ~0.9GB at 4096), so raising it costs real GPU memory — clamp to a sane range.
+  function _clampCtx(n) { n = n | 0; if (!n) return 4096; return Math.max(1024, Math.min(8192, n)); }
   let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
   let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
   let _scr = null;    // scratch buffers, sized to _scrT rows
@@ -2747,7 +2762,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
-    const maxTokens = (provider && (provider.maxTokens | 0)) || 512;
+    // Generation budget per round. Default 2048 (was 512, which a reasoning model's <think>
+    // block routinely overran → it hit the cap mid-thought and emitted no answer/tool call).
+    // EOS (im_end) stops normal turns far sooner; this is just the runaway ceiling. The decode
+    // loop also hard-caps at MAX_SEQ-1-pos. Override via provider.maxTokens ("Max output tokens").
+    const maxTokens = (provider && (provider.maxTokens | 0)) || 2048;
     // conversations.js stores the dropdown's modelId in provider.endpoint (the
     // model picker sets spEndpoint = modelId). Accept either field.
     const _wantV = (provider && (provider.endpoint || provider.modelId)) || '';
@@ -2755,7 +2774,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     try {
       emit({ type: 'info', message: 'Loading Qwen3-' + variant + ' dense (WebGPU)… first run downloads the weights.' });
       let lastPct = -1;
-      await loadModel({ variant, onProgress: (p) => {
+      await loadModel({ variant, nCtx: (provider && (provider.contextWindow | 0)) || 0, onProgress: (p) => {
         if (!p) return;
         if (p.phase === 'download') { const pct = p.pct | 0; if (pct === lastPct) return; lastPct = pct; emit({ type: 'info', message: 'Downloading… ' + pct + '%' + (p.recv ? ' (' + (p.recv / 1e9).toFixed(2) + 'GB)' : '') }); }
         else if (p.phase === 'parse') emit({ type: 'info', message: 'Preparing weights… ' + (p.pct || 0) + '%' });
