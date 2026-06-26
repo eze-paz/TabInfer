@@ -73,7 +73,14 @@
       if (m.t === 'unloadDone') { const f = _unloadWaiters.get(m.ackId); if (f) f(); return; }
       const r = _runs.get(m.id);
       if (!r) return;
-      if (m.t === 'emit') { try { r.emit(m.ev); } catch (_) {} }
+      if (m.t === 'emit') {
+        // Capture the model's generated turns for window.SandpieLastResponse (debug).
+        if (m.ev && m.ev.type === 'message_added' && r.resp) {
+          r.resp.push(m.ev.message);
+          try { if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM message]', m.ev.message); } catch (_) {}
+        }
+        try { r.emit(m.ev); } catch (_) {}
+      }
       else if (m.t === 'done') { _runs.delete(m.id); r.resolve(); }
       else if (m.t === 'err') {
         _runs.delete(m.id);
@@ -106,15 +113,19 @@
       tools: config.tools,
       convId: config.convId,
     };
-    // Debug: the exact request the local model will see (system prompt + messages + tool
-    // defs). Always stashed on window.SandpieLastRequest for inspection; also logged every
-    // turn when localStorage 'sandpie-llm-debug' === '1'.
+    // Debug: window.SandpieLastRequest = the exact request the local model sees (system
+    // prompt + INPUT messages + tool defs). window.SandpieLastResponse = the assistant/tool
+    // messages it GENERATES this turn, growing live — the engine runs the whole agent loop
+    // inside the worker, so generated turns arrive as 'message_added' events (captured in the
+    // onmessage handler below), NOT in cfg. Both logged when localStorage 'sandpie-llm-debug'==='1'.
+    const respMsgs = [];
     try {
       window.SandpieLastRequest = cfg;
+      window.SandpieLastResponse = respMsgs;
       if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg);
     } catch (_) {}
     const p = new Promise((resolve, reject) => {
-      _runs.set(id, { emit: emit || (function () {}), resolve, reject });
+      _runs.set(id, { emit: emit || (function () {}), resolve, reject, resp: respMsgs });
       if (signal) {
         signal.addEventListener('abort', () => { try { w.postMessage({ t: 'abort', id }); } catch (_) {} }, { once: true });
       }
