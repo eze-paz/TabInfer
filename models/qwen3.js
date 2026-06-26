@@ -2277,14 +2277,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
-      // Attention input norm → q/k/v. DECODE (T=1) fuses two ways: (a) rmsnormQ emits the int8
-      // activation DIRECTLY from the norm — no separate quantize dispatch; (b) q/k/v share that
-      // one quantized activation (they read the same normed vector). Flags for isolated A/B:
-      // __noRmsFuse → plain rmsnorm + one quantQ8; __noQkvFuse/__noDp4 → full linearQ fallback.
-      if (T === 1 && !globalThis.__noQkvFuse && !globalThis.__noDp4) {
+      // Attention input norm → q/k/v. DECODE (T=1) is the fused int8 path: rmsnormQ emits the
+      // per-group int8 activation DIRECTLY from the norm (no separate quantize dispatch) and
+      // q/k/v all read that one quantized vector. PREFILL (T>1) keeps rmsnorm + linearQ.
+      if (T === 1) {
         const qW = Wq(p + 'self_attn.q_proj.weight'), kW = Wq(p + 'self_attn.k_proj.weight'), vW = Wq(p + 'self_attn.v_proj.weight');
-        if (globalThis.__noRmsFuse) { await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps); quantQ8(s.normed, H); }
-        else { rmsnormQ(s.x, W(p + 'input_layernorm.weight'), H, C.rmsEps); }
+        rmsnormQ(s.x, W(p + 'input_layernorm.weight'), H, C.rmsEps);
         gemvDP4_only(qW.pack, qW.scales, s.q, nHq * hd, H);
         gemvDP4_only(kW.pack, kW.scales, s.k, nKv * hd, H);
         gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
@@ -2304,17 +2302,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
       await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
       // MLP norm → gate/up. Decode fuses the same way: rmsnormQ emits the int8 activation,
-      // gateUpSiluDP4_only consumes it (no separate quantize). Fallbacks preserve the f32
-      // (__noDp4) fused path and the prefill (T>1) gate/up/swiglu path.
+      // gateUpSiluDP4_only consumes it (no separate quantize). Prefill (T>1) keeps the
+      // rmsnorm + gate/up + swiglu path.
       if (T === 1) {
         const gW = Wq(p + 'mlp.gate_proj.weight'), uW = Wq(p + 'mlp.up_proj.weight');
-        if (!globalThis.__noDp4 && !globalThis.__noRmsFuse) {
-          rmsnormQ(s.x, W(p + 'post_attention_layernorm.weight'), H, C.rmsEps);
-          gateUpSiluDP4_only(gW, uW, s.swi, I, H);
-        } else {
-          await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
-          await gateUpSiluQ(s.normed, gW, uW, s.swi, I, H);   // handles __noDp4 (f32) internally
-        }
+        rmsnormQ(s.x, W(p + 'post_attention_layernorm.weight'), H, C.rmsEps);
+        gateUpSiluDP4_only(gW, uW, s.swi, I, H);
       } else {
         await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
         await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
@@ -2869,11 +2862,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
-    // Generation budget per round. Default 2048 (was 512, which a reasoning model's <think>
-    // block routinely overran → it hit the cap mid-thought and emitted no answer/tool call).
-    // EOS (im_end) stops normal turns far sooner; this is just the runaway ceiling. The decode
-    // loop also hard-caps at MAX_SEQ-1-pos. Override via provider.maxTokens ("Max output tokens").
-    const maxTokens = (provider && (provider.maxTokens | 0)) || 2048;
+    // Generation budget per round. NO artificial thinking cap by default — a reasoning <think>
+    // block can be long, and a fixed cap (512, then 2048) truncated it mid-thought. EOS (im_end)
+    // stops finished turns; the only hard bound is the context window (the decode loop caps at
+    // MAX_SEQ-1-pos). Default = MAX_SEQ so context is the sole limit. Override via
+    // provider.maxTokens ("Max output tokens") if you want a tighter cap.
+    const maxTokens = (provider && (provider.maxTokens | 0)) || MAX_SEQ;
     // conversations.js stores the dropdown's modelId in provider.endpoint (the
     // model picker sets spEndpoint = modelId). Accept either field.
     const _wantV = (provider && (provider.endpoint || provider.modelId)) || '';
