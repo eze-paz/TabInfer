@@ -2800,10 +2800,12 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (!mr) return 0;
     let m; try { m = await mr.json(); } catch (_) { return 0; }
     const C = CONFIG;
-    if (!m || m.ver !== KVCACHE_VER || m.variant !== variant || m.P > P ||
+    if (!m || m.ver !== KVCACHE_VER || m.variant !== variant ||
         m.qver !== QCACHE_VER || m.qgroup !== QGROUP ||   // KV depends on the quantized weights
-        m.nKvHeads !== C.nKvHeads || m.headDim !== C.headDim || m.numLayers !== C.numLayers) return 0;
-    for (let i = 0; i < m.P; i++) if (ids[i] !== m.ids[i]) return 0;   // prompt must start with the cached prefix
+        m.nKvHeads !== C.nKvHeads || m.headDim !== C.headDim || m.numLayers !== C.numLayers) { console.log('[qwen3 kv] restore skip: config/ver mismatch', { cachedP: m && m.P, qver: m && m.qver }); return 0; }
+    if (m.P > P) { console.log('[qwen3 kv] restore skip: cached P=' + m.P + ' > current pSys=' + P + ' (prefix got SHORTER)'); return 0; }
+    for (let i = 0; i < m.P; i++) if (ids[i] !== m.ids[i]) { console.log('[qwen3 kv] restore skip: token mismatch at index ' + i + '/' + m.P + ' (cached=' + m.ids[i] + ' got=' + ids[i] + ') — the system prefix changed'); return 0; }
+    console.log('[qwen3 kv] restoring ' + m.P + '-tok prefix from disk');
     ensureKv();
     const tgt = m.segs.map(sg => _kv[sg.layer][sg.role]);
     const q = E.device().queue;
@@ -2829,14 +2831,17 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // 672KiB→MB readback per layer×{k,v}, deferred so it never blocks decode). No-op if the
   // snapshot for this prefix already exists. Single-flight via _kvWriting.
   function scheduleWriteKvPrefix(variant, ids, P) {
-    if (_kvWriting || !P || P < 16 || !_kv) return;
+    if (_kvWriting) { console.log('[qwen3 kv] write skip: a write is already in flight (_kvWriting stuck?)'); return; }
+    if (!P || P < 16) { console.log('[qwen3 kv] write skip: pSys=' + P); return; }
+    if (!_kv) { console.log('[qwen3 kv] write skip: KV freed'); return; }
     _kvWriting = true;
     (async () => {
       try {
         const cache = await caches.open(KVCACHE_NAME);
         const hash = _fnv1a(ids, P);
         const cur = await cache.match(_kvUrl(variant, 'current'));
-        if (cur) { try { const cm = await cur.json(); if (cm && cm.hash === hash && cm.P === P) return; } catch (_) {} }
+        if (cur) { try { const cm = await cur.json(); if (cm && cm.hash === hash && cm.P === P) { console.log('[qwen3 kv] write skip: snapshot already current (P=' + P + ')'); return; } } catch (_) {} }
+        console.log('[qwen3 kv] writing snapshot: P=' + P + ' (prior prefix changed or absent)');
         const C = CONFIG, perElems = P * C.nKvHeads * C.headDim;
         await cache.delete(_kvUrl(variant, 'current'));   // invalidate old snapshot first (manifest = commit point)
         let buf = new Uint8Array(QCHUNK), used = 0, chunkIdx = 0, globalOff = 0;
@@ -2923,6 +2928,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
           ids0 = ids;
           // Persistent prompt cache: restore the stable system+tools prefix KV (skips its prefill).
           if (sys) { try { pSys = _lcpLen(TOK.encodeChat([{ role: 'system', content: sys }]), ids); } catch (_) { pSys = 0; } }
+          console.log('[qwen3 kv] round0 pSys=' + pSys + ' / prompt=' + ids.length + ' tok');
           if (pSys >= 16 && (!_cachedIds || _lcpLen(_cachedIds, ids) < pSys)) {
             try { const r = await restoreKvPrefix(variant, ids, pSys); if (r) emit({ type: 'info', message: 'Restored cached prompt…' }); } catch (_) {}
           }
