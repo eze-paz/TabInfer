@@ -2594,10 +2594,30 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   function toolPreamble(tools) {
-    const fns = (tools || []).filter(t => t && t.type === 'function').map(t => t.function).filter(Boolean);
+    const fns = (tools || []).filter(t => t && t.type === 'function' && t.function);
     if (!fns.length) return '';
-    const specs = fns.map(f => `- ${f.name}: ${f.description || ''}\n  arguments (JSON schema): ${JSON.stringify(f.parameters || {})}`).join('\n');
-    return ['You can call a tool by emitting a line: <tool_call>{"name":"...","arguments":{...}}</tool_call>', 'Available tools:', specs].join('\n');
+    // Qwen3's NATIVE (Hermes) tool block — the EXACT text its chat template renders and the
+    // model was RLHF'd against. Small dense Qwen3 (0.6B/1.7B) follow the training distribution
+    // closely and won't reliably emit <tool_call> for a hand-rolled format (they narrate the
+    // intent in prose instead). Signatures are the full {"type":"function","function":{…}}
+    // objects inside <tools></tools>. Our assistant <tool_call> / tool <tool_response>
+    // renderings (norm/tcText) already match this template.
+    const sigs = fns.map(t => JSON.stringify({ type: 'function', function: t.function })).join('\n');
+    return [
+      '# Tools',
+      '',
+      'You may call one or more functions to assist with the user query.',
+      '',
+      'You are provided with function signatures within <tools></tools> XML tags:',
+      '<tools>',
+      sigs,
+      '</tools>',
+      '',
+      'For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:',
+      '<tool_call>',
+      '{"name": <function-name>, "arguments": <args-json-object>}',
+      '</tool_call>',
+    ].join('\n');
   }
   const _cleanContent = (t) => (t || '').replace(/<tool_call>[\s\S]*?<\/tool_call>/g, '').trim();
 
