@@ -431,6 +431,61 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return gemvDP4_only(packBuf, scBuf, yBuf, N, K, acc);
   }
 
+  // FUSED rmsnorm + int8 quantize (decode T=1): emit the per-group int8 activation that the
+  // DP4A gemvs consume DIRECTLY from the norm, so the separate quantize dispatch disappears
+  // (the dispatch-overhead lever — RMSNorm fusion was the paper's biggest single win). Output
+  // layout is BIT-IDENTICAL to rmsnorm→QUANTQ8: xq[g*8+k]=pack4xI8 of 4 int8, xs[g]=scale.
+  // normed = x*inv*w is recomputed inline during quantize (cheap; avoids a shared-mem array,
+  // so there's NO hidden context/hidden-size cap). One workgroup over the single row.
+  const RMSNORMQ_WGSL = `
+enable f16;
+struct P { H:u32, eps:f32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<f32>;
+@group(0) @binding(1) var<storage, read>       w  : array<f16>;
+@group(0) @binding(2) var<storage, read_write> xq : array<u32>;
+@group(0) @binding(3) var<storage, read_write> xs : array<f32>;
+@group(0) @binding(4) var<uniform>             p  : P;
+var<workgroup> red : array<f32, ${WG_H}>;
+@compute @workgroup_size(${WG_H},1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>) {
+  let H = p.H;
+  var s : f32 = 0.0;
+  var i = lid.x;
+  loop { if (i >= H) { break; } let v = x[i]; s = s + v*v; i = i + ${WG_H}u; }
+  red[lid.x] = s; workgroupBarrier();
+  var stride = ${WG_H}u/2u;
+  loop { if (stride==0u){break;} if (lid.x<stride){red[lid.x]=red[lid.x]+red[lid.x+stride];} workgroupBarrier(); stride=stride/2u; }
+  let inv = inverseSqrt(red[0]/f32(H) + p.eps);
+  let ng = H / ${QGROUP}u;
+  var g = lid.x;
+  loop {
+    if (g >= ng) { break; }
+    let base = g * ${QGROUP}u;
+    var mx : f32 = 0.0;
+    for (var j:u32=0u; j<${QGROUP}u; j=j+1u) { mx = max(mx, abs(x[base+j]*inv*f32(w[base+j]))); }
+    let scale = mx/127.0; let invs = select(0.0, 1.0/scale, scale > 0.0);
+    xs[g] = scale;
+    for (var k:u32=0u; k<${QGROUP / 4}u; k=k+1u) {
+      let b = base + k*4u;
+      let q0 = clamp(i32(round(x[b]    *inv*f32(w[b])    *invs)), -127, 127);
+      let q1 = clamp(i32(round(x[b+1u] *inv*f32(w[b+1u]) *invs)), -127, 127);
+      let q2 = clamp(i32(round(x[b+2u] *inv*f32(w[b+2u]) *invs)), -127, 127);
+      let q3 = clamp(i32(round(x[b+3u] *inv*f32(w[b+3u]) *invs)), -127, 127);
+      xq[g*${QGROUP / 4}u + k] = pack4xI8(vec4<i32>(q0, q1, q2, q3));
+    }
+    g = g + ${WG_H}u;
+  }
+}`;
+  // Fused norm+quantize → _dp4.xq/_dp4.xs (the caller then runs gemvDP4_only / gateUpSiluDP4_only).
+  function rmsnormQ(xBuf, wBuf, H, eps) {
+    ensureDp4(H);
+    const pipe = E.getPipeline('q3.rmsnormQ', RMSNORMQ_WGSL);
+    const u = new Uint32Array(4); const du = new DataView(u.buffer);
+    du.setUint32(0, H, true); du.setFloat32(4, eps, true);
+    const p = uniform(u);
+    return E.dispatch(pipe, [xBuf, wBuf, _dp4.xq, _dp4.xs, p], [1, 1, 1]);
+  }
+
   // ---- FUSED int4 gate+up+SwiGLU (T=1): swi[i] = silu(gate·x)*(up·x) ----
   // 3 decode passes (gate gemv, up gemv, swiglu) → 1. Reads x once per chunk and
   // dequant-dots it against BOTH gate and up weights; one fewer pass barrier ×2
@@ -559,11 +614,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       const nWG = Math.ceil(I / GUSQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
       return E.dispatch(pipe, [xBuf, gRec.pack, gRec.scales, uRec.pack, uRec.scales, swiBuf, d], [gx, gy, 1]);
     }
-    ensureDp4(H);
-    const qp = E.getPipeline('q3.quantq8', QUANTQ8_WGSL);
-    const qd = uniform(new Uint32Array([H, 0, 0, 0]));
-    const groups = H / QGROUP, qgx = Math.min(groups, 65535), qgy = Math.ceil(groups / qgx);
-    E.dispatch(qp, [xBuf, _dp4.xq, _dp4.xs, qd], [qgx, qgy, 1]);
+    quantQ8(xBuf, H);
+    return gateUpSiluDP4_only(gRec, uRec, swiBuf, I, H);
+  }
+  // gate+up+SwiGLU against the CURRENTLY-quantized activation in _dp4 (caller ran quantQ8 or
+  // rmsnormQ first) — lets the MLP norm feed it pre-quantized, dropping the quantize dispatch.
+  function gateUpSiluDP4_only(gRec, uRec, swiBuf, I, H) {
     const pipe = E.getPipeline('q3.gateupDP4', GATEUPDP4_WGSL);
     const d = uniform(new Uint32Array([I, H, 0, 0]));
     const nWG = Math.ceil(I / GUSQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
@@ -1342,6 +1398,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for(let t=0;t<T;t++){let ss=0;for(let i=0;i<H;i++)ss+=x[t*H+i]**2;const inv=1/Math.sqrt(ss/H+eps);for(let i=0;i<H;i++)y[t*H+i]=x[t*H+i]*inv*wR[i];}
       check('rmsnorm', maxAbs(got,y));
       [xb,wb,yb].forEach(b=>b.destroy());
+    }
+
+    // --- rmsnormQ (FUSED norm+int8 quantize, decode) vs CPU rmsnorm → int8 dequant ---
+    {
+      const H=256, eps=1e-6;
+      const x=new Float32Array(H), w=new Float32Array(H);
+      for(let i=0;i<H;i++){ x[i]=Math.sin(i*0.07); w[i]=0.5+0.5*Math.cos(i*0.03); }
+      const wR=roundF16(w);
+      const xb=f32buf(x), wb=f16buf(w);
+      await rmsnormQ(xb, wb, H, eps);
+      const xs=await E.readF32(_dp4.xs, H/QGROUP);     // also flushes the rmsnormQ dispatch
+      const xqU=await readU32Range(_dp4.xq, 0, H/4);
+      const deq=new Float32Array(H);
+      for(let wi=0; wi<H/4; wi++){ const word=xqU[wi]; for(let k=0;k<4;k++){ let b=(word>>>(8*k))&0xFF; if(b>127)b-=256; const i=wi*4+k; deq[i]=b*xs[Math.floor(i/QGROUP)]; } }
+      let ss=0; for(let i=0;i<H;i++)ss+=x[i]**2; const inv=1/Math.sqrt(ss/H+eps);
+      const y=new Float32Array(H); let ref=1e-9; for(let i=0;i<H;i++){ y[i]=x[i]*inv*wR[i]; ref=Math.max(ref,Math.abs(y[i])); }
+      check('rmsnormQ', maxAbs(deq,y)/ref, 2e-2);   // int8 per-group quant → relative tol
+      [xb,wb].forEach(b=>b.destroy());
     }
     // --- linearT ---
     {
@@ -2203,18 +2277,19 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
-      await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
-      // q/k/v all read the SAME normed activation, and the DP4A gemv quantizes its input
-      // internally — so the default path re-quantized the identical vector 3×. On decode
-      // (T=1, dispatch-overhead-bound) quantize ONCE and reuse, saving 2 dispatches/layer.
-      // Provably identical output (same kernels, same data). __noQkvFuse / __noDp4 fall back.
+      // Attention input norm → q/k/v. DECODE (T=1) fuses two ways: (a) rmsnormQ emits the int8
+      // activation DIRECTLY from the norm — no separate quantize dispatch; (b) q/k/v share that
+      // one quantized activation (they read the same normed vector). Flags for isolated A/B:
+      // __noRmsFuse → plain rmsnorm + one quantQ8; __noQkvFuse/__noDp4 → full linearQ fallback.
       if (T === 1 && !globalThis.__noQkvFuse && !globalThis.__noDp4) {
         const qW = Wq(p + 'self_attn.q_proj.weight'), kW = Wq(p + 'self_attn.k_proj.weight'), vW = Wq(p + 'self_attn.v_proj.weight');
-        quantQ8(s.normed, H);
+        if (globalThis.__noRmsFuse) { await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps); quantQ8(s.normed, H); }
+        else { rmsnormQ(s.x, W(p + 'input_layernorm.weight'), H, C.rmsEps); }
         gemvDP4_only(qW.pack, qW.scales, s.q, nHq * hd, H);
         gemvDP4_only(kW.pack, kW.scales, s.k, nKv * hd, H);
         gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
       } else {
+        await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
         await linearQ(s.normed, Wq(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
         await linearQ(s.normed, Wq(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
         await linearQ(s.normed, Wq(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
@@ -2228,10 +2303,20 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
       await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
       await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
-      await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
+      // MLP norm → gate/up. Decode fuses the same way: rmsnormQ emits the int8 activation,
+      // gateUpSiluDP4_only consumes it (no separate quantize). Fallbacks preserve the f32
+      // (__noDp4) fused path and the prefill (T>1) gate/up/swiglu path.
       if (T === 1) {
-        await gateUpSiluQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), Wq(p + 'mlp.up_proj.weight'), s.swi, I, H);  // fused gate+up+silu (3 passes→1)
+        const gW = Wq(p + 'mlp.gate_proj.weight'), uW = Wq(p + 'mlp.up_proj.weight');
+        if (!globalThis.__noDp4 && !globalThis.__noRmsFuse) {
+          rmsnormQ(s.x, W(p + 'post_attention_layernorm.weight'), H, C.rmsEps);
+          gateUpSiluDP4_only(gW, uW, s.swi, I, H);
+        } else {
+          await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
+          await gateUpSiluQ(s.normed, gW, uW, s.swi, I, H);   // handles __noDp4 (f32) internally
+        }
       } else {
+        await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
         await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
         await linearQ(s.normed, Wq(p + 'mlp.up_proj.weight'), s.up, T, I, H);
         await swiglu(s.gate, s.up, s.swi, T * I);
