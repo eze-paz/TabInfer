@@ -2110,7 +2110,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         MAX_SEQ = ctx;
         try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
         try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
-        _kv = null; _tokHist = null; _cachedIds = null;   // prefix cache invalid (KV cleared)
+        _kv = null; _tokHist = null; _cachedIds = null; _sysAnchor = null;   // prefix cache invalid (KV cleared)
       }
       return;
     }
@@ -2215,6 +2215,14 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // the differing tail. Invalidated on unload and on any generate() (which
   // clobbers KV from position 0). See [[reference_qwen3-dense-webgpu-variants]].
   let _cachedIds = null;
+  // SYSTEM-PROMPT CACHE (in-memory, zero-copy): once the stable system block (system prompt +
+  // tool descriptions + skill defs + skill guidance — all concatenated into `sys`) is prefilled,
+  // its KV lives in _kv[0..P_sys) and is never overwritten (decode writes [L..); later prefills
+  // start at [P_sys..)). This "anchor" records that _kv[0..ids.length) holds exactly this system
+  // prefix for this variant, so a new conversation's FIRST message can skip re-prefilling it even
+  // when _cachedIds is null/stale. Invalidated wherever _kv[0..P_sys) could be clobbered (model
+  // switch, generate() from pos 0, unload).
+  let _sysAnchor = null;   // { variant, ids } | null
   let _idsBuf = null, _idsCap = 0;
   let _tokHist = null;   // GPU token history: argmax of pos P writes [P+1]; decode embed at pos P reads [P]. Enables GPU-resident chaining (no per-token CPU readback in the loop).
 
@@ -2417,7 +2425,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const PIPE_DEPTH = 3;   // batches kept in flight so the GPU never idles awaiting a readback.
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     await loadModel({ variant: _variant });
-    _cachedIds = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
+    _cachedIds = null; _sysAnchor = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     const L = ids.length;
     const tok0 = await forward(ids, 0);          // prefill → _tokHist[L]=token0
@@ -2620,7 +2628,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     try { for (const b of _dp4dead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
     try { for (const b of _dp4gDead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4g) { _dp4g.xq.destroy(); _dp4g.xs.destroy(); } } catch (_) {}
     _dp4 = null; _dp4dead = []; _dp4g = null; _dp4gDead = [];
-    _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null;
+    _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null; _sysAnchor = null;
     if (deep) {
       _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
       _f16Probed = false; _f16Math = null;    // re-probe against the rebuilt device
@@ -2679,7 +2687,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         if (_perfData) { _gpuMs += _perfData.gpu_drain_ms; _encMs += _perfData.encode_ms; }
       }
     } catch (e) {
-      _cachedIds = null;   // KV prefix now partial/uncertain → force a full prefill next turn
+      _cachedIds = null; _sysAnchor = null;   // KV prefix now partial/uncertain → force a full prefill next turn
       _PERF = _savedPerf;
       throw e;
     }
@@ -2776,9 +2784,39 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _toolRunner = null;
   function setToolRunner(fn) { _toolRunner = (typeof fn === 'function') ? fn : null; }
 
-  // (Persistent disk KV-prefix cache REMOVED — it never reliably restored on the first message
-  // of a conversation and added fragility for little gain. Multi-turn prefix reuse is handled
-  // entirely by the in-memory _cachedIds match in _streamIds, which stays.)
+  // ---- System-prompt cache (in-memory, zero-copy; see _sysAnchor) ----
+  // The cacheable prefix is the system block ONLY (no generation prompt). `sys` already holds the
+  // system prompt + tool descriptions + skill defs + skill guidance, so this single encode covers
+  // all four — no need to know how they were assembled.
+  function _sysPrefixIds(sys) {
+    try { return sys ? TOK.encodeChat([{ role: 'system', content: sys }], { addGenerationPrompt: false }) : null; }
+    catch (_) { return null; }
+  }
+  function _commonLen(a, b) { const m = Math.min(a.length, b.length); let i = 0; while (i < m && a[i] === b[i]) i++; return i; }
+  function _startsWith(ids, pre, n) { if (ids.length < n) return false; for (let i = 0; i < n; i++) if (ids[i] !== pre[i]) return false; return true; }
+
+  // BEFORE round-0 prefill: if our anchor proves _kv[0..P_sys) already holds exactly this system
+  // block's KV, claim it (set _cachedIds) so _streamIds prefills only the tail — skipping the
+  // system block even on a NEW conversation's first message (when _cachedIds is null/stale).
+  // No-op if the live in-memory prefix already covers it (multi-turn handles that). Hit → true.
+  function _sysCacheClaim(ids, sys, variant, emit) {
+    const sysIds = _sysPrefixIds(sys);
+    if (!sysIds || sysIds.length < 16) return false;
+    const P = sysIds.length;
+    if (!_startsWith(ids, sysIds, P)) return false;                          // ids must begin with the system block
+    if (_cachedIds && _commonLen(_cachedIds, ids) >= P) return false;        // live KV already covers it
+    if (!_kv || !_sysAnchor || _sysAnchor.variant !== variant) return false; // no usable anchor
+    if (_sysAnchor.ids.length !== P || !_startsWith(_sysAnchor.ids, sysIds, P)) return false;  // anchor != this system block
+    _cachedIds = sysIds;   // _streamIds: LCP(_cachedIds, ids) === P → reuse the resident system KV
+    try { emit && emit({ type: 'info', message: 'Using cached system prompt…' }); } catch (_) {}
+    return true;
+  }
+  // AFTER round-0 prefill: _kv[0..P_sys) now definitely holds this system block's KV (reused or
+  // freshly prefilled), so record/refresh the anchor for the next conversation.
+  function _sysCacheRecord(sys, variant) {
+    const sysIds = _sysPrefixIds(sys);
+    _sysAnchor = (sysIds && sysIds.length >= 16 && _kv) ? { variant, ids: sysIds } : null;
+  }
 
   async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
     // Generation budget per round. NO artificial thinking cap by default — a reasoning <think>
@@ -2837,7 +2875,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
           (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },     // answer → streamed content
         );
         const ids = TOK.encodeChat(work);
+        if (round === 0) _sysCacheClaim(ids, sys, variant, emit);   // skip re-prefilling the system block if resident
         await _streamIds(ids, { maxTokens, signal, onToken: (p) => parser.push(p) });
+        if (round === 0) _sysCacheRecord(sys, variant);             // _kv[0..P_sys) now holds this system block
         parser.flush();
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
         emit({ type: 'info', message: null });
