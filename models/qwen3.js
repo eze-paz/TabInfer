@@ -2102,12 +2102,16 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   async function loadModel({ onProgress, variant = '0.6B', nCtx } = {}) {
-    const ctx = _clampCtx(nCtx);
+    // nCtx is OPTIONAL. An omitted/0 nCtx means "keep the current context window" — callers like
+    // _streamIds/generate that don't know the provider must NOT shrink it. Only an explicit
+    // positive nCtx (re)sizes MAX_SEQ. (Bug fixed: _streamIds' nCtx-less loadModel was resetting
+    // MAX_SEQ to 4096 right after runConversation set it from provider.contextWindow.)
+    const want = (nCtx | 0) > 0 ? _clampCtx(nCtx) : 0;
     if (_loaded && _variant === variant) {
-      if (ctx !== MAX_SEQ) {
+      if (want && want !== MAX_SEQ) {
         // Same weights, different context window: drop the KV buffers (they're sized to
         // MAX_SEQ) so ensureKv() reallocs at the new size; weights/scratch are unaffected.
-        MAX_SEQ = ctx;
+        MAX_SEQ = want;
         try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
         try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
         _kv = null; _tokHist = null; _cachedIds = null; _sysAnchor = null;   // prefix cache invalid (KV cleared)
@@ -2115,7 +2119,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       return;
     }
     if (_loaded) unload();
-    MAX_SEQ = ctx;   // set BEFORE any KV/tokHist allocation (ensureKv reads it)
+    if (want) MAX_SEQ = want;   // explicit window on fresh load; else keep the existing MAX_SEQ default
     if (!(variant in CONFIGS)) throw new Error('unknown Qwen3 variant: ' + variant);
     Object.assign(CONFIG, CONFIGS[variant]);
     MODEL_ROOT = MODEL_ROOTS[variant];
