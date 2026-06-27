@@ -2806,24 +2806,37 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (m.P > P) { console.log('[qwen3 kv] restore skip: cached P=' + m.P + ' > current pSys=' + P + ' (prefix got SHORTER)'); return 0; }
     for (let i = 0; i < m.P; i++) if (ids[i] !== m.ids[i]) { console.log('[qwen3 kv] restore skip: token mismatch at index ' + i + '/' + m.P + ' (cached=' + m.ids[i] + ' got=' + ids[i] + ') — the system prefix changed'); return 0; }
     console.log('[qwen3 kv] restoring ' + m.P + '-tok prefix from disk');
-    ensureKv();
-    const tgt = m.segs.map(sg => _kv[sg.layer][sg.role]);
-    const q = E.device().queue;
-    let ci = 0;
-    const readChunk = async (idx) => {
-      const r = await cache.match(_kvUrl(variant, 'c' + idx)); if (!r) throw new Error('kv chunk ' + idx + ' missing');
-      const u8 = new Uint8Array(await r.arrayBuffer());
-      const cStart = idx * QCHUNK, cEnd = cStart + u8.byteLength;
-      for (let i = 0; i < m.segs.length; i++) {
-        const sg = m.segs[i]; if (sg.off >= cEnd) break; if (sg.off + _ceil16(sg.len) <= cStart) continue;
-        const ov0 = Math.max(sg.off, cStart), ov1 = Math.min(sg.off + sg.len, cEnd);
-        if (ov1 > ov0) q.writeBuffer(tgt[i], ov0 - sg.off, u8, ov0 - cStart, ov1 - ov0);
-      }
-    };
-    const pool = [];
-    for (let w = 0; w < Math.min(QREAD_CONC, m.nChunks); w++) pool.push((async () => { for (;;) { const my = ci++; if (my >= m.nChunks) break; await readChunk(my); } })());
-    await Promise.all(pool);
+    // Read the chunks into the KV buffers. If ANY chunk is missing/unreadable (Cache Storage
+    // can evict individual data entries while keeping the manifest), the old code threw and the
+    // call-site catch swallowed it — leaving _cachedIds unset (→ full re-prefill) AND the broken
+    // manifest in place (→ the write no-ops "already current" forever). Now: catch it, log the
+    // real reason, and DELETE the manifest so the post-prefill write rebuilds a good snapshot.
+    try {
+      ensureKv();
+      const tgt = m.segs.map(sg => _kv[sg.layer][sg.role]);
+      const q = E.device().queue;
+      let ci = 0;
+      const readChunk = async (idx) => {
+        const r = await cache.match(_kvUrl(variant, 'c' + idx)); if (!r) throw new Error('kv chunk ' + idx + ' missing (evicted)');
+        const u8 = new Uint8Array(await r.arrayBuffer());
+        const cStart = idx * QCHUNK, cEnd = cStart + u8.byteLength;
+        for (let i = 0; i < m.segs.length; i++) {
+          const sg = m.segs[i]; if (sg.off >= cEnd) break; if (sg.off + _ceil16(sg.len) <= cStart) continue;
+          const ov0 = Math.max(sg.off, cStart), ov1 = Math.min(sg.off + sg.len, cEnd);
+          if (ov1 > ov0) q.writeBuffer(tgt[i], ov0 - sg.off, u8, ov0 - cStart, ov1 - ov0);
+        }
+      };
+      const pool = [];
+      for (let w = 0; w < Math.min(QREAD_CONC, m.nChunks); w++) pool.push((async () => { for (;;) { const my = ci++; if (my >= m.nChunks) break; await readChunk(my); } })());
+      await Promise.all(pool);
+    } catch (e) {
+      console.warn('[qwen3 kv] restore FAILED reading chunks: ' + ((e && e.message) || e) + ' — invalidating snapshot so it rebuilds this turn');
+      try { await cache.delete(_kvUrl(variant, 'current')); } catch (_) {}
+      _cachedIds = null;
+      return 0;
+    }
     _cachedIds = ids.slice(0, m.P);
+    console.log('[qwen3 kv] restored ' + m.P + ' tok OK (prefill will reuse them)');
     return m.P;
   }
 
