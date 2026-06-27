@@ -1235,14 +1235,15 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   // split the S keys — score via vec4 dot + parallel max/sum reduction, then a 128-thread
   // PV accumulation (nd dims × ng key-groups, reduced). Query at the last position attends
   // all keys (T=1 ⇒ causal limit = S-1), so no per-key mask.
-  const ATTN_DEC_WGSL = `
+  // Function (not const) so MAXS tracks the device-derived _attnMaxS (set at load).
+  function attnDecWgsl() { return `
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
 @group(0) @binding(4) var<uniform>             p : P;
-const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const MAXS=${4096}u;
+const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const MAXS=${_attnMaxS}u;
 var<workgroup> qd  : array<vec4<f32>, HD4>;   // the single query (hd4 vec4)
 var<workgroup> sc  : array<f32, MAXS>;        // scores / probs per key
 var<workgroup> red : array<f32, DWG>;         // reduction scratch
@@ -1286,11 +1287,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     for (var gg=0u; gg<ng; gg=gg+1u){ sum4 = sum4 + part[gg*nd + lid]; }
     O[hqoff + lid] = sum4 / denom;
   }
-}`;
+}`; }
   function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
     const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
     if (T === 1) {   // decode: dedicated single-query kernel, one workgroup per head
-      const pipe = E.getPipeline('q3.attnDecode', ATTN_DEC_WGSL);
+      const pipe = E.getPipeline('q3.attnDecode.' + _attnMaxS, attnDecWgsl());   // label tracks MAXS so it can't reuse a stale-size pipeline
       const gx = Math.min(nHq, 65535), gy = Math.ceil(nHq / gx);
       return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
     }
@@ -2102,18 +2103,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   async function loadModel({ onProgress, variant = '0.6B', nCtx } = {}) {
-    // nCtx (provider.contextWindow) only sets the growth CEILING (_ctxCap) — it does NOT eagerly
-    // size MAX_SEQ. MAX_SEQ stays small and the auto-grow in _streamIds expands it to fit each
-    // prompt, so we never pre-allocate a huge KV that OOMs the iGPU (the cause of the "!!!!"
-    // garbage at 8192). An omitted nCtx leaves the current ceiling untouched.
-    if ((nCtx | 0) > 0) _ctxCap = Math.max(1024, Math.min(CTX_HARD_MAX, nCtx | 0));
-    if (_loaded && _variant === variant) return;
+    // nCtx (provider.contextWindow) only sets the growth CEILING (_ctxCap), clamped to _attnMaxS
+    // (the decode-attention's hard limit) — it does NOT eagerly size MAX_SEQ. MAX_SEQ stays small
+    // and the auto-grow in _streamIds expands it to fit each prompt, so we never pre-allocate a
+    // huge KV. Already-loaded: just re-apply the ceiling (_attnMaxS already known).
+    if (_loaded && _variant === variant) {
+      if ((nCtx | 0) > 0) _ctxCap = Math.max(1024, Math.min(_attnMaxS, nCtx | 0));
+      return;
+    }
     if (_loaded) unload();
     if (!(variant in CONFIGS)) throw new Error('unknown Qwen3 variant: ' + variant);
     Object.assign(CONFIG, CONFIGS[variant]);
     MODEL_ROOT = MODEL_ROOTS[variant];
     _variant = variant;
     await E.init();
+    // Decode-attention key capacity = hard context ceiling. The `sc` shared array is f32, so
+    // MAXS*4 + ~3KB (qd/red/part) must fit the device's workgroup-storage limit. Leave 4KB slack.
+    try { const lim = (E.device().limits.maxComputeWorkgroupStorageSize | 0); if (lim >= 8192) _attnMaxS = Math.max(2048, Math.min(8192, Math.floor((lim - 4096) / 4))); } catch (_) {}
+    _ctxCap = (nCtx | 0) > 0 ? Math.max(1024, Math.min(_attnMaxS, nCtx | 0)) : _attnMaxS;
+    if (MAX_SEQ > _attnMaxS) MAX_SEQ = _attnMaxS;   // never allocate beyond the decode-attn capacity
     try { await probeF16Gemm(); } catch (_) {}   // pick f16 vs f32 prefill-GEMM dot for this GPU
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
@@ -2194,15 +2202,17 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // ============================================================
   // Forward graph + KV cache + generate
   // ============================================================
-  // MAX_SEQ = KV buffer size = the context actually ALLOCATED. It starts small and grows ON
-  // DEMAND to fit each prompt (see the auto-grow in _streamIds) — we never pre-allocate the full
-  // configured window, because the KV is f32 and ~1.9GB at 8192 (geometry is identical for 0.6B
-  // and 1.7B), which OOMs the iGPU and yields garbage output. _ctxCap is the growth CEILING set
-  // from provider.contextWindow (default 8192). So a 4200-tok prompt allocates ~5200 (~1.2GB),
-  // not 8192 (~1.9GB); the window only reaches 8192 if a prompt actually needs it.
-  const CTX_HARD_MAX = 8192;
+  // _attnMaxS = the decode-attention's per-key shared-memory capacity (the `sc` array in
+  // ATTN_DEC_WGSL) and therefore the HARD context ceiling: if the sequence S exceeds it, the
+  // decode kernel writes sc[] OUT OF BOUNDS → corruption → "!!!!" garbage (the bug that hit at
+  // S>4096). Sized at load from the device's workgroup-storage limit (32KB on gen-12lp → 7168);
+  // sc is f32 so MAXS·4 + ~3KB of other shared must fit. Context can NEVER exceed this.
+  let _attnMaxS = 4096;     // decode-attn key capacity = hard context ceiling; set in loadModel
+  // MAX_SEQ = KV buffer size = the context actually ALLOCATED. Starts small and grows ON DEMAND
+  // to fit each prompt (auto-grow in _streamIds) so we never pre-allocate a huge KV. _ctxCap is
+  // the growth ceiling = min(provider.contextWindow, _attnMaxS), set at load.
   let MAX_SEQ = 4096;       // currently-allocated KV window (grows to fit, never shrinks in a session)
-  let _ctxCap = CTX_HARD_MAX;   // growth ceiling (provider.contextWindow, clamped to CTX_HARD_MAX)
+  let _ctxCap = 4096;       // growth ceiling = min(provider.contextWindow, _attnMaxS)
   function _clampCtx(n) { n = n | 0; if (!n) return 4096; return Math.max(1024, Math.min(_ctxCap, n)); }
   // Grow the context window (KV buffer size) to `want`, freeing the old KV so ensureKv reallocs at
   // the new size. Used to auto-fit a prompt longer than the current MAX_SEQ instead of erroring.
