@@ -8,6 +8,13 @@
 (function () {
   'use strict';
 
+  // Request PERSISTENT storage once on load. Without this, Cache Storage + OPFS are
+  // "best-effort" and the browser evicts entries under pressure — which silently corrupts
+  // the multi-hundred-MB quantized-weights and KV-prefix snapshots (a manifest can survive
+  // while its data chunks are evicted → restore fails → permanent re-prefill). Granted
+  // automatically by Chrome on engaged/installed origins; harmless if denied.
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist().then(function (granted) { try { console.log('[sandpie] persistent storage: ' + (granted ? 'granted' : 'denied (caches may be evicted)')); } catch (_) {} }, function () {}); } catch (_) {}
+
   // KEEP IN SYNC with DEFAULT_MODELS in webgpu-qwen3.js (the worker's real engine).
   const DEFAULT_MODELS = [
     { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (~1.1GB download)' },
