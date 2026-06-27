@@ -176,6 +176,63 @@ const SandpieWebGPU = (function () {
     return out;
   }
 
+  // ---- Texture-backed tensors (MLDrift-style activation storage) --------------
+  // Capturing MLDrift's WGSL (2026-06-27) showed its prefill edge on this iGPU is
+  // storing activations/outputs in TEXTURES (rgba16float) — half the bandwidth + the
+  // GPU's 2D texture cache — with f32 compute, NOT f16-math/subgroups/DP4A. These
+  // helpers let a kernel read activations via textureLoad. Texture views get a stable
+  // id in _bufIds so dispatch()'s bind-group cache keys them like buffers.
+  function createTexture2D(width, height, format, usage, label) {
+    return device().createTexture({ size: { width, height }, format, dimension: '2d', usage, label });
+  }
+  function texView(tex, label) {
+    const v = tex.createView({ label });
+    _bufIds.set(v, ++_bufCtr);
+    return v;
+  }
+  // Upload an X[rows, cols] f32 matrix as an rgba32float texture: texel(x=col/4, y=row)
+  // holds 4 consecutive cols. Row-major f32 data maps 1:1 (cols multiple of 4). Returns
+  // { tex, view, width, height }.
+  function texFromF32(data, rows, cols, label) {
+    const width = cols / 4, height = rows;
+    const tex = createTexture2D(width, height, 'rgba32float',
+      GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label);
+    device().queue.writeTexture({ texture: tex }, data, { bytesPerRow: cols * 4, rowsPerImage: height }, { width, height });
+    return { tex, view: texView(tex, label), width, height };
+  }
+  // Same, but rgba16float storage (half the bytes — the MLDrift bandwidth lever).
+  // Converts the f32 data to IEEE half on the CPU for upload; textureLoad still
+  // returns f32 in-shader (free hardware conversion), so the kernel is identical.
+  function texFromF16(data, rows, cols, label) {
+    const width = cols / 4, height = rows;
+    const half = f32ToF16(data);
+    const tex = createTexture2D(width, height, 'rgba16float',
+      GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, label);
+    device().queue.writeTexture({ texture: tex }, half, { bytesPerRow: cols * 2, rowsPerImage: height }, { width, height });
+    return { tex, view: texView(tex, label), width, height };
+  }
+  // Minimal f32→f16 (round-to-nearest-even, with subnormal + overflow handling).
+  function f32ToF16(f32) {
+    const out = new Uint16Array(f32.length);
+    const fb = new Float32Array(1), ib = new Uint32Array(fb.buffer);
+    for (let i = 0; i < f32.length; i++) {
+      fb[0] = f32[i]; const x = ib[0];
+      const sign = (x >>> 16) & 0x8000;
+      let mant = x & 0x007fffff; let exp = (x >>> 23) & 0xff;
+      if (exp === 255) { out[i] = sign | (mant ? 0x7e00 : 0x7c00); continue; }   // NaN/Inf
+      let e = exp - 127 + 15;
+      if (e >= 31) { out[i] = sign | 0x7c00; continue; }                          // overflow → Inf
+      if (e <= 0) {                                                               // subnormal/zero
+        if (e < -10) { out[i] = sign; continue; }
+        mant = (mant | 0x00800000) >>> (1 - e);
+        out[i] = sign | ((mant + 0x00001000) >>> 13);
+        continue;
+      }
+      out[i] = sign | (e << 10) | ((mant + 0x00001000) >>> 13);
+    }
+    return out;
+  }
+
   // ============================================================
   // 2b. WGSL template renderer (Jinja-lite)
   // ============================================================
@@ -258,7 +315,8 @@ const SandpieWebGPU = (function () {
     for (let i = 0; i < buffers.length; i++) key += '|' + (_bufIds.get(buffers[i]) || 0);
     let bindGroup = _bgCache.get(key);
     if (!bindGroup) {
-      const entries = buffers.map((b, i) => ({ binding: i, resource: { buffer: b } }));
+      // A resource is either a GPUBuffer (→ {buffer}) or a GPUTextureView (→ the view itself).
+      const entries = buffers.map((b, i) => ({ binding: i, resource: (b instanceof GPUBuffer) ? { buffer: b } : b }));
       bindGroup = device().createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries });
       if (_bgCache.size > 4096) _bgCache.clear();   // bound it (transient test buffers etc.)
       _bgCache.set(key, bindGroup);
@@ -464,6 +522,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     lastLoss: () => _lastLost, onLost: (fn) => { if (typeof fn === 'function') _lostListeners.push(fn); },
     renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling, beginBatch, endBatch, copyBuffer,
     createBuffer, uploadF32, readF32, gemm,
+    createTexture2D, texView, texFromF32, texFromF16, f32ToF16,
     // measurement
     selfTest, bench,
     // host contract (stubs for now)

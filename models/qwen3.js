@@ -1011,6 +1011,121 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
 
+  // ---- TEXTURE-BACKED GEMM (MLDrift-style, experimental A/B vs gemmDP4A) -------
+  // Captured MLDrift's Gemma WGSL (2026-06-27): on this iGPU its prefill edge is
+  // storing ACTIVATIONS in a texture (rgba16float) — half-bandwidth + the GPU's 2D
+  // texture cache — with f32 compute (NOT f16-math/subgroups/DP4A). This is a faithful
+  // port of that idea on our int4 weights: X[T,K] lives in a texture (texel(x=k/4,
+  // y=token) = X[token, 4k..4k+3]), weights stay int4 in a storage buffer (dequant
+  // inline to f32), 4×4 register tile, NO shared-memory staging — the texture cache
+  // is the operand cache. Benched head-to-head against gemmDP4A via _benchGemmTex.
+  function gemmTexWgsl() {
+    const BM = GEMMQ_BM, BN = GEMMQ_BN, TM = GEMMQ_TM, TN = GEMMQ_TN;
+    const WGM = BM / TM, WGN = BN / TN, NTH = WGM * WGN;
+    let s = `
+enable f16;
+struct D { T:u32, N:u32, K:u32, acc:u32 };
+@group(0) @binding(0) var Xt : texture_2d<f32>;            // texel(x=k/4, y=token)
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // [N,K/8] int4 (q+8)
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;   // [N,K/${QGROUP}]
+@group(0) @binding(3) var<storage, read_write> Y  : array<f32>;   // [T,N]
+@group(0) @binding(4) var<uniform>             d  : D;
+@compute @workgroup_size(${NTH}, 1, 1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let lx = lid.x; let tN = lx % ${WGN}u; let tM = lx / ${WGN}u;
+  let mBase = wg.y*${BM}u; let nBase = wg.x*${BN}u;
+  let WPR = d.K/8u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u;
+`;
+    for (let r = 0; r < TM * TN; r++) s += `  var acc${r}:f32=0.0;\n`;
+    s += `  for (var k4:u32=0u; k4<K4; k4=k4+1u) {
+    let k0 = k4*4u;
+`;
+    for (let i = 0; i < TM; i++) s += `    let x${i} = textureLoad(Xt, vec2<i32>(i32(k4), i32(mBase+tM*${TM}u+${i}u)), 0);\n`;
+    for (let j = 0; j < TN; j++) s += `    var w${j}:vec4<f32>;
+    { let gn=nBase+tN*${TN}u+${j}u; let word=W[gn*WPR + (k0>>3u)]; let h=(k0&4u);
+      let n0=i32((word>>(4u*(h+0u)))&0xFu)-8; let n1=i32((word>>(4u*(h+1u)))&0xFu)-8;
+      let n2=i32((word>>(4u*(h+2u)))&0xFu)-8; let n3=i32((word>>(4u*(h+3u)))&0xFu)-8;
+      let sv=f32(sc[gn*gpr + k0/${QGROUP}u]); w${j}=vec4<f32>(f32(n0),f32(n1),f32(n2),f32(n3))*sv; }
+`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `    acc${i * TN + j}=acc${i * TN + j}+dot(x${i}, w${j});\n`;
+    s += `  }
+`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `  { let gm=mBase+tM*${TM}u+${i}u; let gn=nBase+tN*${TN}u+${j}u; if (gm<d.T && gn<d.N) { let idx=gm*d.N+gn; Y[idx]=select(0.0,Y[idx],d.acc!=0u)+acc${i * TN + j}; } }\n`;
+    s += `}`;
+    return s;
+  }
+  // xtView = a GPUTextureView of X[T,K] (texel(x=k/4,y=token)). wrec = {pack, scales}.
+  function gemmTexQ(xtView, wrec, yBuf, T, N, K, acc) {
+    const pipe = E.getPipeline('q3.gemmTex', gemmTexWgsl());
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
+    return E.dispatch(pipe, [xtView, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
+  }
+
+  // ---- gemmTex2: FAITHFUL port of MLDrift kernel #142 -------------------------
+  // The first port (gemmTexQ) was unfaithful and slow for two reasons unrelated to
+  // textures: (1) no split-K, (2) it re-unpacked int4 weights per-thread-per-K (256×
+  // more dequant ALU than gemmDP4A's amortized shared-mem unpack). This replicates
+  // MLDrift exactly: one workgroup owns 8 tokens (M-block) × (TPX·4) channels; each
+  // thread owns 4 channels and ALL 8 tokens (s0..s7 = vec4 of 4 channels each, 32
+  // f32 accumulators); SK=8 threads in y split the K dimension (k4 += 8) and the
+  // results tree-reduce through workgroup memory. Weights are plain f16 in a buffer
+  // (no inline int4 unpack — isolating the texture-activation question). Activations
+  // come from a texture: texel(x=token, y=k4) = X[token, 4·k4 .. +3].
+  const G2_SK = 8, G2_CH = 4, G2_BT = 8;
+  function gemmTex2Wgsl(tpx) {
+    const TPX = tpx || 8, SK = G2_SK, CH = G2_CH, BT = G2_BT, NTH = TPX * SK;
+    let s = `
+enable f16;
+struct D { T:u32, N:u32, K:u32, acc:u32 };
+@group(0) @binding(0) var Xt : texture_2d<f32>;                 // texel(x=token, y=k4)
+@group(0) @binding(1) var<storage, read>       W  : array<vec4<f16>>;  // [N, K/4] row-major
+@group(0) @binding(2) var<storage, read_write> Y  : array<f32>;        // [T,N]
+@group(0) @binding(3) var<uniform>             d  : D;
+var<workgroup> red : array<vec4<f32>, ${NTH}>;
+@compute @workgroup_size(${TPX}, ${SK}, 1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let K4 = d.K/4u;
+  let tokBase = wg.y*${BT}u;
+  let chBase = (wg.x*${TPX}u + lid.x)*${CH}u;   // this thread's 4 channels: chBase..chBase+3
+`;
+    for (let t = 0; t < BT; t++) s += `  var s${t}:vec4<f32> = vec4<f32>(0.0);\n`;
+    s += `  var k4 = lid.y;
+  loop {
+    if (k4 >= K4) { break; }
+`;
+    for (let t = 0; t < BT; t++) s += `    let v${t} = textureLoad(Xt, vec2<i32>(i32(tokBase+${t}u), i32(k4)), 0);\n`;
+    for (let c = 0; c < CH; c++) s += `    let w${c} = vec4<f32>(W[(chBase+${c}u)*K4 + k4]);\n`;
+    for (let t = 0; t < BT; t++) s += `    s${t} = s${t} + vec4<f32>(dot(v${t},w0), dot(v${t},w1), dot(v${t},w2), dot(v${t},w3));\n`;
+    s += `    k4 = k4 + ${SK}u;
+  }
+  let slot = lid.x*${SK}u + lid.y;
+`;
+    // Tree-reduce each token-row's vec4 across the SK threads in y.
+    for (let t = 0; t < BT; t++) {
+      s += `  red[slot] = s${t}; workgroupBarrier();\n`;
+      for (let st = SK >> 1; st > 0; st >>= 1) s += `  if (lid.y < ${st}u) { red[slot] = red[slot] + red[slot + ${st}u]; } workgroupBarrier();\n`;
+      s += `  s${t} = red[lid.x*${SK}u]; workgroupBarrier();\n`;
+    }
+    s += `  if (lid.y != 0u) { return; }
+`;
+    for (let t = 0; t < BT; t++) {
+      s += `  { let gm=tokBase+${t}u; if (gm<d.T) {
+    for (var c=0u; c<${CH}u; c=c+1u) { let gn=chBase+c; if (gn<d.N) { let idx=gm*d.N+gn; Y[idx]=select(0.0,Y[idx],d.acc!=0u)+s${t}[c]; } }
+  } }
+`;
+    }
+    s += `}`;
+    return s;
+  }
+  // xtView = GPUTextureView of X[T,K] as texel(x=token,y=k4). wf16 = f16 weight buffer [N,K/4].
+  function gemmTex2(xtView, wf16, yBuf, T, N, K, acc, tpx) {
+    tpx = tpx || 8;
+    const pipe = E.getPipeline('q3.gemmTex2.' + tpx, gemmTex2Wgsl(tpx));
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
+    const chPerWG = tpx * G2_CH;   // channels / workgroup
+    return E.dispatch(pipe, [xtView, wf16, yBuf, d], [Math.ceil(N / chPerWG), Math.ceil(T / G2_BT), 1]);
+  }
+
   // Router for the int4 weight path. wrec = { pack, scales, N, K }. acc=true →
   // y += result (fused residual add, saves a separate addInPlace pass).
   async function linearQ(xBuf, wrec, yBuf, T, N, K, acc) {
@@ -2539,6 +2654,120 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       speedup_perCall: +(qUs / (gUs + quUs)).toFixed(2) };   // current per-call (quant each time)
   }
 
+  // TEXTURE-GEMM A/B (the MLDrift port). GPU-timestamp min-of-reps — same method as
+  // _benchGemmTS — comparing: gemmDP4A (current default), gemmQ (f16), gemmTex on an
+  // rgba32float X texture, and gemmTex on an rgba16float X texture (the bandwidth lever).
+  // Correctness of both texture variants checked vs gemmQ. Returns GFLOP/s per variant
+  // so we can see whether textures beat our shared-mem-staged kernels on THIS iGPU
+  // before committing to a full texture rewrite. Run in docs/webgpu-engine-test.html.
+  async function _benchGemmTex({ T = 256, N = 6144, K = 2048, iters = 10, reps = 14 } = {}) {
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); for (let i = 0; i < scales.length; i++) scales[i] = 0x3000 + (i % 7);
+    const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.013) * 0.7;
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bg'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), yb = E.createBuffer(T * N * 4, UF, 'yb');
+    const wrec = { pack: pb, scales: sb };
+    const tex32 = E.texFromF32(x, T, K, 'Xt32');
+    const tex16 = E.texFromF16(x, T, K, 'Xt16');
+    // Correctness: texture variants vs gemmQ (f16 reference).
+    uniformReset(); await gemmQ(xb, wrec, yb, T, N, K); await E.device().queue.onSubmittedWorkDone();
+    const ref = await E.readF32(yb, T * N);
+    const chk = async (view) => {
+      uniformReset(); await gemmTexQ(view, wrec, yb, T, N, K); await E.device().queue.onSubmittedWorkDone();
+      const g = await E.readF32(yb, T * N);
+      let mx = 0, rf = 0; for (let i = 0; i < g.length; i++) { mx = Math.max(mx, Math.abs(g[i] - ref[i])); rf = Math.max(rf, Math.abs(ref[i])); }
+      return +(mx / (rf || 1)).toExponential(2);
+    };
+    const relErr32 = await chk(tex32.view), relErr16 = await chk(tex16.view);
+    const prof = async (fn, cap) => { uniformReset(); E.beginProfile(cap); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); return await E.endProfile(); };
+    const sumAll = (p) => p.reduce((s, r) => s + r.us, 0) / iters;
+    let qUs = Infinity, dUs = Infinity, t32Us = Infinity, t16Us = Infinity;
+    for (let r = 0; r < reps; r++) {
+      qUs = Math.min(qUs, sumAll(await prof(() => gemmQ(xb, wrec, yb, T, N, K), iters + 8)));
+      dUs = Math.min(dUs, sumAll((await prof(() => gemmDP4A(xb, wrec, yb, T, N, K), iters * 2 + 8)).filter(x => !/quant/i.test(x.label))));
+      t32Us = Math.min(t32Us, sumAll(await prof(() => gemmTexQ(tex32.view, wrec, yb, T, N, K), iters + 8)));
+      t16Us = Math.min(t16Us, sumAll(await prof(() => gemmTexQ(tex16.view, wrec, yb, T, N, K), iters + 8)));
+    }
+    [xb, pb, sb, yb].forEach(b => b.destroy());
+    try { tex32.tex.destroy(); tex16.tex.destroy(); } catch (_) {}
+    const gflops = (us) => +(2 * T * N * K / us / 1e3).toFixed(0);
+    return { T, N, K, reps, relErr_tex32: relErr32, relErr_tex16: relErr16,
+      f16_us: +qUs.toFixed(1), f16_gflops: gflops(qUs),
+      dp4_us: +dUs.toFixed(1), dp4_gflops: gflops(dUs),
+      tex32_us: +t32Us.toFixed(1), tex32_gflops: gflops(t32Us),
+      tex16_us: +t16Us.toFixed(1), tex16_gflops: gflops(t16Us),
+      tex16_vs_dp4: +(dUs / t16Us).toFixed(2), tex16_vs_f16: +(qUs / t16Us).toFixed(2) };
+  }
+
+  // FAITHFUL MLDrift texture-GEMM A/B. Builds a token-major X texture (texel(x=token,
+  // y=k4)) + f16 weight buffer, validates gemmTex2's math vs a CPU reference at a small
+  // shape, then GPU-timestamp min-of-reps benches gemmTex2 (f32 tex & f16 tex) vs our
+  // gemmDP4A / gemmQ at the real shape. Weights for tex2 are plain f16 (no int4 unpack)
+  // — this ISOLATES the texture-activation + split-K question. If tex2 still loses to
+  // gemmDP4A despite cheaper weights, textures genuinely don't transfer to this iGPU.
+  async function _benchGemmTex2({ T = 256, N = 6144, K = 2048, iters = 6, reps = 8 } = {}) {
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bg'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    // Build a token-major texture from X[rows,cols] row-major: tex[k4][token][0..3] = X[token,4k4..].
+    const buildTex = (X, rows, cols, f16) => {
+      const w = rows, h = cols / 4, comp = new Float32Array(w * h * 4);   // [h=k4][w=token][4]
+      for (let t = 0; t < rows; t++) for (let k = 0; k < cols; k++) comp[(Math.floor(k / 4)) * w * 4 + t * 4 + (k % 4)] = X[t * cols + k];
+      const fmt = f16 ? 'rgba16float' : 'rgba32float';
+      const data = f16 ? E.f32ToF16(comp) : comp;
+      const tex = E.createTexture2D(w, h, fmt, GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, 'Xtm');
+      E.device().queue.writeTexture({ texture: tex }, data, { bytesPerRow: w * (f16 ? 8 : 16), rowsPerImage: h }, { width: w, height: h });
+      return { tex, view: E.texView(tex, 'Xtm') };
+    };
+    // ---- correctness: small shape, f16 weights, vs CPU ----
+    {
+      const t = 8, n = 32, k = 64;
+      const Xs = new Float32Array(t * k); for (let i = 0; i < Xs.length; i++) Xs[i] = Math.sin(i * 0.11);
+      const Ws = new Float32Array(n * k); for (let i = 0; i < Ws.length; i++) Ws[i] = Math.cos(i * 0.07) * 0.5;
+      const Wh = E.f32ToF16(Ws);
+      const wb = E.createBuffer(Wh.byteLength, UF, 'wf16'); E.device().queue.writeBuffer(wb, 0, Wh);
+      const yb = E.createBuffer(t * n * 4, UF, 'ys'); const tx = buildTex(Xs, t, k, false);
+      uniformReset(); await gemmTex2(tx.view, wb, yb, t, n, k, false, 8); await E.device().queue.onSubmittedWorkDone();
+      const got = await E.readF32(yb, t * n);
+      // CPU ref using f16-rounded weights (decode the halfs back to f32)
+      const h2f = (h) => { const s = (h & 0x8000) ? -1 : 1; const e = (h >> 10) & 0x1f; const m = h & 0x3ff; if (e === 0) return s * m * 2 ** -24; if (e === 31) return m ? NaN : s * Infinity; return s * (1 + m / 1024) * 2 ** (e - 15); };
+      let mx = 0, rf = 0;
+      for (let r = 0; r < t; r++) for (let c = 0; c < n; c++) { let a = 0; for (let kk = 0; kk < k; kk++) a += Xs[r * k + kk] * h2f(Wh[c * k + kk]); mx = Math.max(mx, Math.abs(a - got[r * n + c])); rf = Math.max(rf, Math.abs(a)); }
+      var tex2_relErr = +(mx / (rf || 1)).toExponential(2);
+      [wb, yb, tx.tex].forEach(b => b.destroy && b.destroy());
+    }
+    // ---- speed: real shape ----
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); for (let i = 0; i < scales.length; i++) scales[i] = 0x3000 + (i % 7);
+    const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.013) * 0.7;
+    const wf16 = new Uint16Array(N * K); for (let i = 0; i < wf16.length; i++) wf16[i] = 0x3000 + (i % 11);
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), wb = mk(wf16), yb = E.createBuffer(T * N * 4, UF, 'yb');
+    const wrec = { pack: pb, scales: sb };
+    const tx32 = buildTex(x, T, K, false), tx16 = buildTex(x, T, K, true);
+    const TPXS = [8, 16, 32];   // sweep workgroup width (TPX*8 threads): 64/128/256
+    uniformReset(); await gemmDP4A(xb, wrec, yb, T, N, K); for (const tp of TPXS) { uniformReset(); await gemmTex2(tx16.view, wb, yb, T, N, K, false, tp); }
+    await E.device().queue.onSubmittedWorkDone();
+    const prof = async (fn, cap) => { uniformReset(); E.beginProfile(cap); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); return await E.endProfile(); };
+    const sumAll = (p) => p.reduce((s, r) => s + r.us, 0) / iters;
+    const gflops = (us) => +(2 * T * N * K / us / 1e3).toFixed(0);
+    let dUs = Infinity, qUs = Infinity;
+    const texByTpx = {}; for (const tp of TPXS) texByTpx[tp] = Infinity;
+    for (let r = 0; r < reps; r++) {
+      dUs = Math.min(dUs, sumAll((await prof(() => gemmDP4A(xb, wrec, yb, T, N, K), iters * 2 + 8)).filter(z => !/quant/i.test(z.label))));
+      qUs = Math.min(qUs, sumAll(await prof(() => gemmQ(xb, wrec, yb, T, N, K), iters + 8)));
+      for (const tp of TPXS) texByTpx[tp] = Math.min(texByTpx[tp], sumAll(await prof(() => gemmTex2(tx16.view, wb, yb, T, N, K, false, tp), iters + 8)));
+    }
+    [xb, pb, sb, wb, yb].forEach(b => b.destroy());
+    try { tx32.tex.destroy(); tx16.tex.destroy(); } catch (_) {}
+    const texGflops = {}; let best = 0; for (const tp of TPXS) { texGflops['tex2_tpx' + tp + '_' + (tp * 8) + 'thr'] = gflops(texByTpx[tp]); best = Math.max(best, gflops(texByTpx[tp])); }
+    return { T, N, K, reps, tex2_relErr,
+      dp4_gflops: gflops(dUs), f16_gflops: gflops(qUs),
+      ...texGflops,
+      best_tex2_gflops: best, best_tex2_vs_dp4: +(best / gflops(dUs)).toFixed(2) };
+  }
+
   // Debug bench (no model load): time the tiled attention at a realistic prefill shape.
   async function _benchAttn({ T = 128, S = 2790, nHq = 16, nKv = 8, hd = 128, iters = 3 } = {}) {
     const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.01);
@@ -2954,7 +3183,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS,
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2,
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
