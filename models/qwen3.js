@@ -2205,6 +2205,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // KV is f32 and scales linearly with MAX_SEQ (the shared 8-kv-head × 128 × 28-layer geometry
   // is ~0.9GB at 4096), so raising it costs real GPU memory — clamp to a sane range.
   function _clampCtx(n) { n = n | 0; if (!n) return 4096; return Math.max(1024, Math.min(8192, n)); }
+  // Grow the context window (KV buffer size) to `want`, freeing the old KV so ensureKv reallocs at
+  // the new size. Used to auto-fit a prompt longer than the current MAX_SEQ instead of erroring.
+  function _growCtx(want) {
+    if (want <= MAX_SEQ) return;
+    MAX_SEQ = want;
+    try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
+    try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
+    _kv = null; _tokHist = null; _cachedIds = null; _sysAnchor = null;   // realloc + invalidate prefix caches
+  }
   let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
   let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
   let _scr = null;    // scratch buffers, sized to _scrT rows
@@ -2641,7 +2650,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   async function _streamIds(ids, { maxTokens = 512, onToken, signal } = {}) {
     await loadModel({ variant: _variant });
     const L = ids.length;
-    if (L >= MAX_SEQ) throw new Error('prompt too long: ' + L + ' tokens >= MAX_SEQ ' + MAX_SEQ);
+    // Auto-grow the context to fit the prompt + decode headroom (capped at 8192) instead of
+    // erroring. This makes a long prompt "just work" regardless of the provider.contextWindow
+    // setting (which still applies, in loadModel, as an explicit larger target). Only errors if
+    // the prompt alone won't fit even at the cap.
+    if (L + 64 > MAX_SEQ) {
+      const want = _clampCtx(L + 1024);
+      if (L + 64 > want) throw new Error('prompt too long: ' + L + ' tokens — exceeds the max context window (' + want + ')');
+      _growCtx(want);
+    }
     // One-time device fingerprint — compare against the harness to spot a different
     // adapter / power state / memory limits between the two pages (same backend).
     try {
