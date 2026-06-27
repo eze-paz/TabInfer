@@ -1388,7 +1388,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   e = tid;                                     // write O = acc / denom
   loop { if (e >= QT*hd4) { break; }
     let qi = e/hd4; let d4 = e%hd4; let gq = qbase+qi;
-    if (gq < p.T) { O[gq*qhs4 + hqoff + d4] = acc[qi*HD4+d4] / lsh[qi]; }
+    if (gq < p.T) { O[gq*qhs4 + hqoff + d4] = vec4<f32>(acc[qi*HD4+d4]) / lsh[qi]; }
     e = e + WG;
   }
 }`;
@@ -1459,7 +1459,146 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
       const gx = Math.min(nHq, 65535), gy = Math.ceil(nHq / gx);
       return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
     }
+    // PREFILL (T>1): f16 flash attention (KT=8) — ~2× the f32 kernel on this iGPU.
+    // Prefill attention was f32-ALU + latency + occupancy bound (NOT FMA-bound, so f16
+    // alone gave only 1.09×); the win came from f16 inner products + 4-accumulator ILP
+    // (breaks the score/PV dependency chains) + f16 running-acc (halves SLM → more
+    // resident workgroups). Verified relErr ~1e-3 vs the f32 kernel. Falls back to the
+    // f32 kernel when shader-f16 is unavailable (or __noAttnF16 set, for A/B).
+    const useF16 = !globalThis.__noAttnF16 && !!(E.caps && E.caps() && E.caps().hasF16);
+    if (useF16) return attentionF16(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd, 8);
     const pipe = E.getPipeline('q3.attnFlash', ATTN_WGSL);
+    const blocks = nHq * Math.ceil(T / ATTN_QT);
+    const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
+  }
+
+  // ---- f16 prefill attention (experimental A/B vs ATTN_WGSL) ------------------
+  // Prefill attention is COMPUTE-BOUND AT THE iGPU's f32 ceiling (~123 GFLOP/s;
+  // measured attnFlash = 131). The matmuls are fast only because they're int8/f16.
+  // This is the same kernel with the two hot inner loops in f16 (gen-12lp f16 ≈ 2×
+  // f32 FMA rate): the QKᵀ dot accumulates in f16, and the per-tile PV sum (KT=8
+  // terms, small → f16-safe) accumulates in f16 — while the RUNNING output acc and
+  // ALL softmax stats (max/denom/rescale) stay f32 for stability. Q/K/V are read
+  // from f32 global and cast to f16 when staged into shared memory.
+  // Parameterized f16 prefill attention. KT (keys per tile) is DECOUPLED from the
+  // workgroup size (WG=128) — each of the 3 per-tile phases (scores/softmax/PV) loops
+  // its work over the 128 threads. Bigger KT → fewer tiles → fewer barriers (4/tile),
+  // the lever if the kernel is barrier/structure-bound rather than FMA-bound.
+  function attnF16Wgsl(KT) {
+    const QT = ATTN_QT, WG = ATTN_WG, HD4 = ATTN_HDMAX / 4;
+    return `
+enable f16;
+struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
+@group(0) @binding(4) var<uniform>             p : P;
+const QT=${QT}u; const KT=${KT}u; const HD4=${HD4}u; const WG=${WG}u;
+var<workgroup> qsh : array<vec4<f16>, QT*HD4>;
+var<workgroup> ksh : array<vec4<f16>, KT*HD4>;
+var<workgroup> vsh : array<vec4<f16>, KT*HD4>;
+var<workgroup> acc : array<vec4<f16>, QT*HD4>;   // f16 to cut SLM → higher occupancy
+var<workgroup> scr : array<f32, QT*KT>;
+var<workgroup> msh : array<f32, QT>;
+var<workgroup> lsh : array<f32, QT>;
+var<workgroup> csh : array<f32, QT>;
+@compute @workgroup_size(${WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+  let tid = lidv.x;
+  let hd4 = p.hd / 4u;
+  let nqb = (p.T + QT - 1u)/QT;
+  let blk = wg.x + wg.y*nwg.x;
+  let hq = blk / nqb;
+  if (hq >= p.nHq) { return; }
+  let qbase = (blk % nqb) * QT;
+  let grp = p.nHq / p.nKv; let hk = hq / grp;
+  let kv4 = (p.nKv*p.hd)/4u; let qhs4 = (p.nHq*p.hd)/4u; let hkoff = hk*hd4; let hqoff = hq*hd4;
+  let scale = 1.0/sqrt(f32(p.hd));
+  let qmax = (p.S - p.T) + min(qbase + QT, p.T) - 1u;
+  var e = tid;
+  loop { if (e >= QT*hd4) { break; }
+    let qi = e/hd4; let d4 = e%hd4; let gq = qbase+qi;
+    qsh[qi*HD4+d4] = select(vec4<f16>(0.0), vec4<f16>(Q[gq*qhs4 + hqoff + d4]), gq < p.T);
+    acc[qi*HD4+d4] = vec4<f16>(0.0);
+    e = e + WG;
+  }
+  if (tid < QT) { msh[tid] = -3.0e38; lsh[tid] = 0.0; }
+  workgroupBarrier();
+  var k0 = 0u;
+  loop {
+    if (k0 >= p.S || k0 > qmax) { break; }
+    e = tid;                                    // load K/V tile (KT keys)
+    loop { if (e >= KT*hd4) { break; }
+      let kj = e/hd4; let d4 = e%hd4; let gk = k0+kj; let ok = gk < p.S;
+      ksh[kj*HD4+d4] = select(vec4<f16>(0.0), vec4<f16>(K[gk*kv4 + hkoff + d4]), ok);
+      vsh[kj*HD4+d4] = select(vec4<f16>(0.0), vec4<f16>(V[gk*kv4 + hkoff + d4]), ok);
+      e = e + WG;
+    }
+    workgroupBarrier();
+    e = tid;                                    // scores: QT*KT entries over WG threads
+    loop { if (e >= QT*KT) { break; }
+      let qi = e/KT; let kj = e%KT;
+      let qo = qi*HD4; let ko = kj*HD4;
+      var s0 = vec4<f16>(0.0); var s1 = vec4<f16>(0.0); var s2 = vec4<f16>(0.0); var s3 = vec4<f16>(0.0);
+      for (var i4=0u;i4<hd4;i4=i4+4u){          // 4 independent accumulators → break the dependency chain (ILP)
+        s0 = s0 + qsh[qo+i4]*ksh[ko+i4];
+        s1 = s1 + qsh[qo+i4+1u]*ksh[ko+i4+1u];
+        s2 = s2 + qsh[qo+i4+2u]*ksh[ko+i4+2u];
+        s3 = s3 + qsh[qo+i4+3u]*ksh[ko+i4+3u];
+      }
+      let sv = (s0+s1)+(s2+s3);
+      let dot = f32(sv.x + sv.y + sv.z + sv.w);
+      let gq = qbase+qi; let gk = k0+kj; let gqpos = (p.S - p.T) + gq;
+      let valid = (gq < p.T) && (gk < p.S) && (gk <= gqpos);
+      scr[e] = select(-3.0e38, dot*scale, valid);
+      e = e + WG;
+    }
+    workgroupBarrier();
+    if (tid < QT) {                             // online-softmax update per query
+      let qi = tid;
+      var tm = -3.0e38;
+      for (var kj=0u;kj<KT;kj=kj+1u){ tm = max(tm, scr[qi*KT+kj]); }
+      let mnew = max(msh[qi], tm);
+      let corr = exp(msh[qi] - mnew);
+      var sum = 0.0;
+      for (var kj=0u;kj<KT;kj=kj+1u){
+        let pw = select(0.0, exp(scr[qi*KT+kj]-mnew), scr[qi*KT+kj] > -3.0e37);
+        scr[qi*KT+kj] = pw; sum = sum + pw;
+      }
+      lsh[qi] = lsh[qi]*corr + sum; msh[qi] = mnew; csh[qi] = corr;
+    }
+    workgroupBarrier();
+    e = tid;                                    // PV: acc = acc*corr + Σ_kj prob*V
+    loop { if (e >= QT*hd4) { break; }
+      let qi = e/hd4; let d4 = e%hd4; let so = qi*KT;
+      var a0 = vec4<f16>(0.0); var a1 = vec4<f16>(0.0); var a2 = vec4<f16>(0.0); var a3 = vec4<f16>(0.0);
+      for (var kj=0u;kj<KT;kj=kj+4u){          // 4 independent PV accumulators (ILP)
+        a0 = a0 + f16(scr[so+kj])    * vsh[(kj)*HD4+d4];
+        a1 = a1 + f16(scr[so+kj+1u]) * vsh[(kj+1u)*HD4+d4];
+        a2 = a2 + f16(scr[so+kj+2u]) * vsh[(kj+2u)*HD4+d4];
+        a3 = a3 + f16(scr[so+kj+3u]) * vsh[(kj+3u)*HD4+d4];
+      }
+      let a16 = (a0+a1)+(a2+a3);
+      acc[qi*HD4+d4] = acc[qi*HD4+d4]*f16(csh[qi]) + a16;
+      e = e + WG;
+    }
+    workgroupBarrier();
+    k0 = k0 + KT;
+  }
+  e = tid;
+  loop { if (e >= QT*hd4) { break; }
+    let qi = e/hd4; let d4 = e%hd4; let gq = qbase+qi;
+    if (gq < p.T) { O[gq*qhs4 + hqoff + d4] = vec4<f32>(acc[qi*HD4+d4]) / lsh[qi]; }
+    e = e + WG;
+  }
+}`;
+  }
+  function attentionF16(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd, KT) {
+    KT = KT || ATTN_KT;
+    const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
+    const pipe = E.getPipeline('q3.attnFlashF16.' + KT, attnF16Wgsl(KT));
     const blocks = nHq * Math.ceil(T / ATTN_QT);
     const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
     return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
@@ -2851,6 +2990,43 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { T, N, K, reps, outMaxAbs: +maxAbs.toFixed(2), dp4_gflops: gflops(dUs), tex3_gflops: gflops(t3), tex3_vs_dp4: +(gflops(t3) / gflops(dUs)).toFixed(2) };
   }
 
+  // A/B: f32 attnFlash vs f16 attnFlash. Correctness (f16 vs f32 output) + GPU-timestamp
+  // min-of-reps timing + GFLOP/s. Proves whether f16 lifts prefill attention off the f32
+  // ceiling (~123 GFLOP/s). Default shape = real prefill self-attention (T=S).
+  async function _benchAttnF16({ T = 2560, S = 2560, nHq = 16, nKv = 8, hd = 128, iters = 4, reps = 8 } = {}) {
+    const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.011) * 0.5;
+    const Kk = new Float32Array(S * nKv * hd); for (let i = 0; i < Kk.length; i++) Kk[i] = Math.cos(i * 0.007) * 0.5;
+    const Vv = new Float32Array(S * nKv * hd); for (let i = 0; i < Vv.length; i++) Vv[i] = Math.sin(i * 0.005 + 1) * 0.5;
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'ab'); E.device().queue.writeBuffer(b, 0, a.buffer, 0, a.byteLength); return b; };
+    const qb = mk(Q), kb = mk(Kk), vb = mk(Vv), of = E.createBuffer(Q.byteLength, UF, 'of'), o16 = E.createBuffer(Q.byteLength, UF, 'o16');
+    const KTS = [4, 8, 16];
+    // correctness vs the f32 kernel (per KT)
+    uniformReset(); await attention(qb, kb, vb, of, T, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone();
+    const n = Math.min(Q.length, 200000);
+    const a = await E.readF32(of, n);
+    const relErr = {};
+    for (const KT of KTS) {
+      uniformReset(); await attentionF16(qb, kb, vb, o16, T, S, nHq, nKv, hd, KT); await E.device().queue.onSubmittedWorkDone();
+      const b = await E.readF32(o16, n);
+      let mx = 0, rf = 0; for (let i = 0; i < n; i++) { mx = Math.max(mx, Math.abs(a[i] - b[i])); rf = Math.max(rf, Math.abs(a[i])); }
+      relErr['KT' + KT] = +(mx / (rf || 1)).toExponential(2);
+    }
+    const prof = async (fn) => { uniformReset(); E.beginProfile(iters + 8); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); const p = await E.endProfile(); return p.reduce((s, r) => s + r.us, 0) / iters; };
+    let f32u = Infinity; const f16u = {}; for (const KT of KTS) f16u[KT] = Infinity;
+    for (let r = 0; r < reps; r++) {
+      f32u = Math.min(f32u, await prof(() => attention(qb, kb, vb, of, T, S, nHq, nKv, hd)));
+      for (const KT of KTS) f16u[KT] = Math.min(f16u[KT], await prof(() => attentionF16(qb, kb, vb, o16, T, S, nHq, nKv, hd, KT)));
+    }
+    [qb, kb, vb, of, o16].forEach(x => x.destroy());
+    const pairs = (T === S) ? (T * (T + 1) / 2) : (T * (S - T) + T * (T + 1) / 2);
+    const flop = pairs * nHq * hd * 4;
+    const gflops = (us) => +(flop / us / 1e3).toFixed(0);
+    const out = { T, S, relErr, f32_us: +f32u.toFixed(1), f32_gflops: gflops(f32u) };
+    for (const KT of KTS) { out['f16_KT' + KT + '_us'] = +f16u[KT].toFixed(1); out['f16_KT' + KT + '_gflops'] = gflops(f16u[KT]); out['speedup_KT' + KT] = +(f32u / f16u[KT]).toFixed(2); }
+    return out;
+  }
+
   // Debug bench (no model load): time the tiled attention at a realistic prefill shape.
   async function _benchAttn({ T = 128, S = 2790, nHq = 16, nKv = 8, hd = 128, iters = 3 } = {}) {
     const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.01);
@@ -3266,7 +3442,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3,
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
