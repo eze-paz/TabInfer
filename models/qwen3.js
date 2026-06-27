@@ -2102,24 +2102,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   async function loadModel({ onProgress, variant = '0.6B', nCtx } = {}) {
-    // nCtx is OPTIONAL. An omitted/0 nCtx means "keep the current context window" — callers like
-    // _streamIds/generate that don't know the provider must NOT shrink it. Only an explicit
-    // positive nCtx (re)sizes MAX_SEQ. (Bug fixed: _streamIds' nCtx-less loadModel was resetting
-    // MAX_SEQ to 4096 right after runConversation set it from provider.contextWindow.)
-    const want = (nCtx | 0) > 0 ? _clampCtx(nCtx) : 0;
-    if (_loaded && _variant === variant) {
-      if (want && want !== MAX_SEQ) {
-        // Same weights, different context window: drop the KV buffers (they're sized to
-        // MAX_SEQ) so ensureKv() reallocs at the new size; weights/scratch are unaffected.
-        MAX_SEQ = want;
-        try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
-        try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
-        _kv = null; _tokHist = null; _cachedIds = null; _sysAnchor = null;   // prefix cache invalid (KV cleared)
-      }
-      return;
-    }
+    // nCtx (provider.contextWindow) only sets the growth CEILING (_ctxCap) — it does NOT eagerly
+    // size MAX_SEQ. MAX_SEQ stays small and the auto-grow in _streamIds expands it to fit each
+    // prompt, so we never pre-allocate a huge KV that OOMs the iGPU (the cause of the "!!!!"
+    // garbage at 8192). An omitted nCtx leaves the current ceiling untouched.
+    if ((nCtx | 0) > 0) _ctxCap = Math.max(1024, Math.min(CTX_HARD_MAX, nCtx | 0));
+    if (_loaded && _variant === variant) return;
     if (_loaded) unload();
-    if (want) MAX_SEQ = want;   // explicit window on fresh load; else keep the existing MAX_SEQ default
     if (!(variant in CONFIGS)) throw new Error('unknown Qwen3 variant: ' + variant);
     Object.assign(CONFIG, CONFIGS[variant]);
     MODEL_ROOT = MODEL_ROOTS[variant];
@@ -2205,10 +2194,16 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // ============================================================
   // Forward graph + KV cache + generate
   // ============================================================
-  let MAX_SEQ = 4096;   // context window = KV buffer size; configurable per-provider at load
-  // KV is f32 and scales linearly with MAX_SEQ (the shared 8-kv-head × 128 × 28-layer geometry
-  // is ~0.9GB at 4096), so raising it costs real GPU memory — clamp to a sane range.
-  function _clampCtx(n) { n = n | 0; if (!n) return 4096; return Math.max(1024, Math.min(8192, n)); }
+  // MAX_SEQ = KV buffer size = the context actually ALLOCATED. It starts small and grows ON
+  // DEMAND to fit each prompt (see the auto-grow in _streamIds) — we never pre-allocate the full
+  // configured window, because the KV is f32 and ~1.9GB at 8192 (geometry is identical for 0.6B
+  // and 1.7B), which OOMs the iGPU and yields garbage output. _ctxCap is the growth CEILING set
+  // from provider.contextWindow (default 8192). So a 4200-tok prompt allocates ~5200 (~1.2GB),
+  // not 8192 (~1.9GB); the window only reaches 8192 if a prompt actually needs it.
+  const CTX_HARD_MAX = 8192;
+  let MAX_SEQ = 4096;       // currently-allocated KV window (grows to fit, never shrinks in a session)
+  let _ctxCap = CTX_HARD_MAX;   // growth ceiling (provider.contextWindow, clamped to CTX_HARD_MAX)
+  function _clampCtx(n) { n = n | 0; if (!n) return 4096; return Math.max(1024, Math.min(_ctxCap, n)); }
   // Grow the context window (KV buffer size) to `want`, freeing the old KV so ensureKv reallocs at
   // the new size. Used to auto-fit a prompt longer than the current MAX_SEQ instead of erroring.
   function _growCtx(want) {
@@ -2641,7 +2636,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     try { for (const b of _dp4dead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
     try { for (const b of _dp4gDead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4g) { _dp4g.xq.destroy(); _dp4g.xs.destroy(); } } catch (_) {}
     _dp4 = null; _dp4dead = []; _dp4g = null; _dp4gDead = [];
-    _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null; _sysAnchor = null;
+    _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null; _sysAnchor = null; MAX_SEQ = 4096;
     if (deep) {
       _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
       _f16Probed = false; _f16Math = null;    // re-probe against the rebuilt device
@@ -2654,13 +2649,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   async function _streamIds(ids, { maxTokens = 512, onToken, signal } = {}) {
     await loadModel({ variant: _variant });
     const L = ids.length;
-    // Auto-grow the context to fit the prompt + decode headroom (capped at 8192) instead of
-    // erroring. This makes a long prompt "just work" regardless of the provider.contextWindow
-    // setting (which still applies, in loadModel, as an explicit larger target). Only errors if
-    // the prompt alone won't fit even at the cap.
+    // Grow the allocated context JUST ENOUGH to fit this prompt + decode headroom (never the full
+    // configured ceiling), capped at _ctxCap. This keeps the KV cache as small as possible — a
+    // 4200-tok prompt allocates ~5200 (~1.2GB), not 8192 (~1.9GB, which OOMs the iGPU → garbage).
+    // Only errors if the prompt won't fit even at the ceiling.
     if (L + 64 > MAX_SEQ) {
-      const want = _clampCtx(L + 1024);
-      if (L + 64 > want) throw new Error('prompt too long: ' + L + ' tokens — exceeds the max context window (' + want + ')');
+      const want = Math.max(1024, Math.min(_ctxCap, L + 1024));
+      if (L + 64 > want) throw new Error('prompt too long: ' + L + ' tokens — exceeds the context limit (' + _ctxCap + '). Raise "Context size" or shorten the prompt.');
       _growCtx(want);
     }
     // One-time device fingerprint — compare against the harness to spot a different
