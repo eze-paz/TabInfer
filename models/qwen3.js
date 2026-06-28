@@ -3289,6 +3289,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       push(t) { buf += t; step(); },
       flush() { out(buf); buf = ''; if (state === 'tool' && cur.trim()) acc.toolCalls.push(cur.trim()); },
       get content() { return acc.content; }, get reasoning() { return acc.reasoning; }, get toolCalls() { return acc.toolCalls; },
+      get state() { return state; },   // after flush(): 'think' ⇒ generation was cut off INSIDE <think> (never saw </think>)
     };
   }
 
@@ -3396,11 +3397,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
         emit({ type: 'info', message: null });
 
-        const content = parser.content.replace(/^\s+/, '');
+        let content = parser.content.replace(/^\s+/, '');
         const toolCalls = [];
         parser.toolCalls.forEach((raw, k) => {
           try { const o = JSON.parse(raw); if (o && o.name) toolCalls.push({ id: 'call_' + round + '_' + k, type: 'function', function: { name: o.name, arguments: JSON.stringify(o.arguments || {}) } }); } catch (_) {}
         });
+        // NEVER leave a blank turn. If the model produced no answer AND no tool call, it almost
+        // always ran out of context budget INSIDE the <think> block: the prompt sits near the
+        // context ceiling (_ctxCap), so the decode loop hit MAX_SEQ-1-pos before the model could
+        // close </think> and write an answer (parser.state stays 'think'). Silently emitting an
+        // empty assistant message is the reported "only thinks, then stops" bug. Surface an
+        // actionable message instead so the user always sees what happened. (The genuine fix for
+        // the budget itself is raising _ctxCap — streaming decode attention + f16 KV.)
+        if (!content && !toolCalls.length) {
+          const cutMidThink = parser.state === 'think' || parser.reasoning.length > 0;
+          content = cutMidThink
+            ? '⚠️ I ran out of room to answer: this conversation is near the model\'s context limit (' + _ctxCap + ' tokens), so it used the remaining budget on reasoning and couldn\'t finish a reply. Start a new chat, remove a large earlier message (e.g. a long command output), or raise **Context size** in the provider settings.'
+            : '⚠️ The model produced no output. Try resending, or start a new chat if the history is very long.';
+          emit({ type: 'delta', delta: { content } });
+        }
         // Synthesize the tool_calls delta so conversations.js builds the call bubbles.
         if (toolCalls.length) emit({ type: 'delta', delta: { tool_calls: toolCalls.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } })) } });
         emit({ type: 'round_end', content });
