@@ -67,7 +67,7 @@
     function cleanup() { clearTimeout(timer); sw.removeEventListener('message', onMsg); sw.removeEventListener('error', onErr); }
     sw.addEventListener('message', onMsg);
     sw.addEventListener('error', onErr);
-    sw.postMessage({ type: 'tool', id, name: m.name, args: m.args, conversation_file_name: m.convId, localterm: { token: localStorage.getItem('sandpie:localterm:token') || '', port: +(localStorage.getItem('sandpie:localterm:port')) || 8771 } });
+    sw.postMessage({ type: 'tool', id, name: m.name, args: m.args, conversation_file_name: m.convId });
   }
 
   function worker() {
