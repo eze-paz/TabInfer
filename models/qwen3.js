@@ -1399,7 +1399,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   // split the S keys — score via vec4 dot + parallel max/sum reduction, then a 128-thread
   // PV accumulation (nd dims × ng key-groups, reduced). Query at the last position attends
   // all keys (T=1 ⇒ causal limit = S-1), so no per-key mask.
-  // Function (not const) so MAXS tracks the device-derived _attnMaxS (set at load).
+  // Function (not const) so MAXS tracks the device-derived _attnDecLegacyMaxS (set at load).
+  // LEGACY kernel: kept for A/B (__noStreamDecAttn=1) — superseded by the STREAMING split-KV
+  // kernel below, which has no MAXS shared array (no context ceiling) and much better occupancy.
   function attnDecWgsl() { return `
 struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
@@ -1407,7 +1409,7 @@ struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
 @group(0) @binding(4) var<uniform>             p : P;
-const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const MAXS=${_attnMaxS}u;
+const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const MAXS=${_attnDecLegacyMaxS}u;
 var<workgroup> qd  : array<vec4<f32>, HD4>;   // the single query (hd4 vec4)
 var<workgroup> sc  : array<f32, MAXS>;        // scores / probs per key
 var<workgroup> red : array<f32, DWG>;         // reduction scratch
@@ -1452,13 +1454,171 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     O[hqoff + lid] = sum4 / denom;
   }
 }`; }
-  function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
-    const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
-    if (T === 1) {   // decode: dedicated single-query kernel, one workgroup per head
-      const pipe = E.getPipeline('q3.attnDecode.' + _attnMaxS, attnDecWgsl());   // label tracks MAXS so it can't reuse a stale-size pipeline
-      const gx = Math.min(nHq, 65535), gy = Math.ceil(nHq / gx);
-      return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
+  // ---- STREAMING split-KV decode attention (T==1) -----------------------------
+  // Replaces the legacy kernel above as the default decode path. Two problems with the
+  // legacy kernel: (1) it materializes ALL S scores in a workgroup array sc[MAXS], so the
+  // 32KB workgroup-storage limit becomes a HARD 7168-token context ceiling (out-of-bounds
+  // writes past it → "!!!!" garbage); (2) one workgroup per head = only nHq (16) workgroups
+  // for the whole GPU — most of the iGPU's subslices idle. This kernel fixes both:
+  //   • ONLINE SOFTMAX over 128-key tiles (running max m + denom l, flash-decoding style):
+  //     the score array is one tile (sc[128]) — workgroup storage is O(1) in S, NO ceiling.
+  //   • SPLIT-KV: gy = nsplit workgroups per head each own a contiguous key range and
+  //     emit an UNNORMALIZED partial (m_i, l_i, o_i); a tiny combine pass merges them:
+  //     M = max m_i, L = Σ l_i·e^(m_i−M), O = Σ o_i·e^(m_i−M) / L. nHq×nsplit workgroups
+  //     (e.g. 16×12 = 192) instead of 16 → the occupancy the legacy kernel never had.
+  //     (This is llama.cpp's flash_attn_vec split-KV shape; the combine math is exact,
+  //     not approximate — verified vs the CPU reference in selfTestKernels.)
+  // Per tile: score phase (one key/thread, 4-accumulator vec4 dot for ILP — the same
+  // restructuring that won 3.4× on prefill), tree max-reduce, exp+tree sum-reduce, then a
+  // PV phase where thread (d4,g) accumulates its dim-slice over the tile's keys in
+  // registers (rescaled by e^(m−mnew) on each running-max update).
+  const DEC_TK = 128;            // keys per tile == workgroup size (one key per thread in score phase)
+  const DEC_NSPLIT_MAX = 16;     // scratch is sized for this; nsplit chosen per-dispatch below
+  function attnDecStreamWgsl() { return `
+struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, nsplit:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       Q  : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       K  : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       V  : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> PO : array<vec4<f32>>;  // partial O [nHq*nsplit, HD4] (unnormalized)
+@group(0) @binding(4) var<storage, read_write> PML: array<f32>;        // partial (m,l) [nHq*nsplit, 2]
+@group(0) @binding(5) var<uniform>             p  : P;
+const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const TK=${DEC_TK}u;
+var<workgroup> qd  : array<vec4<f32>, HD4>;   // the single query
+var<workgroup> sc  : array<f32, TK>;          // ONE TILE of scores/probs (not all S — no ceiling)
+var<workgroup> red : array<f32, DWG>;         // reduction scratch
+var<workgroup> part: array<vec4<f32>, DWG>;   // final PV partials
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>) {
+  let lid = lidv.x;
+  let hq = wg.x; let split = wg.y;
+  if (hq >= p.nHq) { return; }
+  let hd4 = p.hd/4u;
+  let grp = p.nHq/p.nKv; let hk = hq/grp;
+  let kv4 = (p.nKv*p.hd)/4u; let hqoff = hq*hd4; let hkoff = hk*hd4;
+  let scale = 1.0/sqrt(f32(p.hd));
+  let per = (p.S + p.nsplit - 1u) / p.nsplit;   // this split's key range [c0, c1)
+  let c0 = split * per;
+  let c1 = min(p.S, c0 + per);
+  let pidx = hq*p.nsplit + split;
+  var e = lid; loop { if (e>=hd4) {break;} qd[e] = Q[hqoff + e]; e = e + DWG; }
+  workgroupBarrier();
+  var m = -3.0e38; var l = 0.0;                 // running max / denom (identical on every thread)
+  let nd = hd4; let ng = DWG / nd;              // PV: thread = (dim d4, key-group g)
+  let d4 = lid % nd; let g = lid / nd;
+  var acc4 = vec4<f32>(0.0);                    // this thread's PV slice, in registers
+  var k0 = c0;
+  loop { if (k0 >= c1) { break; }
+    let key = k0 + lid;                         // scores: one key per thread
+    var s = -3.0e38;
+    if (key < c1) {
+      var s0=vec4<f32>(0.0); var s1=vec4<f32>(0.0); var s2=vec4<f32>(0.0); var s3=vec4<f32>(0.0);
+      let ko = key*kv4 + hkoff;
+      let hd4a = hd4 & ~3u;
+      var i4 = 0u;
+      loop { if (i4 >= hd4a) { break; }         // 4 independent accumulators (ILP)
+        s0 = s0 + qd[i4]*K[ko+i4];
+        s1 = s1 + qd[i4+1u]*K[ko+i4+1u];
+        s2 = s2 + qd[i4+2u]*K[ko+i4+2u];
+        s3 = s3 + qd[i4+3u]*K[ko+i4+3u];
+        i4 = i4 + 4u;
+      }
+      loop { if (i4 >= hd4) { break; } s0 = s0 + qd[i4]*K[ko+i4]; i4 = i4 + 1u; }
+      let sv = (s0+s1)+(s2+s3);
+      s = (sv.x+sv.y+sv.z+sv.w)*scale;
     }
+    red[lid] = s; workgroupBarrier();           // tile max
+    var st = DWG/2u; loop { if(st==0u){break;} if(lid<st){ red[lid]=max(red[lid],red[lid+st]); } workgroupBarrier(); st=st/2u; }
+    let mnew = max(m, red[0]); workgroupBarrier();
+    let corr = exp(m - mnew);                   // 0 on the first tile (m=-3e38) — acc is 0 anyway
+    let pe = select(0.0, exp(s - mnew), key < c1);
+    sc[lid] = pe;
+    red[lid] = pe; workgroupBarrier();          // tile sum
+    st = DWG/2u; loop { if(st==0u){break;} if(lid<st){ red[lid]=red[lid]+red[lid+st]; } workgroupBarrier(); st=st/2u; }
+    l = l*corr + red[0]; m = mnew;
+    var a = acc4*corr;                          // PV over this tile (sc already barrier-synced)
+    var kj = g; loop { if (kj >= TK) { break; }
+      let gk = k0 + kj;
+      if (gk < c1) { a = a + sc[kj]*V[gk*kv4 + hkoff + d4]; }
+      kj = kj + ng;
+    }
+    acc4 = a;
+    workgroupBarrier();                         // sc/red are overwritten next tile
+    k0 = k0 + TK;
+  }
+  part[lid] = acc4; workgroupBarrier();         // reduce the ng key-groups per dim
+  if (lid < nd) {
+    var sum4 = vec4<f32>(0.0);
+    for (var gg=0u; gg<ng; gg=gg+1u){ sum4 = sum4 + part[gg*nd + lid]; }
+    PO[pidx*HD4 + lid] = sum4;                  // UNNORMALIZED — combine pass divides
+  }
+  if (lid == 0u) { PML[pidx*2u] = m; PML[pidx*2u+1u] = l; }
+}`; }
+  // Combine pass: merge each head's nsplit partials into the final O. One (tiny) workgroup
+  // per head; every thread redundantly folds the (m_i, l_i) stats (nsplit ≤ 16), threads
+  // 0..hd4-1 each own one output vec4. Empty splits carry (m=-3e38, l=0) → e^(m−M) = 0.
+  const ATTN_DEC_COMBINE_WGSL = `
+struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, nsplit:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       PO : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       PML: array<f32>;
+@group(0) @binding(2) var<storage, read_write> O  : array<vec4<f32>>;
+@group(0) @binding(3) var<uniform>             p  : P;
+const HD4=${ATTN_HDMAX / 4}u;
+@compute @workgroup_size(32,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>) {
+  let hq = wg.x; if (hq >= p.nHq) { return; }
+  let hd4 = p.hd/4u; let lid = lidv.x;
+  var M = -3.0e38;
+  for (var i=0u;i<p.nsplit;i=i+1u){ M = max(M, PML[(hq*p.nsplit+i)*2u]); }
+  var L = 0.0;
+  for (var i=0u;i<p.nsplit;i=i+1u){ L = L + PML[(hq*p.nsplit+i)*2u+1u]*exp(PML[(hq*p.nsplit+i)*2u]-M); }
+  if (lid < hd4) {
+    var o = vec4<f32>(0.0);
+    for (var i=0u;i<p.nsplit;i=i+1u){ o = o + PO[(hq*p.nsplit+i)*HD4 + lid]*exp(PML[(hq*p.nsplit+i)*2u]-M); }
+    O[hq*hd4 + lid] = o / L;                    // T=1 ⇒ O row 0: O[hq*hd4 + d4]
+  }
+}`;
+  // Persistent scratch for the split partials (grown by head count, freed in unload()).
+  let _decSplit = null, _decSplitDead = [];
+  function ensureDecSplit(nHq) {
+    if (_decSplit && _decSplit.heads >= nHq) return;
+    if (_decSplit) _decSplitDead.push(_decSplit.po, _decSplit.pml);
+    const HD4 = ATTN_HDMAX / 4;
+    _decSplit = {
+      heads: nHq,
+      po: E.createBuffer(nHq * DEC_NSPLIT_MAX * HD4 * 16, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'decPO'),
+      pml: E.createBuffer(nHq * DEC_NSPLIT_MAX * 2 * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'decPML'),
+    };
+  }
+  // nsplit: ~640 keys per workgroup → nHq×nsplit workgroups (16 heads × 12 @ S=7168 = 192 WGs
+  // vs the legacy kernel's 16). Clamped to the scratch capacity. nsplitOverride is for tests.
+  function attnDecodeStream(qBuf, kBuf, vBuf, oBuf, S, nHq, nKv, hd, nsplitOverride) {
+    ensureDecSplit(nHq);
+    const nsplit = nsplitOverride || Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640)));
+    const p = uniform(new Uint32Array([1, S, nHq, nKv, hd, nsplit, 0, 0]));   // shared by both passes
+    const pipe = E.getPipeline('q3.attnDecStream', attnDecStreamWgsl());
+    E.dispatch(pipe, [qBuf, kBuf, vBuf, _decSplit.po, _decSplit.pml, p], [nHq, nsplit, 1]);
+    const cpipe = E.getPipeline('q3.attnDecCombine', ATTN_DEC_COMBINE_WGSL);
+    return E.dispatch(cpipe, [_decSplit.po, _decSplit.pml, oBuf, p], [nHq, 1, 1]);
+  }
+  function attnDecodeLegacy(qBuf, kBuf, vBuf, oBuf, S, nHq, nKv, hd) {
+    const p = uniform(new Uint32Array([1, S, nHq, nKv, hd, 0, 0, 0]));
+    const pipe = E.getPipeline('q3.attnDecode.' + _attnDecLegacyMaxS, attnDecWgsl());   // label tracks MAXS so it can't reuse a stale-size pipeline
+    const gx = Math.min(nHq, 65535), gy = Math.ceil(nHq / gx);
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
+  }
+  function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
+    if (T === 1) {   // decode: HYBRID. Measured on gen-12lp (_benchAttnDec, GPU timestamps, WARM device,
+      // min-of-8): streaming split-KV wins or ties from nsplit≥2 — S=1024: 1.18×, 2048: 1.11×,
+      // 2688: 1.07×, 4096: 1.02×, 5376: 1.07×, 7168: 1.02× — and is the ONLY kernel past the
+      // legacy shared-memory ceiling (cold/idle-clocked GPU shows larger deltas, 1.2-1.26×; trust
+      // the warm numbers). At nsplit=1 (S≤640) the extra combine pass makes it 0.84× → keep the
+      // legacy kernel for short contexts. __noStreamDecAttn forces legacy everywhere (A/B);
+      // the legacy ceiling is a hard limit, so past it streaming always runs.
+      const useStream = !globalThis.__noStreamDecAttn && (S > 640 || S > _attnDecLegacyMaxS);
+      if (useStream) return attnDecodeStream(qBuf, kBuf, vBuf, oBuf, S, nHq, nKv, hd);
+      return attnDecodeLegacy(qBuf, kBuf, vBuf, oBuf, S, nHq, nKv, hd);
+    }
+    const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
     // PREFILL (T>1): f16 flash attention (KT=8) — ~2× the f32 kernel on this iGPU.
     // Prefill attention was f32-ALU + latency + occupancy bound (NOT FMA-bound, so f16
     // alone gave only 1.09×); the win came from f16 inner products + 4-accumulator ILP
@@ -1824,6 +1984,44 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         let den=0;const a=new Float32Array(hd);for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)a[i]+=w*Vv[ko+i];}
         for(let i=0;i<hd;i++)y[qo+i]=a[i]/den;}
       check('attentionDecode', maxAbs(got,y), 2e-3);
+      [qb,kb,vb,ob].forEach(b=>b.destroy());
+    }
+    // --- decode attention: legacy vs streaming split-KV (multi-tile, uneven + empty splits) ---
+    {
+      const S=333,nHq=4,nKv=2,hd=128;   // S>TK forces multiple online-softmax tiles; 333%128≠0 exercises the partial tile
+      const Q=new Float32Array(nHq*hd),Kk=new Float32Array(S*nKv*hd),Vv=new Float32Array(S*nKv*hd);
+      for(let i=0;i<Q.length;i++)Q[i]=Math.sin(i*0.017);
+      for(let i=0;i<Kk.length;i++)Kk[i]=Math.cos(i*0.009);
+      for(let i=0;i<Vv.length;i++)Vv[i]=Math.sin(i*0.004+0.7);
+      const y=new Float32Array(nHq*hd); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
+      for(let hq=0;hq<nHq;hq++){const hk=Math.floor(hq/grp);const qo=hq*hd;
+        let m=-1e38;for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];d*=scale;if(d>m)m=d;}
+        let den=0;const a=new Float32Array(hd);for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)a[i]+=w*Vv[ko+i];}
+        for(let i=0;i<hd;i++)y[qo+i]=a[i]/den;}
+      const qb=f32buf(Q),kb=f32buf(Kk),vb=f32buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
+      await attnDecodeLegacy(qb,kb,vb,ob,S,nHq,nKv,hd);
+      check('attnDecodeLegacy', maxAbs(await E.readF32(ob,Q.length),y), 2e-3);
+      await attnDecodeStream(qb,kb,vb,ob,S,nHq,nKv,hd,5);   // 5 splits of 67 keys — uneven, all non-empty
+      check('attnDecodeStream (split=5)', maxAbs(await E.readF32(ob,Q.length),y), 2e-3);
+      await attnDecodeStream(qb,kb,vb,ob,S,nHq,nKv,hd,16);  // per=21 → splits 15.86.. : last split near-empty range handling
+      check('attnDecodeStream (split=16)', maxAbs(await E.readF32(ob,Q.length),y), 2e-3);
+      [qb,kb,vb,ob].forEach(b=>b.destroy());
+    }
+    // --- decode attention streaming: EMPTY split (nsplit > ceil(S/per) leaves trailing splits with c0>=S) ---
+    {
+      const S=100,nHq=2,nKv=1,hd=64;    // nsplit=16 → per=7 → splits 15 (c0=105) is empty; hd=64 also covers hd4=16
+      const Q=new Float32Array(nHq*hd),Kk=new Float32Array(S*nKv*hd),Vv=new Float32Array(S*nKv*hd);
+      for(let i=0;i<Q.length;i++)Q[i]=Math.cos(i*0.031);
+      for(let i=0;i<Kk.length;i++)Kk[i]=Math.sin(i*0.012);
+      for(let i=0;i<Vv.length;i++)Vv[i]=Math.cos(i*0.008+0.2);
+      const y=new Float32Array(nHq*hd); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
+      for(let hq=0;hq<nHq;hq++){const hk=Math.floor(hq/grp);const qo=hq*hd;
+        let m=-1e38;for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];d*=scale;if(d>m)m=d;}
+        let den=0;const a=new Float32Array(hd);for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)a[i]+=w*Vv[ko+i];}
+        for(let i=0;i<hd;i++)y[qo+i]=a[i]/den;}
+      const qb=f32buf(Q),kb=f32buf(Kk),vb=f32buf(Vv),ob=E.createBuffer(Q.length*4,ST(),'o');
+      await attnDecodeStream(qb,kb,vb,ob,S,nHq,nKv,hd,16);
+      check('attnDecodeStream (empty split)', maxAbs(await E.readF32(ob,Q.length),y), 2e-3);
       [qb,kb,vb,ob].forEach(b=>b.destroy());
     }
     // --- swiglu ---
@@ -2420,9 +2618,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     MODEL_ROOT = MODEL_ROOTS[variant];
     _variant = variant;
     await E.init();
-    // Decode-attention key capacity = hard context ceiling. The `sc` shared array is f32, so
-    // MAXS*4 + ~3KB (qd/red/part) must fit the device's workgroup-storage limit. Leave 4KB slack.
-    try { const lim = (E.device().limits.maxComputeWorkgroupStorageSize | 0); if (lim >= 8192) _attnMaxS = Math.max(2048, Math.min(8192, Math.floor((lim - 4096) / 4))); } catch (_) {}
+    // Legacy decode-attn key capacity: its `sc` shared array is f32, so MAXS*4 + ~3KB
+    // (qd/red/part) must fit the device's workgroup-storage limit (4KB slack). The default
+    // STREAMING kernel has no such limit — its ceiling is the KV memory budget DEC_STREAM_CTX.
+    try { const lim = (E.device().limits.maxComputeWorkgroupStorageSize | 0); if (lim >= 8192) _attnDecLegacyMaxS = Math.max(2048, Math.min(8192, Math.floor((lim - 4096) / 4))); } catch (_) {}
+    _attnMaxS = globalThis.__noStreamDecAttn ? _attnDecLegacyMaxS : DEC_STREAM_CTX;
     _ctxCap = (nCtx | 0) > 0 ? Math.max(1024, Math.min(_attnMaxS, nCtx | 0)) : _attnMaxS;
     if (MAX_SEQ > _attnMaxS) MAX_SEQ = _attnMaxS;   // never allocate beyond the decode-attn capacity
     try { await probeF16Gemm(); } catch (_) {}   // pick f16 vs f32 prefill-GEMM dot for this GPU
@@ -2505,12 +2705,16 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // ============================================================
   // Forward graph + KV cache + generate
   // ============================================================
-  // _attnMaxS = the decode-attention's per-key shared-memory capacity (the `sc` array in
-  // ATTN_DEC_WGSL) and therefore the HARD context ceiling: if the sequence S exceeds it, the
-  // decode kernel writes sc[] OUT OF BOUNDS → corruption → "!!!!" garbage (the bug that hit at
-  // S>4096). Sized at load from the device's workgroup-storage limit (32KB on gen-12lp → 7168);
-  // sc is f32 so MAXS·4 + ~3KB of other shared must fit. Context can NEVER exceed this.
-  let _attnMaxS = 4096;     // decode-attn key capacity = hard context ceiling; set in loadModel
+  // _attnMaxS = the decode-attention context ceiling. With the STREAMING split-KV kernel
+  // (the default) workgroup storage is O(1) in S, so there is no shader-imposed ceiling —
+  // the cap is DEC_STREAM_CTX (KV-memory-bound: f32 KV @16K ≈ 1.8GB on the 0.6B; int8 KV
+  // [P2] will raise it further). The LEGACY kernel (__noStreamDecAttn) materializes all S
+  // scores in a workgroup array, so ITS ceiling (_attnDecLegacyMaxS) comes from the device's
+  // workgroup-storage limit (32KB on gen-12lp → 7168): exceeding it wrote sc[] out of bounds
+  // → corruption → "!!!!" garbage (the bug that hit at S>4096).
+  const DEC_STREAM_CTX = 16384;   // streaming-kernel context cap (KV memory budget, not a shader limit)
+  let _attnDecLegacyMaxS = 4096;  // legacy kernel's shared-memory key capacity; set in loadModel
+  let _attnMaxS = 4096;     // effective decode-attn context ceiling; set in loadModel
   // MAX_SEQ = KV buffer size = the context actually ALLOCATED. Starts small and grows ON DEMAND
   // to fit each prompt (auto-grow in _streamIds) so we never pre-allocate a huge KV. _ctxCap is
   // the growth ceiling = min(provider.contextWindow, _attnMaxS), set at load.
@@ -3027,6 +3231,50 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return out;
   }
 
+  // Debug bench (no model load): DECODE attention A/B — legacy single-WG-per-head kernel vs
+  // the streaming split-KV kernel, at T=1 across context lengths. GPU-timestamped (min-of-reps,
+  // both streaming passes summed). Streaming also runs at nsplit=1 to isolate the online-softmax
+  // restructuring cost from the split-KV occupancy win. Legacy is skipped when S exceeds its
+  // shared-memory ceiling (that's the point of the new kernel).
+  async function _benchAttnDec({ S = 2688, nHq = 16, nKv = 8, hd = 128, iters = 20, reps = 6 } = {}) {
+    const Q = new Float32Array(nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.011) * 0.5;
+    const Kk = new Float32Array(S * nKv * hd); for (let i = 0; i < Kk.length; i++) Kk[i] = Math.cos(i * 0.007) * 0.5;
+    const Vv = new Float32Array(S * nKv * hd); for (let i = 0; i < Vv.length; i++) Vv[i] = Math.sin(i * 0.005 + 1) * 0.5;
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'ad'); E.device().queue.writeBuffer(b, 0, a.buffer, 0, a.byteLength); return b; };
+    const qb = mk(Q), kb = mk(Kk), vb = mk(Vv), ob = E.createBuffer(Q.byteLength, UF, 'ao');
+    // CPU reference (T=1: the query attends all S keys)
+    const y = new Float32Array(nHq * hd); const grp = nHq / nKv; const scale = 1 / Math.sqrt(hd);
+    for (let hq = 0; hq < nHq; hq++) {
+      const hk = Math.floor(hq / grp), qo = hq * hd;
+      let m = -1e38; const sc = new Float32Array(S);
+      for (let s = 0; s < S; s++) { const ko = s * (nKv * hd) + hk * hd; let d = 0; for (let i = 0; i < hd; i++) d += Q[qo + i] * Kk[ko + i]; sc[s] = d * scale; if (sc[s] > m) m = sc[s]; }
+      let den = 0; const a = new Float32Array(hd);
+      for (let s = 0; s < S; s++) { const ko = s * (nKv * hd) + hk * hd; const w = Math.exp(sc[s] - m); den += w; for (let i = 0; i < hd; i++) a[i] += w * Vv[ko + i]; }
+      for (let i = 0; i < hd; i++) y[qo + i] = a[i] / den;
+    }
+    const relErrVs = async () => { const got = await E.readF32(ob, y.length); let mx = 0, rf = 1e-9; for (let i = 0; i < y.length; i++) { mx = Math.max(mx, Math.abs(got[i] - y[i])); rf = Math.max(rf, Math.abs(y[i])); } return +(mx / rf).toExponential(2); };
+    const nsplitAuto = Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640)));
+    const legacyOk = S <= _attnDecLegacyMaxS;
+    const out = { S, nHq, nKv, hd, nsplit_auto: nsplitAuto, legacy_maxS: _attnDecLegacyMaxS };
+    // correctness
+    if (legacyOk) { uniformReset(); await attnDecodeLegacy(qb, kb, vb, ob, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone(); out.relErr_legacy = await relErrVs(); }
+    uniformReset(); await attnDecodeStream(qb, kb, vb, ob, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone(); out.relErr_stream = await relErrVs();
+    // timing (GPU timestamps; sum every pass in the profile window, min over reps)
+    const prof = async (fn) => { E.beginProfile(iters * 2 + 8); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); const p = await E.endProfile(); return p.reduce((s, r) => s + r.us, 0) / iters; };
+    let legUs = Infinity, strUs = Infinity, str1Us = Infinity;
+    for (let r = 0; r < reps; r++) {
+      if (legacyOk) legUs = Math.min(legUs, await prof(() => attnDecodeLegacy(qb, kb, vb, ob, S, nHq, nKv, hd)));
+      strUs = Math.min(strUs, await prof(() => attnDecodeStream(qb, kb, vb, ob, S, nHq, nKv, hd)));
+      str1Us = Math.min(str1Us, await prof(() => attnDecodeStream(qb, kb, vb, ob, S, nHq, nKv, hd, 1)));
+    }
+    [qb, kb, vb, ob].forEach(b => b.destroy());
+    if (legacyOk) out.legacy_us = +legUs.toFixed(1);
+    out.stream_us = +strUs.toFixed(1); out.stream_nsplit1_us = +str1Us.toFixed(1);
+    if (legacyOk) { out.speedup = +(legUs / strUs).toFixed(2); out.speedup_nsplit1 = +(legUs / str1Us).toFixed(2); }
+    return out;
+  }
+
   // Debug bench (no model load): time the tiled attention at a realistic prefill shape.
   async function _benchAttn({ T = 128, S = 2790, nHq = 16, nKv = 8, hd = 128, iters = 3 } = {}) {
     const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.01);
@@ -3134,6 +3382,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     try { for (const b of _dp4dead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
     try { for (const b of _dp4gDead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_dp4g) { _dp4g.xq.destroy(); _dp4g.xs.destroy(); } } catch (_) {}
     _dp4 = null; _dp4dead = []; _dp4g = null; _dp4gDead = [];
+    try { for (const b of _decSplitDead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_decSplit) { _decSplit.po.destroy(); _decSplit.pml.destroy(); } } catch (_) {}
+    _decSplit = null; _decSplitDead = [];
     _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null; _sysAnchor = null; MAX_SEQ = 4096;
     if (deep) {
       _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
@@ -3457,7 +3707,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
