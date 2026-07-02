@@ -270,6 +270,26 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       [nb, bb, rl, ri, rw, g_, u_, sw, eo, xo].forEach(b => b.destroy());
       [gate, ...experts.flatMap(e => [e.w1, e.w3, e.w2])].forEach(o => { o.rec.pack.destroy(); o.rec.scales.destroy(); });
     }
+    // --- gemvDP4 (int8 activation × int4 weight) vs gemvQ8 (f32 activation) ---
+    {
+      const N = 512, K = 1024;
+      const rnd = (n, s) => { const a = new Float32Array(n); let x = s; for (let i = 0; i < n; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; a[i] = (x / 0x3fffffff - 1) * 0.5; } return a; };
+      const xf = rnd(K, 3);
+      const u16 = new Uint16Array(N * K), t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      const wf = rnd(N * K, 9); for (let i = 0; i < N * K; i++) { t[0] = wf[i]; u16[i] = ti[0] >>> 16; }
+      const { pack, scales } = _quantInt4(u16, N, K);
+      const pb = E.createBuffer(pack.byteLength, ST(), 'p'), sb = E.createBuffer(scales.byteLength, ST(), 's');
+      E.device().queue.writeBuffer(pb, 0, pack); E.device().queue.writeBuffer(sb, 0, scales);
+      const rec = { pack: pb, scales: sb };
+      const xb = f32buf(xf), y1 = E.createBuffer(N * 4, ST(), 'y1'), y2 = E.createBuffer(N * 4, ST(), 'y2');
+      await gemvQ8(xb, rec, y1, N, K, false);
+      quantAct(xb, K); await gemvDP4(rec, y2, N, K, false);
+      await E.device().queue.onSubmittedWorkDone();
+      const a = await E.readF32(y1, N), b = await E.readF32(y2, N);
+      let mx = 0, rf = 1e-9; for (let i = 0; i < N; i++) { mx = Math.max(mx, Math.abs(a[i] - b[i])); rf = Math.max(rf, Math.abs(a[i])); }
+      check('lfm25 gemvDP4 vs gemvQ8 (int8 act)', mx / rf, 3e-2);
+      [pb, sb, xb, y1, y2].forEach(x => x.destroy());
+    }
     // --- GPU-resident indexed MoE dispatch (packed experts, no readback) vs CPU ref ---
     {
       const H = 64, nE = 8, K = 2, eI = 32, wpr = (Kd) => Kd / 8, gpr = (Kd) => Kd / QGROUP;
@@ -753,10 +773,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Efficient T=1 int4 GEMV: GEMVQ_NR output rows per workgroup (input reused across the
   // block in registers), subgroupAdd reduction — the design idxGemv/qwen use. Measured ~3×
   // the old 1-row matvecQ. acc=1 → y += result (fused residual). y=[N].
-  const GEMV_WG = 64;
-  let _gemvNR = 4;   // rows/workgroup for gemvQ8 + idxGemv (8B sweep: NR4 54.1 < NR8 55.3 < NR16 57.1ms); globalThis.__gemvNR overrides
+  let _gemvNR = 4;    // rows/workgroup for gemvQ8 + idxGemv (8B sweep: NR4 54.1 < NR8 55.3 < NR16 57.1ms)
+  let _gemvWG = 32;   // threads/workgroup = 1 Intel subgroup (8B sweep: WG32 58.3 < WG64 67.9 < WG128 82.5ms — single-subgroup reduce + 2× occupancy)
   const _NR = () => Math.max(1, (globalThis.__gemvNR | 0) || _gemvNR);
-  function gemvQ8Wgsl(NR) { return `
+  const _WG = () => Math.max(32, (globalThis.__gemvWG | 0) || _gemvWG);
+  function gemvQ8Wgsl(NR, GEMV_WG) { return `
 enable f16;
 enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _p:u32 };
@@ -805,14 +826,116 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
 }`; }
   function gemvQ8(xBuf, rec, yBuf, N, K, acc) {
-    const NR = _NR();
+    const NR = _NR(), WG = _WG();
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
-    const pipe = E.getPipeline('lfm25.gemvQ8.' + NR, gemvQ8Wgsl(NR));
+    const pipe = E.getPipeline('lfm25.gemvQ8.' + NR + '.' + WG, gemvQ8Wgsl(NR, WG));
     const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, yBuf, d], [gx, gy, 1]);
   }
-  // route T=1 to the fast 8-row GEMV; batched (prefill) T>1 stays on matvecQ
-  function mv(xBuf, rec, yBuf, T, N, K, acc) { return T === 1 ? gemvQ8(xBuf, rec, yBuf, N, K, acc) : matvecQ(xBuf, rec, yBuf, T, N, K, acc); }
+  // ---- DP4A path: int8 activation × int4 weight via dot4I8Packed ---------------------
+  // The int4 GEMVs run ~15-18 GB/s (ALU/dequant-bound, not memory). dot4I8Packed does 4 int8
+  // MACs in one instr → far less ALU. Activation is quantized per-32-group to int8 once per
+  // distinct input; weight scale × activation scale applied per group.
+  // Activation quantize: x[K] f32 → _dp4.xq[K/4] packed int8 + _dp4.xs[K/32] f32 scales.
+  const QUANTQ8_WGSL = `
+struct Q { K:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<f32>;
+@group(0) @binding(1) var<storage, read_write> xq : array<u32>;
+@group(0) @binding(2) var<storage, read_write> xs : array<f32>;
+@group(0) @binding(3) var<uniform>             q  : Q;
+var<workgroup> msh : array<f32, ${QGROUP}>;
+var<workgroup> qsh : array<i32, ${QGROUP}>;
+@compute @workgroup_size(${QGROUP},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let g = wg.x; let i = g*${QGROUP}u + lid.x;
+  let v = select(0.0, x[i], i < q.K);
+  msh[lid.x] = abs(v); workgroupBarrier();
+  var s = ${QGROUP}u/2u;
+  loop { if (s==0u){break;} if (lid.x<s){ msh[lid.x]=max(msh[lid.x],msh[lid.x+s]); } workgroupBarrier(); s=s/2u; }
+  let mx = msh[0];
+  let scale = select(mx/127.0, 1e-8, mx < 1e-12);
+  if (lid.x == 0u) { xs[g] = scale; }
+  var qv = i32(round(v/scale)); qv = clamp(qv, -127, 127);
+  qsh[lid.x] = qv; workgroupBarrier();
+  if (lid.x < ${QGROUP}u/4u) {
+    let b = lid.x*4u;
+    let packed = (u32(qsh[b]) & 0xFFu) | ((u32(qsh[b+1u]) & 0xFFu)<<8u) | ((u32(qsh[b+2u]) & 0xFFu)<<16u) | ((u32(qsh[b+3u]) & 0xFFu)<<24u);
+    xq[g*(${QGROUP}u/4u) + lid.x] = packed;
+  }
+}`;
+  let _dp4 = null;
+  function ensureDp4(K) { if (_dp4 && _dp4.cap >= K) return; if (_dp4) { try { _dp4.xq.destroy(); _dp4.xs.destroy(); } catch (_) {} } _dp4 = { cap: K, xq: E.createBuffer((K / 4) * 4, ST(), 'xq'), xs: E.createBuffer((K / QGROUP) * 4, ST(), 'xs') }; }
+  function quantAct(xBuf, K) {
+    ensureDp4(K);
+    const q = uniform(new Uint32Array([K, 0, 0, 0]));
+    const groups = K / QGROUP, gx = Math.min(groups, 65535), gy = Math.ceil(groups / gx);
+    return E.dispatch(E.getPipeline('lfm25.quantq8', QUANTQ8_WGSL), [xBuf, _dp4.xq, _dp4.xs, q], [gx, gy, 1]);
+  }
+  function gemvDP4Wgsl(NR, GEMV_WG) { return `
+enable f16;
+enable subgroups;
+struct D { N:u32, K:u32, acc:u32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       xq : array<u32>;
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;
+@group(0) @binding(3) var<storage, read>       xs : array<f32>;
+@group(0) @binding(4) var<storage, read_write> y  : array<f32>;
+@group(0) @binding(5) var<uniform>             d  : D;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let nBase = (wg.x + wg.y*nwg.x) * ${NR}u;
+  let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = xq[2u*w]; let xb = xq[2u*w + 1u];
+    let grp = (w*8u)/${QGROUP}u; let xsc = xs[grp];
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
+      let n = nBase + r; if (n >= d.N) { continue; }
+      let p = W[n*words + w];
+      let lo = vec4<i32>(unpack4xU8(p & 0x0F0F0F0Fu)); let hi = vec4<i32>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu));
+      let wa = pack4xI8(vec4<i32>(lo.x,hi.x,lo.y,hi.y) - vec4<i32>(8));
+      let wb = pack4xI8(vec4<i32>(lo.z,hi.z,lo.w,hi.w) - vec4<i32>(8));
+      acc[r] = acc[r] + (f32(sc[n*gpr + grp])*xsc) * f32(dot4I8Packed(wa, xa) + dot4I8Packed(wb, xb));
+    }
+    w = w + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
+    let ss = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${NR}u) {
+    let n = nBase + lid.x;
+    if (n < d.N) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
+      y[n] = select(0.0, y[n], d.acc != 0u) + t;
+    }
+  }
+}`; }
+  function gemvDP4(rec, yBuf, N, K, acc) {   // caller ran quantAct(input, K) → _dp4
+    const NR = _NR(), WG = _WG();
+    const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
+    const pipe = E.getPipeline('lfm25.gemvDP4.' + NR + '.' + WG, gemvDP4Wgsl(NR, WG));
+    const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [_dp4.xq, rec.pack, rec.scales, _dp4.xs, yBuf, d], [gx, gy, 1]);
+  }
+
+  // route T=1 to the f32-dequant 8-row GEMV (MEASURED faster than DP4A on gen-12lp: 61.5 vs
+  // 68.9ms — the int4→int8 repack offsets dot4I8Packed here; DP4A kept opt-in via __useDp4 for
+  // devices where it wins). prefill T>1 → batched matvecQ.
+  function mv(xBuf, rec, yBuf, T, N, K, acc) {
+    if (T !== 1) return matvecQ(xBuf, rec, yBuf, T, N, K, acc);
+    if (globalThis.__useDp4) { quantAct(xBuf, K); return gemvDP4(rec, yBuf, N, K, acc); }
+    return gemvQ8(xBuf, rec, yBuf, N, K, acc);
+  }
 
   const RMSNORM_WGSL = `
 enable f16;
@@ -1036,7 +1159,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
   // GPU → runs expert e=idx[k]'s block (rows e*N..), input at k*inStride (0 for w1/w3 which
   // share `normed`; eI for w2 whose input is per-expert act[k]), output at k*N. No readback:
   // the whole MoE block stays batched. GEMVQ_NR rows/workgroup, subgroupAdd reduction.
-  function idxGemvWgsl(NR) { return `
+  function idxGemvWgsl(NR, GEMV_WG) { return `
 enable f16;
 enable subgroups;
 struct D { N:u32, Kc:u32, inStride:u32, _p:u32 };
@@ -1089,9 +1212,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
 }`; }
   function idxGemv(xBuf, rec, idxBuf, yBuf, topK, N, Kc, inStride) {
-    const NR = _NR();
+    const NR = _NR(), WG = _WG();
     const d = uniform(new Uint32Array([N, Kc, inStride, 0]));
-    const pipe = E.getPipeline('lfm25.idxGemv.' + NR, idxGemvWgsl(NR));
+    const pipe = E.getPipeline('lfm25.idxGemv.' + NR + '.' + WG, idxGemvWgsl(NR, WG));
     return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, idxBuf, yBuf, d], [Math.ceil(N / NR), topK, 1]);
   }
   // combine: x[h] += Σ_k wt[k] * o[k*H + h]   (weighted expert sum into the residual)
@@ -1196,7 +1319,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (_scr) kill(_scr); if (_kv) kill(_kv); if (_conv) kill(_conv);
     if (_idsBuf) try { _idsBuf.destroy(); } catch (_) {}
     try { if (_amaxV) _amaxV.destroy(); if (_amaxI) _amaxI.destroy(); } catch (_) {}
-    _scr = null; _kv = null; _conv = null; _idsBuf = null; _amaxV = null; _amaxI = null;
+    try { if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
+    _scr = null; _kv = null; _conv = null; _idsBuf = null; _amaxV = null; _amaxI = null; _dp4 = null;
   }
 
   // One forward over T tokens at absolute positions [posBase, posBase+T).
