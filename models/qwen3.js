@@ -3655,11 +3655,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // Grow + CHUNK the prefill exactly like _streamIds. generate() is the harness path, but a
     // long test prompt must not overflow the allocated KV (silent OOB writes → garbage output)
     // nor go out in one multi-second submit (TDR). Same PREFILL_CHUNK=256 blocks.
-    if (L + 64 > MAX_SEQ) {
-      const want = Math.max(1024, Math.min(_ctxCap, L + 1024));
-      if (L + 64 > want) throw new Error('prompt too long: ' + L + ' tokens — exceeds the context limit (' + _ctxCap + '). Raise "Context size" or shorten the prompt.');
-      _growCtx(want);
-    }
+    if (L + 64 > _ctxCap) throw new Error('prompt too long: ' + L + ' tokens — exceeds the context limit (' + _ctxCap + '). Raise "Context size" or shorten the prompt.');
+    const _need = L + 64 + Math.max(64, Math.min((maxTokens | 0) || 64, _ctxCap));
+    if (_need > MAX_SEQ) _growCtx(Math.max(1024, Math.min(_ctxCap, Math.ceil(_need / 1024) * 1024)));
     let tok0;
     const temp = temperature > 0 ? +temperature : 0;
     for (let off = 0; off < L; off += 256) {     // prefill → _tokHist[L]=token0
@@ -4274,15 +4272,15 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     const temp = temperature > 0 ? +temperature : 0;
     await loadModel({ variant: _variant });
     const L = ids.length;
-    // Grow the allocated context JUST ENOUGH to fit this prompt + decode headroom (never the full
-    // configured ceiling), capped at _ctxCap. This keeps the KV cache as small as possible — a
-    // 4200-tok prompt allocates ~5200 (~1.2GB), not 8192 (~1.9GB, which OOMs the iGPU → garbage).
-    // Only errors if the prompt won't fit even at the ceiling.
-    if (L + 64 > MAX_SEQ) {
-      const want = Math.max(1024, Math.min(_ctxCap, L + 1024));
-      if (L + 64 > want) throw new Error('prompt too long: ' + L + ' tokens — exceeds the context limit (' + _ctxCap + '). Raise "Context size" or shorten the prompt.');
-      _growCtx(want);
-    }
+    // Grow the allocated context to fit this prompt PLUS the decode budget, capped at _ctxCap.
+    // Growing only on prompt overflow (the old rule) left MAX_SEQ at its 4096 default whenever
+    // the prompt still fit, so with "Context size" raised to e.g. 8192 the decode loop
+    // (MAX_SEQ-1-pos) still hit a wall at ~4096 and the model died mid-<think> well below the
+    // configured ceiling. Round up to 1K steps so L creeping up each turn doesn't force a KV
+    // realloc (= prefix-cache drop + full re-prefill) every turn.
+    if (L + 64 > _ctxCap) throw new Error('prompt too long: ' + L + ' tokens — exceeds the context limit (' + _ctxCap + '). Raise "Context size" or shorten the prompt.');
+    const _need = L + 64 + Math.max(64, Math.min((maxTokens | 0) || _ctxCap, _ctxCap));
+    if (_need > MAX_SEQ) _growCtx(Math.max(1024, Math.min(_ctxCap, Math.ceil(_need / 1024) * 1024)));
     // One-time device fingerprint — compare against the harness to spot a different
     // adapter / power state / memory limits between the two pages (same backend).
     try {
@@ -4466,9 +4464,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // Generation budget per round. NO artificial thinking cap by default — a reasoning <think>
     // block can be long, and a fixed cap (512, then 2048) truncated it mid-thought. EOS (im_end)
     // stops finished turns; the only hard bound is the context window (the decode loop caps at
-    // MAX_SEQ-1-pos). Default = MAX_SEQ so context is the sole limit. Override via
-    // provider.maxTokens ("Max output tokens") if you want a tighter cap.
-    const maxTokens = (provider && (provider.maxTokens | 0)) || MAX_SEQ;
+    // MAX_SEQ-1-pos). Default = the context ceiling so context is the sole limit. Override via
+    // provider.maxTokens ("Max output tokens") if you want a tighter cap. Resolved AFTER
+    // loadModel below, so _ctxCap already reflects provider.contextWindow.
+    let maxTokens = (provider && (provider.maxTokens | 0)) || 0;
     // conversations.js stores the dropdown's modelId in provider.endpoint (the
     // model picker sets spEndpoint = modelId). Accept either field.
     const _wantV = (provider && (provider.endpoint || provider.modelId)) || '';
@@ -4487,6 +4486,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       if (e && e.name === 'AbortError') throw e;
       emit({ type: 'error', message: 'Qwen3 dense: ' + ((e && e.message) || e) }); emit({ type: 'agent_done' }); return;
     }
+    if (!maxTokens) maxTokens = _ctxCap;   // now valid: loadModel applied provider.contextWindow
     let sys = (systemPrompt && typeof systemPrompt === 'object') ? (systemPrompt.content || '') : (systemPrompt || '');
     const toolList = (Array.isArray(tools) ? tools : []).filter(t => t && t.type === 'function');
     const pre = toolPreamble(toolList);
