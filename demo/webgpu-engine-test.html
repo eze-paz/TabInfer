@@ -69,6 +69,7 @@
 <script src="../modules/webgpu-engine.js?v=46"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
 <script src="../modules/webgpu-qwen3.js?v=124"></script>
+<script src="../modules/webgpu-lfm25.js?v=1"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -134,6 +135,7 @@
     set('status', 'running Qwen3 kernel tests…', 'hi');
     try {
       const rows = await window.SandpieQwen3.selfTestKernels();
+      if (window.SandpieLfm25) rows.push(...await window.SandpieLfm25.selfTestKernels());   // LFM2.5 port (Phase A) kernels
       const allOk = rows.every(r => r.ok);
       $('kernels').innerHTML = rows.map(r =>
         `<span class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'PASS' : 'FAIL'}</span>  ${r.name}  <span style="color:#6e7681">err=${r.err.toExponential(2)}</span>`
