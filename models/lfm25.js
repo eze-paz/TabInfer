@@ -370,27 +370,31 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const _isInt4 = (name) => /(_proj|\.w[123])\.weight$/.test(name) || /experts\.(gate_up_proj|down_proj)$/.test(name);
   const _isF32 = (name) => /expert_bias/.test(name);
 
-  function _uploadTensor(name, info, raw) {
+  async function _uploadTensor(name, info, raw, sink) {
     const numel = info.shape.reduce((a, b) => a * b, 1);
     const u16 = new Uint16Array(raw.buffer, raw.byteOffset, numel);
+    const put = (buf, arr) => E.device().queue.writeBuffer(buf, 0, arr.buffer === undefined ? arr : new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength));
     if (_isInt4(name) && info.shape.length >= 2 && (info.shape[info.shape.length - 1] % QGROUP) === 0) {
       const K = info.shape[info.shape.length - 1], rows = numel / K;
       const { pack, scales } = _quantInt4(u16, rows, K);
       const packBuf = E.createBuffer(pack.byteLength, ST(), name + '.pack');
       const scBuf = E.createBuffer(scales.byteLength, ST(), name + '.sc');
-      E.device().queue.writeBuffer(packBuf, 0, pack); E.device().queue.writeBuffer(scBuf, 0, scales);
+      put(packBuf, pack); put(scBuf, scales);
       _weights[name] = { pack: packBuf, scales: scBuf, N: rows, K, int4: true, shape: info.shape };
+      if (sink) { await sink.add(name, 'pack', pack, { kind: 'int4', shape: info.shape, N: rows, K }); await sink.add(name, 'scales', scales, { kind: 'int4', shape: info.shape, N: rows, K }); }
     } else if (_isF32(name)) {
       const f32 = new Float32Array(numel); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
       for (let i = 0; i < numel; i++) { ti[0] = u16[i] << 16; f32[i] = t[0]; }
       const buf = E.createBuffer(f32.byteLength, ST(), name);
-      E.device().queue.writeBuffer(buf, 0, f32);
+      put(buf, f32);
       _weights[name] = { buf, f32: true, shape: info.shape };
+      if (sink) await sink.add(name, 'buf', f32, { kind: 'f32', shape: info.shape });
     } else {
       const bits = info.dtype === 'BF16' ? _bf16ToF16bits(u16) : u16;
       const buf = E.createBuffer(numel * 2, ST(), name);
-      E.device().queue.writeBuffer(buf, 0, bits);
+      put(buf, bits);
       _weights[name] = { buf, shape: info.shape };
+      if (sink) await sink.add(name, 'buf', bits, { kind: 'f16', shape: info.shape });
     }
     // TIED lm_head: the embedding also serves the vocab GEMV — make its int4 twin now,
     // while the raw bf16 is still in hand (it is never resident again after this call).
@@ -399,12 +403,93 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       const { pack, scales } = _quantInt4(u16, rows, K);
       const packBuf = E.createBuffer(pack.byteLength, ST(), 'lm_head.pack');
       const scBuf = E.createBuffer(scales.byteLength, ST(), 'lm_head.sc');
-      E.device().queue.writeBuffer(packBuf, 0, pack); E.device().queue.writeBuffer(scBuf, 0, scales);
+      put(packBuf, pack); put(scBuf, scales);
       _weights['lm_head.weight'] = { pack: packBuf, scales: scBuf, N: rows, K, int4: true, shape: info.shape };
+      if (sink) { await sink.add('lm_head.weight', 'pack', pack, { kind: 'int4', shape: info.shape, N: rows, K }); await sink.add('lm_head.weight', 'scales', scales, { kind: 'int4', shape: info.shape, N: rows, K }); }
     }
   }
 
-  async function _streamWeights(url, onProgress) {
+  // ---- persistent quantized-weights cache -------------------------------------------
+  // Same design as the qwen3 engine's (the pattern the user was right to insist on):
+  // GPU-READY bytes stream into fixed 64MiB Cache Storage chunks; a manifest of 4-byte-
+  // aligned segments is written LAST as the commit point (a torn write = cache miss, never
+  // corruption). Reload: allocate buffers from the manifest and writeBuffer chunk slices
+  // straight into them — no download, no re-quantize, peak host RAM = one chunk.
+  // Namespaced under /lfm25/ so it coexists with the qwen3 cache in the same Cache bucket.
+  const QC_NAME = 'sandpie-webgpu-quant';
+  const QC_VER = 1;
+  const QC_CHUNK = 64 * 1024 * 1024;
+  const _qcUrl = (variant, part) => 'https://sandpie.quant/lfm25/v' + QC_VER + '/' + variant + '/' + part;
+  function _makeSink(variant) {
+    let cache = null, buf = new Uint8Array(QC_CHUNK), used = 0, chunkIdx = 0, globalOff = 0, dead = false;
+    const segs = [];
+    const flush = async () => {
+      if (!used) return;
+      await cache.put(_qcUrl(variant, 'c' + chunkIdx), new Response(buf.subarray(0, used)));
+      chunkIdx++; buf = new Uint8Array(QC_CHUNK); used = 0;
+    };
+    return {
+      async open() {
+        try { cache = await caches.open(QC_NAME); await cache.delete(_qcUrl(variant, 'manifest')); return true; } catch (_) { dead = true; return false; }
+      },
+      async add(name, part, arr, meta) {
+        if (dead) return;
+        try {
+          const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+          const pad = (4 - (globalOff % 4)) % 4;                       // 4-align every segment start
+          for (let p = 0; p < pad; p++) { if (used === QC_CHUNK) await flush(); buf[used++] = 0; globalOff++; }
+          const lenPad = (4 - (bytes.byteLength % 4)) % 4;             // …and its length (writeBuffer size must be %4)
+          segs.push({ name, part, off: globalOff, len: bytes.byteLength + lenPad, ...meta });
+          let src = 0;
+          while (src < bytes.byteLength) {
+            if (used === QC_CHUNK) await flush();
+            const n = Math.min(QC_CHUNK - used, bytes.byteLength - src);
+            buf.set(bytes.subarray(src, src + n), used); used += n; src += n; globalOff += n;
+          }
+          for (let p = 0; p < lenPad; p++) { if (used === QC_CHUNK) await flush(); buf[used++] = 0; globalOff++; }
+        } catch (e) { dead = true; try { console.warn('[lfm25] quant-cache write failed (quota?) — continuing uncached', e); } catch (_) {} }
+      },
+      async finish() {
+        if (dead) return false;
+        try {
+          await flush();
+          const manifest = { ver: QC_VER, qgroup: QGROUP, chunkSize: QC_CHUNK, nChunks: chunkIdx, totalBytes: globalOff, segs };
+          await cache.put(_qcUrl(variant, 'manifest'), new Response(JSON.stringify(manifest), { headers: { 'content-type': 'application/json' } }));
+          return true;
+        } catch (_) { return false; }
+      },
+    };
+  }
+  async function _readQuantCache(variant, onProgress) {
+    let cache; try { cache = await caches.open(QC_NAME); } catch (_) { return false; }
+    const mResp = await cache.match(_qcUrl(variant, 'manifest'));
+    if (!mResp) return false;
+    let m; try { m = await mResp.json(); } catch (_) { return false; }
+    if (!m || m.ver !== QC_VER || m.qgroup !== QGROUP || m.chunkSize !== QC_CHUNK) return false;
+    // allocate every GPU buffer up front from the manifest
+    const bySeg = [];
+    for (const s of m.segs) {
+      const rec = _weights[s.name] || (_weights[s.name] = s.kind === 'int4' ? { N: s.N, K: s.K, int4: true, shape: s.shape } : { shape: s.shape, ...(s.kind === 'f32' ? { f32: true } : {}) });
+      const buf = E.createBuffer(s.len, ST(), s.name + '.' + s.part);
+      if (s.part === 'pack') rec.pack = buf; else if (s.part === 'scales') rec.scales = buf; else rec.buf = buf;
+      bySeg.push({ ...s, buf });
+    }
+    for (let ci = 0; ci < m.nChunks; ci++) {   // stream chunks → writeBuffer slices
+      const resp = await cache.match(_qcUrl(variant, 'c' + ci));
+      if (!resp) return false;                  // evicted mid-set → treat as full miss
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      const cStart = ci * QC_CHUNK, cEnd = cStart + bytes.byteLength;
+      for (const s of bySeg) {
+        if (s.off + s.len <= cStart || s.off >= cEnd) continue;
+        const b = Math.max(s.off, cStart), e = Math.min(s.off + s.len, cEnd);
+        E.device().queue.writeBuffer(s.buf, b - s.off, bytes.buffer, b - cStart, e - b);
+      }
+      onProgress && onProgress({ phase: 'cache', pct: Math.round((ci + 1) / m.nChunks * 100) });
+    }
+    return true;
+  }
+
+  async function _streamWeights(url, onProgress, sink) {
     // header: first 8 bytes = u64 header length, then the JSON header (Range requests)
     const h8 = await (await fetch(url, { headers: { Range: 'bytes=0-7' } })).arrayBuffer();
     const headerLen = Number(new DataView(h8).getBigUint64(0, true));
@@ -443,7 +528,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         } else { chunks.push(value); recv += value.length; }
         while (ti < tensors.length && tensors[ti].end <= recv) {
           const t = tensors[ti];
-          _uploadTensor(t.name, t.info, takeRange(t.begin, t.end));
+          await _uploadTensor(t.name, t.info, takeRange(t.begin, t.end), sink);
           ti++; dropTo(ti < tensors.length ? tensors[ti].begin : recv);
           onProgress && onProgress({ phase: 'parse', pct: Math.round(ti / tensors.length * 100) });
         }
@@ -461,7 +546,16 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     await E.init();
     await TOK.load(m.root);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
-    await _streamWeights(m.root + 'model.safetensors', onProgress);
+    // FAST PATH: quantized-weights cache (skips download AND re-quantize)
+    let hit = false;
+    try { hit = await _readQuantCache(variant, onProgress); } catch (e) { try { console.warn('[lfm25] cache read failed — falling back to download', e); } catch (_) {} _weights = {}; hit = false; }
+    if (!hit) {
+      _weights = {};
+      const sink = _makeSink(variant);
+      const sinkOk = await sink.open();
+      await _streamWeights(m.root + 'model.safetensors', onProgress, sinkOk ? sink : null);
+      if (sinkOk) { const committed = await sink.finish(); try { console.log('[lfm25] quant cache ' + (committed ? 'written' : 'NOT written (quota?)')); } catch (_) {} }
+    }
     _loaded = true;
   }
   function unload() {
