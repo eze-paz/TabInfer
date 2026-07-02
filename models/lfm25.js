@@ -753,8 +753,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Efficient T=1 int4 GEMV: GEMVQ_NR output rows per workgroup (input reused across the
   // block in registers), subgroupAdd reduction — the design idxGemv/qwen use. Measured ~3×
   // the old 1-row matvecQ. acc=1 → y += result (fused residual). y=[N].
-  const GEMV_WG = 64, GEMVQ_NR = 8;   // shared by gemvQ8 + idxGemv
-  const GEMVQ8_WGSL = `
+  const GEMV_WG = 64;
+  let _gemvNR = 4;   // rows/workgroup for gemvQ8 + idxGemv (8B sweep: NR4 54.1 < NR8 55.3 < NR16 57.1ms); globalThis.__gemvNR overrides
+  const _NR = () => Math.max(1, (globalThis.__gemvNR | 0) || _gemvNR);
+  function gemvQ8Wgsl(NR) { return `
 enable f16;
 enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _p:u32 };
@@ -763,21 +765,21 @@ struct D { N:u32, K:u32, acc:u32, _p:u32 };
 @group(0) @binding(2) var<storage, read>       sc : array<f16>;
 @group(0) @binding(3) var<storage, read_write> y  : array<f32>;
 @group(0) @binding(4) var<uniform>             d  : D;
-var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(num_workgroups) nwg:vec3<u32>,
         @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
-  let nBase = (wg.x + wg.y*nwg.x) * ${GEMVQ_NR}u;
+  let nBase = (wg.x + wg.y*nwg.x) * ${NR}u;
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
-  var acc : array<f32, ${GEMVQ_NR}>;
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { acc[r] = 0.0; }
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
   var w = lid.x;
   loop {
     if (w >= words) { break; }
     let xa = x[2u*w]; let xc = x[2u*w + 1u];
     let grp = (w*8u)/${QGROUP}u;
-    for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
       let n = nBase + r; if (n >= d.N) { continue; }
       let p = W[n*words + w];
       let s = f32(sc[n*gpr + grp]);
@@ -788,12 +790,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     w = w + ${GEMV_WG}u;
   }
   let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
     let ss = subgroupAdd(acc[r]);
     if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
   }
   workgroupBarrier();
-  if (lid.x < ${GEMVQ_NR}u) {
+  if (lid.x < ${NR}u) {
     let n = nBase + lid.x;
     if (n < d.N) {
       let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
@@ -801,11 +803,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       y[n] = select(0.0, y[n], d.acc != 0u) + t;
     }
   }
-}`;
+}`; }
   function gemvQ8(xBuf, rec, yBuf, N, K, acc) {
+    const NR = _NR();
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
-    const pipe = E.getPipeline('lfm25.gemvQ8', GEMVQ8_WGSL);
-    const nWG = Math.ceil(N / GEMVQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    const pipe = E.getPipeline('lfm25.gemvQ8.' + NR, gemvQ8Wgsl(NR));
+    const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, yBuf, d], [gx, gy, 1]);
   }
   // route T=1 to the fast 8-row GEMV; batched (prefill) T>1 stays on matvecQ
@@ -1033,7 +1036,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
   // GPU → runs expert e=idx[k]'s block (rows e*N..), input at k*inStride (0 for w1/w3 which
   // share `normed`; eI for w2 whose input is per-expert act[k]), output at k*N. No readback:
   // the whole MoE block stays batched. GEMVQ_NR rows/workgroup, subgroupAdd reduction.
-  const IDXGEMV_WGSL = `
+  function idxGemvWgsl(NR) { return `
 enable f16;
 enable subgroups;
 struct D { N:u32, Kc:u32, inStride:u32, _p:u32 };
@@ -1043,23 +1046,23 @@ struct D { N:u32, Kc:u32, inStride:u32, _p:u32 };
 @group(0) @binding(3) var<storage, read>       idx : array<u32>;
 @group(0) @binding(4) var<storage, read_write> y   : array<f32>;
 @group(0) @binding(5) var<uniform>             d   : D;
-var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
   let k = wg.y;                              // selected-expert slot
   let e = idx[k];
-  let nBase = wg.x * ${GEMVQ_NR}u;           // first output row (within the expert's N rows)
+  let nBase = wg.x * ${NR}u;                 // first output row (within the expert's N rows)
   let words = d.Kc / 8u; let gpr = d.Kc / ${QGROUP}u;
   let xb = (k * d.inStride) / 4u;            // per-k input base (vec4 units)
-  var acc : array<f32, ${GEMVQ_NR}>;
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { acc[r] = 0.0; }
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
   var w = lid.x;
   loop {
     if (w >= words) { break; }
     let xa = x[xb + 2u*w]; let xc = x[xb + 2u*w + 1u];
     let grp = (w*8u)/${QGROUP}u;
-    for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
       let n = nBase + r; if (n >= d.N) { continue; }
       let row = e*d.N + n;                    // expert e's row block in the packed tensor
       let p = W[row*words + w];
@@ -1071,12 +1074,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     w = w + ${GEMV_WG}u;
   }
   let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
     let ss = subgroupAdd(acc[r]);
     if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
   }
   workgroupBarrier();
-  if (lid.x < ${GEMVQ_NR}u) {
+  if (lid.x < ${NR}u) {
     let n = nBase + lid.x;
     if (n < d.N) {
       let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
@@ -1084,11 +1087,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       y[k*d.N + n] = t;
     }
   }
-}`;
+}`; }
   function idxGemv(xBuf, rec, idxBuf, yBuf, topK, N, Kc, inStride) {
+    const NR = _NR();
     const d = uniform(new Uint32Array([N, Kc, inStride, 0]));
-    const pipe = E.getPipeline('lfm25.idxGemv', IDXGEMV_WGSL);
-    return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, idxBuf, yBuf, d], [Math.ceil(N / GEMVQ_NR), topK, 1]);
+    const pipe = E.getPipeline('lfm25.idxGemv.' + NR, idxGemvWgsl(NR));
+    return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, idxBuf, yBuf, d], [Math.ceil(N / NR), topK, 1]);
   }
   // combine: x[h] += Σ_k wt[k] * o[k*H + h]   (weighted expert sum into the residual)
   const MOECOMBINE_WGSL = `
