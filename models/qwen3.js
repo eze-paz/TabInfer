@@ -2184,6 +2184,27 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return E.dispatch(E.getPipeline('q3.argmaxP2', ARGMAX_P2_WGSL), [_amaxPart.v, _amaxPart.i, outBuf, p], [1, 1, 1]);
   }
 
+  // ---- logit mask (grammar-constrained decoding, P4) --------------------------------
+  // Sets logits of every token NOT in the bitmask to -inf, right before argmax — the GPU
+  // half of constrained decoding: with an in-place mask the model CANNOT pick an illegal
+  // token. One 594-WG elementwise dispatch, only on constrained steps.
+  const LOGITMASK_WGSL = `
+struct P { n:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read_write> logits : array<f32>;
+@group(0) @binding(1) var<storage, read>       mask   : array<u32>;
+@group(0) @binding(2) var<uniform>             p      : P;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let i = gid.x; if (i >= p.n) { return; }
+  if ((mask[i >> 5u] & (1u << (i & 31u))) == 0u) { logits[i] = -3.0e38; }
+}`;
+  let _gmaskBuf = null;   // persistent vocab bitmask buffer (CPU-written per constrained step)
+  function logitMask(logitsBuf, N) {
+    if (!_gmaskBuf) _gmaskBuf = E.createBuffer(Math.ceil(N / 32) * 4, U.STORAGE | U.COPY_DST, 'gmask');
+    const p = uniform(new Uint32Array([N, 0, 0, 0]));
+    return E.dispatch(E.getPipeline('q3.logitMask', LOGITMASK_WGSL), [logitsBuf, _gmaskBuf, p], [Math.ceil(N / 256), 1, 1]);
+  }
+
   // ============================================================
   // Self-tests — each kernel vs a CPU reference. Returns {name, ok, err}[].
   // ============================================================
@@ -2612,6 +2633,23 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       check('argmax 2-stage', idx===98765?0:1);
       [ab,ob].forEach(b=>b.destroy());
     }
+    // --- logitMask (P4): masked argmax must pick the best ALLOWED token ---
+    {
+      const N=151936; const a=new Float32Array(N);
+      for(let i=0;i<N;i++)a[i]=Math.sin(i*0.0007);
+      a[98765]=99.0; a[44444]=50.0;                       // global max vs best-allowed
+      const ab=f32buf(a), ob=E.createBuffer(16, ST(),'oim');
+      const mw=new Uint32Array(Math.ceil(N/32));
+      mw[44444>>5]|=(1<<(44444&31)); mw[7>>5]|=(1<<(7&31));   // allow only 44444 and 7
+      if (!_gmaskBuf) _gmaskBuf = E.createBuffer(mw.byteLength, U.STORAGE|U.COPY_DST, 'gmask');
+      E.device().queue.writeBuffer(_gmaskBuf, 0, mw.buffer, 0, mw.byteLength);
+      await logitMask(ab, N);
+      await argmaxKernel(ab, ob, N, 0);
+      const enc=E.device().createCommandEncoder(); const st=E.createBuffer(16,U.COPY_DST|U.MAP_READ,'sm'); enc.copyBufferToBuffer(ob,0,st,0,16); E.device().queue.submit([enc.finish()]);
+      await st.mapAsync(GPUMapMode.READ); const idx=new Uint32Array(st.getMappedRange())[0]; st.unmap(); st.destroy();
+      check('logitMask + argmax', idx===44444?0:1);
+      [ab,ob].forEach(b=>b.destroy());
+    }
     return out;
   }
 
@@ -2641,6 +2679,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   const TOK = (function () {
     let vocab = null, idToTok = null, bpeRanks = null, byteEnc = null, byteDec = null, ready = false;
+    const _addedIds = new Set();   // added/special token ids (never allowed inside a grammar-constrained span)
     const enc = new TextEncoder(), dec = new TextDecoder();
 
     async function load(root) {
@@ -2649,7 +2688,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const j = await (await fetch(url)).json();
       vocab = j.model.vocab;                       // token string -> id
       idToTok = {}; for (const k in vocab) idToTok[vocab[k]] = k;
-      for (const a of (j.added_tokens || [])) { vocab[a.content] = a.id; idToTok[a.id] = a.content; }
+      for (const a of (j.added_tokens || [])) { vocab[a.content] = a.id; idToTok[a.id] = a.content; _addedIds.add(a.id); }
       bpeRanks = new Map();
       const merges = j.model.merges || [];
       for (let i = 0; i < merges.length; i++) {
@@ -2716,7 +2755,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       return dec.decode(new Uint8Array(bytes));
     }
 
-    return { load, encodeText, encodeChat, decode, isReady: () => ready };
+    return { load, encodeText, encodeChat, decode, isReady: () => ready, specialIds: () => _addedIds };
   })();
 
   // ============================================================
@@ -3319,12 +3358,22 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);              // fused residual: x += down_proj
     }
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
-    // last token row → its own [H] buffer, then lm_head
-    E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
-    await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
-    // GPU-side greedy argmax → write the predicted token straight into the token
-    // history at the NEXT position (posBase+T), so the next forward's embed reads it.
-    await argmaxKernel(s.logits, _tokHist, C.vocab, posBase + T);
+    const forceTok = opts && opts.forceTok;
+    if (forceTok != null) {
+      // GRAMMAR-FORCED token (P4): the next token is fully determined, so logits are
+      // pointless — skip the lm_head GEMV (the biggest decode dispatch) and argmax
+      // entirely and write the token straight into the history. queue.writeBuffer is
+      // queue-ordered before the NEXT forward's submit, whose embed reads it.
+      E.device().queue.writeBuffer(_tokHist, (posBase + T) * 4, new Uint32Array([forceTok]));
+    } else {
+      // last token row → its own [H] buffer, then lm_head
+      E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
+      await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
+      if (opts && opts.maskLogits) logitMask(s.logits, C.vocab);   // grammar mask (P4) — caller wrote _gmaskBuf
+      // GPU-side greedy argmax → write the predicted token straight into the token
+      // history at the NEXT position (posBase+T), so the next forward's embed reads it.
+      await argmaxKernel(s.logits, _tokHist, C.vocab, posBase + T);
+    }
     const _t1 = _PERF ? performance.now() : 0;   // all commands recorded
     const drain = E.endBatch();                   // single submit (returns the drain promise)
     if (submitOnly) return undefined;             // pipelined: caller doesn't wait here
@@ -3409,6 +3458,95 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
   }
 
+  // ---- grammar-constrained decoding (P4) ---------------------------------------------
+  // Once the model emits '<tool_call>', decoding switches from the batched GPU-resident
+  // loop to a per-token loop where every step is either FORCED (frame text — no logits
+  // computed at all: skips lm_head + argmax, ~4ms/token saved) or MASKED (the grammar's
+  // vocab bitmask is applied to the logits before argmax, so an illegal token cannot be
+  // picked). The batched loop resumes after '</tool_call>'. Free-text/thinking tokens pay
+  // ZERO cost — constraint only ever runs inside the tool-call span.
+  const _gdbg = (...a) => { try { if (localStorage.getItem('sandpie-webgpu-debug') === '1') console.log('[qwen3 grammar]', ...a); } catch (_) {} };
+  function makeToolGrammar(toolNames) {
+    try {
+      const G = (typeof globalThis !== 'undefined') && globalThis.SandpieGrammar;
+      if (!G || !toolNames || !toolNames.length || !TOK.isReady()) return null;
+      return G.createToolCallGrammar({
+        vocabSize: CONFIG.vocab,
+        tokenOf: (id) => TOK.decode([id]),
+        toolNames,
+        specialIds: TOK.specialIds(),
+      });
+    } catch (e) { _gdbg('makeToolGrammar failed', e); return null; }
+  }
+  // Per-token constrained loop from position `pos` (= L + count() - 1). Returns
+  // { used, ok } — ok=false means the grammar died (bug/edge) → caller resumes free decode.
+  async function _decodeConstrained(pos, grammar, pushTok, signal, budget) {
+    // discarded pipelined batches may still be writing _tokHist on the GPU — drain first
+    // so our forced writeBuffer/argmax results can't be clobbered by stale in-flight work.
+    await E.device().queue.onSubmittedWorkDone();
+    let used = 0;
+    while (used < budget) {
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      const nx = grammar.next();
+      if (nx.done) {
+        // grammar ends at the wrapper '}' — inject the closing tag ourselves (its ids may
+        // be the SPECIAL token, which is banned inside the span, so the grammar never sees it)
+        for (const t of TOK.encodeText('\n</tool_call>')) {
+          if (used >= budget) break;
+          await forward(null, pos, { chain: true, forceTok: t, submitOnly: true });
+          pushTok(t); pos++; used++;
+        }
+        return { used, ok: true };
+      }
+      if (nx.dead) return { used, ok: false };
+      let t;
+      if (nx.forced != null) {
+        const fids = TOK.encodeText(nx.forced);
+        if (!fids.length) return { used, ok: false };
+        t = fids[0];   // inject the first forced token; grammar re-derives the remainder next step
+        if (!grammar.advance(t)) return { used, ok: false };
+        await forward(null, pos, { chain: true, forceTok: t, submitOnly: true });   // no drain: no readback needed
+      } else {
+        if (!_gmaskBuf) _gmaskBuf = E.createBuffer(Math.ceil(CONFIG.vocab / 32) * 4, U.STORAGE | U.COPY_DST, 'gmask');
+        E.device().queue.writeBuffer(_gmaskBuf, 0, nx.maskWords.buffer, nx.maskWords.byteOffset, nx.maskWords.byteLength);
+        t = await forward(null, pos, { chain: true, maskLogits: true });
+        if (!grammar.advance(t)) { pushTok(t); pos++; used++; return { used, ok: false }; }
+      }
+      pushTok(t); pos++; used++;
+    }
+    return { used, ok: false };
+  }
+  // Driver: batched decode until '<tool_call>' appears in the emitted text, then the
+  // constrained loop for the span, then back to batched — repeat until stop/budget.
+  const GRAMMAR_TRIGGER = '<tool_call>';
+  async function decodeWithGrammar(L, maxTokens, pushTok, signal, count, grammar, getText) {
+    let trig = null, lastTrigLen = -1;
+    const wrapped = (t) => {
+      if (!pushTok(t)) return false;
+      const txt = getText();
+      const idx = txt.lastIndexOf(GRAMMAR_TRIGGER);
+      if (idx >= 0 && idx > lastTrigLen) {
+        const residual = txt.slice(idx + GRAMMAR_TRIGGER.length);
+        if (residual.length <= 24 && residual.indexOf('</tool_call>') < 0) {
+          trig = residual; lastTrigLen = idx;
+          return false;                      // stop the batched loop; constrained loop takes over
+        }
+      }
+      return true;
+    };
+    while (count() < maxTokens) {
+      trig = null;
+      await decodeLoop(L + count() - 1, maxTokens, wrapped, signal, count);
+      if (trig == null) return;              // genuine stop (STOP token / budget / abort)
+      if (grammar.reset(trig)) {
+        const r = await _decodeConstrained(L + count() - 1, grammar, pushTok, signal, maxTokens - count());
+        if (!r.ok) _gdbg('grammar span ended without done — phase=' + grammar.phase() + ' used=' + r.used + ' (resuming free decode)');
+      } else {
+        await E.device().queue.onSubmittedWorkDone();   // residual didn't fit the grammar → free decode, but drain the discarded batches
+      }
+    }
+  }
+
   // Greedy generate — thin wrapper over the double-buffered decodeLoop (see above):
   // GEN_BATCH chained forwards per batch (chained through _tokHist on the GPU, no
   // mid-batch readback), and the next batch is submitted before the current batch's
@@ -3417,7 +3555,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   const GEN_BATCH = 32;   // tokens/GPU-resident batch (1 readback each) — big to amortize the
                           // vsync-throttled readback when the tab is focused (see decodeLoop).
   const PIPE_DEPTH = 3;   // batches kept in flight so the GPU never idles awaiting a readback.
-  async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
+  async function generate(prompt, { maxTokens = 64, onToken, signal, toolNames } = {}) {
     await loadModel({ variant: _variant });
     _cachedIds = null; _sysAnchor = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
@@ -3438,7 +3576,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok0)) return TOK.decode(outIds);
-    await decodeLoop(pos, maxTokens, emit, signal, () => outIds.length);
+    const grammar = toolNames && toolNames.length ? makeToolGrammar(toolNames) : null;
+    if (grammar) await decodeWithGrammar(L, maxTokens, emit, signal, () => outIds.length, grammar, () => TOK.decode(outIds.slice(-14)));
+    else await decodeLoop(pos, maxTokens, emit, signal, () => outIds.length);
     return TOK.decode(outIds);
   }
 
@@ -4024,6 +4164,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _decSplit = null; _decSplitDead = [];
     try { if (_amaxPart) { _amaxPart.v.destroy(); _amaxPart.i.destroy(); } } catch (_) {}
     _amaxPart = null;
+    try { if (_gmaskBuf) _gmaskBuf.destroy(); } catch (_) {}
+    _gmaskBuf = null;
     _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null; _sysAnchor = null; MAX_SEQ = 4096;
     if (deep) {
       _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
@@ -4034,7 +4176,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
 
   // Stream from pre-encoded ids (same prefill+decode as generate(), but the
   // caller supplies the full chat token sequence and gets clean UTF-8 deltas).
-  async function _streamIds(ids, { maxTokens = 512, onToken, signal } = {}) {
+  async function _streamIds(ids, { maxTokens = 512, onToken, signal, grammar } = {}) {
     await loadModel({ variant: _variant });
     const L = ids.length;
     // Grow the allocated context JUST ENOUGH to fit this prompt + decode headroom (never the full
@@ -4111,7 +4253,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       prevText = txt; return true;
     };
     if (!pushTok(tok0)) return prevText;
-    await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length);
+    if (grammar) await decodeWithGrammar(L, maxTokens, pushTok, signal, () => outIds.length, grammar, () => prevText);
+    else await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length);
     const _te = performance.now();
     const _dms = _te - _tp1, _n = outIds.length;
     const _split = _pf ? (' | prefill split: encode=' + _pf.encode_ms + 'ms gpu=' + _pf.gpu_drain_ms + 'ms map=' + _pf.map_ms + 'ms') : '';
@@ -4269,6 +4412,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (const m of (messages || [])) { if (m && m.role) work.push(norm(m)); }
 
     const MAX_ROUNDS = toolList.length ? 8 : 1;
+    let _grammar;   // built lazily on the first tool round (undefined = not tried yet; null = unavailable)
     try {
       for (let round = 0; round < MAX_ROUNDS; round++) {
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
@@ -4281,7 +4425,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         );
         const ids = TOK.encodeChat(work);
         if (round === 0) _sysCacheClaim(ids, sys, variant, emit);   // skip re-prefilling the system block if resident
-        await _streamIds(ids, { maxTokens, signal, onToken: (p) => parser.push(p) });
+        // Grammar-constrained tool calls (P4): once the model opens <tool_call>, the span is
+        // token-masked to be a VALID call to a REGISTERED tool — malformed JSON / made-up
+        // tool names can't be generated at all. Built once per conversation, reused per round.
+        if (toolList.length && _grammar === undefined) _grammar = makeToolGrammar(toolList.map(t => t.function && t.function.name).filter(Boolean));
+        await _streamIds(ids, { maxTokens, signal, grammar: _grammar || null, onToken: (p) => parser.push(p) });
         if (round === 0) _sysCacheRecord(sys, variant);             // _kv[0..P_sys) now holds this system block
         parser.flush();
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
@@ -4345,7 +4493,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   return {
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
-    selfTestKernels,
+    selfTestKernels, makeToolGrammar,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
     runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
