@@ -234,7 +234,254 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return out;
   }
 
-  return { CONFIG, shortConv, router, selfTestKernels };
+  // ============================================================
+  // PHASE B — tokenizer + streaming weight loader.
+  // ============================================================
+  const MODELS = {
+    // Bring-up model: same generation/architecture family, dense FFN, small download.
+    '350M': {
+      root: 'https://huggingface.co/LiquidAI/LFM2.5-350M/resolve/main/',
+      cfg: { numLayers: 16, hidden: 1024, nHeads: 16, nKvHeads: 8, headDim: 64, convL: 3, vocab: 65536, ropeTheta: 1000000, rmsEps: 1e-5, attnLayers: [2, 5, 8, 10, 12, 14], moe: false, bos: 1, eos: 7 },
+    },
+    // The target. moe fields per config.json (verified 2026-07-02).
+    '8B-A1B': {
+      root: 'https://huggingface.co/LiquidAI/LFM2.5-8B-A1B/resolve/main/',
+      cfg: { numLayers: 24, hidden: 2048, nHeads: 32, nKvHeads: 8, headDim: 64, convL: 3, vocab: 128000, ropeTheta: 5000000, rmsEps: 1e-5, attnLayers: [2, 6, 10, 14, 18, 21], moe: true, nExperts: 32, topK: 4, expertI: 1792, denseLayers: 2, denseI: 7168, bos: 124894, eos: 124900 },
+    },
+  };
+  let _variant = null, _cfg = null, _weights = null, _loaded = false;
+
+  // ---- tokenizer: byte-level BPE with the pre_tokenizer regex extracted from
+  // tokenizer.json at load (LFM2's split pattern differs from Qwen's; the (?i:…)
+  // contraction group — the one construct JS regexes lack — is expanded manually).
+  function buildByteMaps() {
+    const bs = [];
+    for (let i = 33; i <= 126; i++) bs.push(i);
+    for (let i = 161; i <= 172; i++) bs.push(i);
+    for (let i = 174; i <= 255; i++) bs.push(i);
+    const cs = bs.slice(); let n = 0;
+    for (let b = 0; b < 256; b++) if (!bs.includes(b)) { bs.push(b); cs.push(256 + n); n++; }
+    const byteEnc = new Array(256), byteDec = {};
+    for (let i = 0; i < bs.length; i++) { const ch = String.fromCharCode(cs[i]); byteEnc[bs[i]] = ch; byteDec[ch] = bs[i]; }
+    return { byteEnc, byteDec };
+  }
+  function _jsRegexFrom(hfPattern) {
+    // The only HF-regex constructs JS lacks in practice: (?i:…) groups. Expand the
+    // standard contraction group; anything else unsupported → fall back to GPT-4-style.
+    let p = hfPattern.replace(/\(\?i:('s\|'t\|'re\|'ve\|'m\|'ll\|'d)\)/i,
+      "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])");
+    try { return new RegExp(p, 'gu'); } catch (_) {
+      return /(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
+    }
+  }
+  const TOK = (function () {
+    let vocab = null, idToTok = null, bpeRanks = null, byteEnc = null, byteDec = null, ready = false, pretokRe = null;
+    let imStart = -1, imEnd = -1, bosId = -1;
+    const _addedIds = new Set();
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    async function load(root) {
+      if (ready) return;
+      const j = await (await fetch(root + 'tokenizer.json')).json();
+      vocab = j.model.vocab;
+      idToTok = {}; for (const k in vocab) idToTok[vocab[k]] = k;
+      for (const a of (j.added_tokens || [])) { vocab[a.content] = a.id; idToTok[a.id] = a.content; _addedIds.add(a.id); }
+      bpeRanks = new Map();
+      const merges = j.model.merges || [];
+      for (let i = 0; i < merges.length; i++) { const m = merges[i]; bpeRanks.set(Array.isArray(m) ? (m[0] + ' ' + m[1]) : m, i); }
+      // pre_tokenizer: find the Split regex wherever it sits (top-level or Sequence)
+      let pat = null;
+      const scan = (pt) => { if (!pt) return; if (pt.pattern && pt.pattern.Regex) pat = pt.pattern.Regex; (pt.pretokenizers || []).forEach(scan); };
+      scan(j.pre_tokenizer);
+      pretokRe = pat ? _jsRegexFrom(pat) : _jsRegexFrom('');
+      ({ byteEnc, byteDec } = buildByteMaps());
+      imStart = vocab['<|im_start|>'] ?? -1; imEnd = vocab['<|im_end|>'] ?? -1;
+      bosId = vocab['<|startoftext|>'] ?? _cfg.bos;
+      ready = true;
+    }
+    function bpe(piece) {
+      let word = Array.from(piece);
+      if (word.length < 2) return word;
+      for (;;) {
+        let bestRank = Infinity, bestI = -1;
+        for (let i = 0; i < word.length - 1; i++) { const r = bpeRanks.get(word[i] + ' ' + word[i + 1]); if (r !== undefined && r < bestRank) { bestRank = r; bestI = i; } }
+        if (bestI < 0) break;
+        word = word.slice(0, bestI).concat(word[bestI] + word[bestI + 1], word.slice(bestI + 2));
+      }
+      return word;
+    }
+    function encodeText(text) {
+      const ids = [];
+      for (const piece of (text.match(pretokRe) || [])) {
+        const bytes = enc.encode(piece);
+        let s = ''; for (const b of bytes) s += byteEnc[b];
+        for (const sub of bpe(s)) { const id = vocab[sub]; if (id !== undefined) ids.push(id); }
+      }
+      return ids;
+    }
+    function encodeChat(messages, { addGenerationPrompt = true } = {}) {
+      const ids = [bosId];   // <|startoftext|>
+      for (const m of messages) {
+        ids.push(imStart); ids.push(...encodeText(m.role + '\n' + (typeof m.content === 'string' ? m.content : ''))); ids.push(imEnd); ids.push(...encodeText('\n'));
+      }
+      if (addGenerationPrompt) { ids.push(imStart); ids.push(...encodeText('assistant\n')); }
+      return ids;
+    }
+    function decode(ids) {
+      let s = ''; for (const id of ids) { const t = idToTok[id]; if (t !== undefined) s += t; }
+      const bytes = []; for (const ch of s) { const b = byteDec[ch]; if (b !== undefined) bytes.push(b); }
+      return dec.decode(new Uint8Array(bytes));
+    }
+    return { load, encodeText, encodeChat, decode, isReady: () => ready, specialIds: () => _addedIds };
+  })();
+
+  // ---- streaming single-pass loader: safetensors header via Range request, then one
+  // sequential body stream; each tensor is quantized/converted the moment its bytes are
+  // complete and the raw bytes are DROPPED — peak host RAM ≈ the largest single tensor
+  // (embed: ~525MB on the 8B) regardless of file size (16.9GB single-file works).
+  const QGROUP = 32;
+  const _f32a = new Float32Array(1), _u32a = new Uint32Array(_f32a.buffer);
+  function _f32ToF16(v) { _f32a[0] = v; const x = _u32a[0]; const sign = (x >>> 16) & 0x8000, exp = (x >>> 23) & 0xff, mant = x & 0x7fffff; if (exp === 0xff) return sign | (mant ? 0x7e00 : 0x7c00); let e = exp - 127 + 15; if (e >= 31) return sign | 0x7c00; if (e <= 0) { if (e < -10) return sign; const m = mant | 0x800000, sh = 14 - e; let h = m >>> sh; if ((m >>> (sh - 1)) & 1) h += 1; return sign | h; } let h = (e << 10) | (mant >>> 13); if ((mant >>> 12) & 1) h += 1; return sign | h; }
+  function _f16ToF32s(h) { const s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x03ff; if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024); if (e === 31) return f ? NaN : (s ? -Infinity : Infinity); return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024); }
+  function _bf16ToF16bits(u16) { const out = new Uint16Array(u16.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer); for (let i = 0; i < u16.length; i++) { ti[0] = u16[i] << 16; out[i] = _f32ToF16(t[0]); } return out; }
+  // group-wise symmetric int4 along K; rows = product of leading dims (3D expert tensors
+  // [E,N,K] quantize as (E·N, K) — per-expert rows are contiguous, so Phase C's expert
+  // GEMV just offsets rows by e·N).
+  function _quantInt4(u16, rows, K) {
+    const wpr = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(rows * wpr), scales = new Uint16Array(rows * gpr);
+    const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+    for (let n = 0; n < rows; n++) {
+      const rU = n * K, rP = n * wpr, rS = n * gpr;
+      for (let g = 0; g < gpr; g++) {
+        let maxabs = 0;
+        for (let j = 0; j < QGROUP; j++) { ti[0] = u16[rU + g * QGROUP + j] << 16; const v = Math.abs(t[0]); if (v > maxabs) maxabs = v; }
+        const sBits = _f32ToF16(maxabs > 0 ? maxabs / 7 : 1e-8); scales[rS + g] = sBits;
+        const inv = 1 / _f16ToF32s(sBits);
+        for (let j = 0; j < QGROUP; j++) {
+          const k = g * QGROUP + j; ti[0] = u16[rU + k] << 16;
+          let q = Math.round(t[0] * inv); if (q < -8) q = -8; else if (q > 7) q = 7;
+          pack[rP + (k >> 3)] |= ((q + 8) & 0xF) << (4 * (k & 7));
+        }
+      }
+    }
+    return { pack, scales };
+  }
+  // Quant plan by tensor name (lfm2 + lfm2_moe families).
+  const _isInt4 = (name) => /(_proj|\.w[123])\.weight$/.test(name) || /experts\.(gate_up_proj|down_proj)$/.test(name);
+  const _isF32 = (name) => /expert_bias/.test(name);
+
+  function _uploadTensor(name, info, raw) {
+    const numel = info.shape.reduce((a, b) => a * b, 1);
+    const u16 = new Uint16Array(raw.buffer, raw.byteOffset, numel);
+    if (_isInt4(name) && info.shape.length >= 2 && (info.shape[info.shape.length - 1] % QGROUP) === 0) {
+      const K = info.shape[info.shape.length - 1], rows = numel / K;
+      const { pack, scales } = _quantInt4(u16, rows, K);
+      const packBuf = E.createBuffer(pack.byteLength, ST(), name + '.pack');
+      const scBuf = E.createBuffer(scales.byteLength, ST(), name + '.sc');
+      E.device().queue.writeBuffer(packBuf, 0, pack); E.device().queue.writeBuffer(scBuf, 0, scales);
+      _weights[name] = { pack: packBuf, scales: scBuf, N: rows, K, int4: true, shape: info.shape };
+    } else if (_isF32(name)) {
+      const f32 = new Float32Array(numel); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < numel; i++) { ti[0] = u16[i] << 16; f32[i] = t[0]; }
+      const buf = E.createBuffer(f32.byteLength, ST(), name);
+      E.device().queue.writeBuffer(buf, 0, f32);
+      _weights[name] = { buf, f32: true, shape: info.shape };
+    } else {
+      const bits = info.dtype === 'BF16' ? _bf16ToF16bits(u16) : u16;
+      const buf = E.createBuffer(numel * 2, ST(), name);
+      E.device().queue.writeBuffer(buf, 0, bits);
+      _weights[name] = { buf, shape: info.shape };
+    }
+    // TIED lm_head: the embedding also serves the vocab GEMV — make its int4 twin now,
+    // while the raw bf16 is still in hand (it is never resident again after this call).
+    if (name === 'model.embed_tokens.weight' && !_weights['lm_head.weight']) {
+      const K = info.shape[1], rows = info.shape[0];
+      const { pack, scales } = _quantInt4(u16, rows, K);
+      const packBuf = E.createBuffer(pack.byteLength, ST(), 'lm_head.pack');
+      const scBuf = E.createBuffer(scales.byteLength, ST(), 'lm_head.sc');
+      E.device().queue.writeBuffer(packBuf, 0, pack); E.device().queue.writeBuffer(scBuf, 0, scales);
+      _weights['lm_head.weight'] = { pack: packBuf, scales: scBuf, N: rows, K, int4: true, shape: info.shape };
+    }
+  }
+
+  async function _streamWeights(url, onProgress) {
+    // header: first 8 bytes = u64 header length, then the JSON header (Range requests)
+    const h8 = await (await fetch(url, { headers: { Range: 'bytes=0-7' } })).arrayBuffer();
+    const headerLen = Number(new DataView(h8).getBigUint64(0, true));
+    const hResp = await fetch(url, { headers: { Range: 'bytes=8-' + (7 + headerLen) } });
+    const header = JSON.parse(new TextDecoder().decode(await hResp.arrayBuffer()));
+    const dataStart = 8 + headerLen;
+    const tensors = Object.keys(header).filter(n => n !== '__metadata__')
+      .map(n => ({ name: n, info: header[n], begin: header[n].data_offsets[0], end: header[n].data_offsets[1] }))
+      .sort((a, b) => a.begin - b.begin);
+    // one sequential body stream; rolling chunk window, tensors consumed in offset order
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('download failed: HTTP ' + resp.status);
+    const total = +(resp.headers.get('content-length') || 0);
+    const reader = resp.body.getReader();
+    let chunks = [], winStart = 0, recv = 0, ti = 0;   // winStart = absolute offset of chunks[0] RELATIVE TO dataStart
+    const have = () => recv - winStart;
+    const takeRange = (begin, end) => {   // begin/end relative to dataStart, within the window
+      const out = new Uint8Array(end - begin); let w = 0, off = winStart;
+      for (const c of chunks) { const cEnd = off + c.length;
+        if (cEnd > begin && off < end) { const s = Math.max(begin - off, 0), e = Math.min(end - off, c.length); out.set(c.subarray(s, e), w); w += e - s; }
+        off = cEnd; }
+      return out;
+    };
+    const dropTo = (abs) => { let off = winStart;
+      while (chunks.length && off + chunks[0].length <= abs) { off += chunks[0].length; chunks.shift(); }
+      winStart = off; };
+    let skippedHeader = false;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) {
+        if (!skippedHeader) {   // the body stream re-delivers header bytes — skip them
+          const priorRecv = recv; recv += value.length;
+          if (recv <= dataStart) continue;
+          const cut = Math.max(dataStart - priorRecv, 0);
+          chunks.push(value.subarray(cut)); winStart = 0; recv = recv - dataStart; skippedHeader = true;
+        } else { chunks.push(value); recv += value.length; }
+        while (ti < tensors.length && tensors[ti].end <= recv) {
+          const t = tensors[ti];
+          _uploadTensor(t.name, t.info, takeRange(t.begin, t.end));
+          ti++; dropTo(ti < tensors.length ? tensors[ti].begin : recv);
+          onProgress && onProgress({ phase: 'parse', pct: Math.round(ti / tensors.length * 100) });
+        }
+        if (total && onProgress) onProgress({ phase: 'download', pct: Math.round((recv + dataStart) / total * 100) });
+      }
+      if (done) break;
+    }
+    if (ti < tensors.length) throw new Error('stream ended early: ' + tensors[ti].name);
+  }
+
+  async function loadModel({ variant = '350M', onProgress } = {}) {
+    if (_loaded && _variant === variant) return;
+    const m = MODELS[variant]; if (!m) throw new Error('unknown LFM2.5 variant ' + variant);
+    _variant = variant; _cfg = m.cfg; _weights = {};
+    await E.init();
+    await TOK.load(m.root);
+    onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
+    await _streamWeights(m.root + 'model.safetensors', onProgress);
+    _loaded = true;
+  }
+  function unload() {
+    try { if (_weights) for (const k in _weights) { const w = _weights[k]; for (const p of ['buf', 'pack', 'scales']) if (w[p] && w[p].destroy) try { w[p].destroy(); } catch (_) {} } } catch (_) {}
+    _weights = null; _loaded = false; _variant = null;
+  }
+  function inventory() {
+    if (!_weights) return null;
+    const inv = { int4: 0, f16: 0, f32: 0, tensors: 0, int4Bytes: 0, f16Bytes: 0, names: [] };
+    for (const k in _weights) {
+      const w = _weights[k]; inv.tensors++;
+      if (w.int4) { inv.int4++; inv.int4Bytes += w.N * w.K / 2 + w.N * w.K / QGROUP * 2; }
+      else if (w.f32) inv.f32++;
+      else { inv.f16++; inv.f16Bytes += w.shape.reduce((a, b) => a * b, 1) * 2; }
+      if (inv.names.length < 400) inv.names.push(k + (w.int4 ? ' [int4 ' + w.N + 'x' + w.K + ']' : ' ' + JSON.stringify(w.shape)));
+    }
+    return inv;
+  }
+
+  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
