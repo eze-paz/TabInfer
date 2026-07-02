@@ -16,7 +16,7 @@ self.window = self;
 let _ok = false;
 try {
   // KEEP the ?v= in sync with sandpie.html when these modules are bumped.
-  importScripts('webgpu-engine.js?v=47', 'webgpu-qwen3.js?v=120');
+  importScripts('webgpu-engine.js?v=47', 'webgpu-qwen3.js?v=121');
   _ok = !!self.SandpieQwen3;
 } catch (e) {
   self.postMessage({ t: 'fatal', message: 'worker import failed: ' + ((e && e.message) || e) });

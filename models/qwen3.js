@@ -552,7 +552,8 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 }`;
   // DP4A int8 variant of the fused gate+up+SwiGLU (same win as gemvDP4A: int8 dot4I8Packed
   // instead of f32 dot4). The int8 activation is read ONCE and dotted against BOTH gate and up.
-  const GATEUPDP4_WGSL = `
+  // Parameterized by NR (rows/WG) — same tuning lever as gemvQ.
+  function gateupDP4Wgsl(NR) { return `
 enable f16;
 enable subgroups;
 struct D { I:u32, H:u32, _a:u32, _b:u32 };
@@ -564,22 +565,22 @@ struct D { I:u32, H:u32, _a:u32, _b:u32 };
 @group(0) @binding(5) var<storage, read>       xs : array<f32>;          // [H/QGROUP] activation scales
 @group(0) @binding(6) var<storage, read_write> swi: array<f32>;          // [I]
 @group(0) @binding(7) var<uniform>             d  : D;
-var<workgroup> pg : array<f32, ${GUSQ_NR * GEMV_WG}>;
-var<workgroup> pu : array<f32, ${GUSQ_NR * GEMV_WG}>;
+var<workgroup> pg : array<f32, ${NR * GEMV_WG}>;
+var<workgroup> pu : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(num_workgroups) nwg:vec3<u32>,
         @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
-  let rowBase = (wg.x + wg.y * nwg.x) * ${GUSQ_NR}u;
+  let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
   if (rowBase >= d.I) { return; }
   let words = d.H / 8u; let gpr = d.H / ${QGROUP}u;
-  var ga : array<f32, ${GUSQ_NR}>; var ua : array<f32, ${GUSQ_NR}>;
-  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) { ga[r]=0.0; ua[r]=0.0; }
+  var ga : array<f32, ${NR}>; var ua : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { ga[r]=0.0; ua[r]=0.0; }
   var w = lid.x;
   loop {
     if (w >= words) { break; }
     let xa = xq[2u*w]; let xb = xq[2u*w + 1u]; let grp = (w*8u)/${QGROUP}u; let xsc = xs[grp];
-    for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
       let row = rowBase + r; let wi = row*words + w; let si = row*gpr + grp;
       let gp = gW[wi]; let gsc = f32(gS[si])*xsc;
       let glo = vec4<i32>(unpack4xU8(gp & 0x0F0F0F0Fu)); let ghi = vec4<i32>(unpack4xU8((gp >> 4u) & 0x0F0F0F0Fu));
@@ -595,12 +596,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     w = w + ${GEMV_WG}u;
   }
   let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
     let g = subgroupAdd(ga[r]); let u = subgroupAdd(ua[r]);
     if (sgi == 0u) { pg[r*${GEMV_WG}u + sgIdx] = g; pu[r*${GEMV_WG}u + sgIdx] = u; }
   }
   workgroupBarrier();
-  if (lid.x < ${GUSQ_NR}u) {
+  if (lid.x < ${NR}u) {
     let row = rowBase + lid.x;
     if (row < d.I) {
       let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var g:f32=0.0; var u:f32=0.0;
@@ -609,7 +610,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       swi[row] = silu * u;
     }
   }
-}`;
+}`; }
   function gateUpSiluQ(xBuf, gRec, uRec, swiBuf, I, H) {
     if (globalThis.__noDp4) {
       const pipe = E.getPipeline('q3.gateupQ', GATEUPQ_WGSL);
@@ -622,10 +623,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
   // gate+up+SwiGLU against the CURRENTLY-quantized activation in _dp4 (caller ran quantQ8 or
   // rmsnormQ first) — lets the MLP norm feed it pre-quantized, dropping the quantize dispatch.
-  function gateUpSiluDP4_only(gRec, uRec, swiBuf, I, H) {
-    const pipe = E.getPipeline('q3.gateupDP4', GATEUPDP4_WGSL);
+  function gateUpSiluDP4_only(gRec, uRec, swiBuf, I, H, NR) {
+    NR = NR || 2;   // measured optimum (min-of-5 GPU-ts at I=3072,H=1024): NR2 91.8µs / NR4 98.3 / NR8 114.7 / NR16 150.7 — 93% of the bandwidth floor
+    const pipe = E.getPipeline(NR === GUSQ_NR ? 'q3.gateupDP4' : 'q3.gateupDP4.' + NR, gateupDP4Wgsl(NR));
     const d = uniform(new Uint32Array([I, H, 0, 0]));
-    const nWG = Math.ceil(I / GUSQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    const nWG = Math.ceil(I / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [_dp4.xq, gRec.pack, gRec.scales, uRec.pack, uRec.scales, _dp4.xs, swiBuf, d], [gx, gy, 1]);
   }
 
@@ -1686,7 +1688,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
 }`; }
   function attnDecodeStreamQ8(qBuf, kqBuf, ksBuf, vqBuf, vsBuf, oBuf, S, nHq, nKv, hd, nsplitOverride) {
     ensureDecSplit(nHq);
-    const nsplit = nsplitOverride || Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640)));
+    const nsplit = nsplitOverride || _decNsplit(S);
     const p = uniform(new Uint32Array([1, S, nHq, nKv, hd, nsplit, 0, 0]));
     const pipe = E.getPipeline('q3.attnDecStreamQ8', attnDecStreamQ8Wgsl());
     E.dispatch(pipe, [qBuf, kqBuf, ksBuf, vqBuf, vsBuf, _decSplit.po, _decSplit.pml, p], [nHq, nsplit, 1]);
@@ -1736,6 +1738,98 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
     const items = 2 * (T * nKv * hd) / 32;
     return E.dispatch(pipe, [krBuf, vBuf, kv.kq, kv.ks, kv.vq, kv.vs, p], [Math.ceil(items / 64), 1, 1]);
   }
+
+  // ---- FUSED decode attention-prep (T=1, int8 KV) --------------------------------
+  // ONE dispatch doing what ropeQK(q) + ropeQK(k) + kvQuantWrite did in three: profiled,
+  // the three are trivially small (16+8 rope workgroups + a 1-WG quant) and cost ~40µs of
+  // per-dispatch overhead EACH per layer — pure occupancy/launch waste at T=1. Workgroup
+  // roles by wg.x: [0,nHq) rope+norm a q head → qr; [nHq,nHq+nKv) rope+norm a k head and
+  // quantize it STRAIGHT into the KV cache (the f32 k row is never written back at all);
+  // [nHq+nKv, nHq+2nKv) quantize a v head into the cache. The full-fusion variant needs
+  // 10 storage bindings — devices with maxStorageBuffersPerShaderStage < 10 (baseline 8,
+  // e.g. some Adreno) fall back to ropeQK(q) + the 7-binding K/V prep (still one fewer
+  // dispatch and no kr round-trip). Requires hd ≤ 128 and hd % 32 == 0.
+  function attnPrepWgsl(fuseQ) { return `
+enable f16;
+struct P { nHq:u32, nKv:u32, hd:u32, posBase:u32, theta:f32, eps:f32, _a:u32, _b:u32 };
+${fuseQ ? `@group(0) @binding(0) var<storage, read>       q  : array<f32>;
+@group(0) @binding(1) var<storage, read>       qw : array<f16>;
+@group(0) @binding(2) var<storage, read_write> qr : array<f32>;` : ''}
+@group(0) @binding(${fuseQ ? 3 : 0}) var<storage, read>       k  : array<f32>;
+@group(0) @binding(${fuseQ ? 4 : 1}) var<storage, read>       kw : array<f16>;
+@group(0) @binding(${fuseQ ? 5 : 2}) var<storage, read>       v  : array<f32>;
+@group(0) @binding(${fuseQ ? 6 : 3}) var<storage, read_write> Kq : array<u32>;
+@group(0) @binding(${fuseQ ? 7 : 4}) var<storage, read_write> Ks : array<f32>;
+@group(0) @binding(${fuseQ ? 8 : 5}) var<storage, read_write> Vq : array<u32>;
+@group(0) @binding(${fuseQ ? 9 : 6}) var<storage, read_write> Vs : array<f32>;
+@group(0) @binding(${fuseQ ? 10 : 7}) var<uniform>            p  : P;
+var<workgroup> red : array<f32, 128>;
+var<workgroup> rk  : array<f32, 128>;    // normed+rope'd (or raw v) head row
+var<workgroup> mxs : array<f32, 4>;      // per-32-group abs-max (hd ≤ 128 → ≤ 4 groups)
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let j = lid.x; let hd = p.hd;
+  let qn = ${fuseQ ? 'p.nHq' : '0u'};
+  let role = wg.x;                       // [0,qn) q-rope | [qn,qn+nKv) k-rope-quant | rest v-quant
+  let isQ = role < qn;
+  let isK = !isQ && role < qn + p.nKv;
+  let head = select(select(role - qn - p.nKv, role - qn, isK), role, isQ);
+  let nH = select(p.nKv, p.nHq, isQ);
+  let base = head*hd;
+  var x:f32 = 0.0;
+  if (j < hd) { x = ${fuseQ ? 'select(select(v[base+j], k[base+j], isK), q[base+j], isQ)' : 'select(v[base+j], k[base+j], isK)'}; }
+  if (isQ || isK) {                      // RMSNorm over hd + per-head norm weight + RoPE
+    red[j] = select(0.0, x*x, j < hd); workgroupBarrier();
+    var st = 64u;
+    loop { if (st==0u) { break; } if (j < st) { red[j] = red[j] + red[j+st]; } workgroupBarrier(); st = st/2u; }
+    let inv = inverseSqrt(red[0]/f32(hd) + p.eps);
+    if (j < hd) { rk[j] = x*inv*${fuseQ ? 'f32(select(kw[j], qw[j], isQ))' : 'f32(kw[j])'}; }
+    workgroupBarrier();
+    if (j < hd) {                        // RoPE rotate_half at absolute position posBase (T=1)
+      let half = hd/2u;
+      let pos = f32(p.posBase);
+      let freqIdx = select(j-half, j, j<half);
+      let ang = pos * pow(p.theta, -2.0*f32(freqIdx)/f32(hd));
+      let c = cos(ang); let s = sin(ang);
+      let partner = select(rk[j-half], rk[j+half], j<half);
+      let rot = select(partner, -partner, j<half);
+      x = rk[j]*c + rot*s;
+    }
+    workgroupBarrier();                  // rk re-written below (and read by packing threads)
+  }
+  ${fuseQ ? 'if (isQ) { if (j < hd) { qr[base+j] = x; } return; }' : ''}
+  // K (rope'd) or V (raw): per-32-group snorm int8 quantize straight into the KV cache
+  if (j < hd) { rk[j] = x; }
+  workgroupBarrier();
+  if (j < hd/32u) {                      // one thread per group: abs-max scan (≤ 4 threads × 32)
+    var mx = 1e-12;
+    for (var i=0u; i<32u; i=i+1u) { mx = max(mx, abs(rk[j*32u + i])); }
+    mxs[j] = mx;
+  }
+  workgroupBarrier();
+  let rowW = (p.posBase*p.nKv*p.hd)/4u + head*(hd/4u);    // u32-word base of this head row
+  let rowG = (p.posBase*p.nKv*p.hd)/32u + head*(hd/32u);  // scale-group base
+  if (j < hd/4u) {
+    let g = (j*4u)/32u; let m = mxs[g];
+    let w = pack4x8snorm(vec4<f32>(rk[j*4u], rk[j*4u+1u], rk[j*4u+2u], rk[j*4u+3u]) / m);
+    if (isK) { Kq[rowW+j] = w; } else { Vq[rowW+j] = w; }
+  }
+  if (j < hd/32u) {
+    if (isK) { Ks[rowG+j] = mxs[j]; } else { Vs[rowG+j] = mxs[j]; }
+  }
+}`; }
+  function attnPrepQ8(qBuf, kBuf, vBuf, qwBuf, kwBuf, qrBuf, kv, nHq, nKv, hd, posBase, theta, eps) {
+    const fuseQ = ((E.caps() && E.caps().limits && E.caps().limits.maxStorageBuffersPerShaderStage) | 0) >= 10;
+    const u = new Uint32Array(8); const dv = new DataView(u.buffer);
+    dv.setUint32(0, nHq, true); dv.setUint32(4, nKv, true); dv.setUint32(8, hd, true);
+    dv.setUint32(12, posBase, true); dv.setFloat32(16, theta, true); dv.setFloat32(20, eps, true);
+    if (!fuseQ) ropeQK(qBuf, qwBuf, qrBuf, 1, nHq, hd, posBase, theta, eps);
+    const p = uniform(u);
+    const pipe = E.getPipeline('q3.attnPrep.' + (fuseQ ? 'full' : 'kv'), attnPrepWgsl(fuseQ));
+    const bufs = fuseQ ? [qBuf, qwBuf, qrBuf, kBuf, kwBuf, vBuf, kv.kq, kv.ks, kv.vq, kv.vs, p]
+                       : [kBuf, kwBuf, vBuf, kv.kq, kv.ks, kv.vq, kv.vs, p];
+    return E.dispatch(pipe, [...bufs], [(fuseQ ? nHq : 0) + 2 * nKv, 1, 1]);
+  }
   // Persistent scratch for the split partials (grown by head count, freed in unload()).
   let _decSplit = null, _decSplitDead = [];
   function ensureDecSplit(nHq) {
@@ -1748,11 +1842,14 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
       pml: E.createBuffer(nHq * DEC_NSPLIT_MAX * 2 * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'decPML'),
     };
   }
-  // nsplit: ~640 keys per workgroup → nHq×nsplit workgroups (16 heads × 12 @ S=7168 = 192 WGs
-  // vs the legacy kernel's 16). Clamped to the scratch capacity. nsplitOverride is for tests.
+  // nsplit: MEASURED optimum (GPU-timestamp sweep, gen-12lp, warm): ≥4 splits as soon as S
+  // allows one 128-key tile per split — 16 heads × <4 splits starves the 96-EU iGPU
+  // (S=512: ns4 = 1.75× ns1; S=1024: ns4 = 1.4× ns2; S=7168: ns16 best). So: at least 4
+  // (capped by ceil(S/tile)), growing past 4 only for long contexts (~448 keys/WG), max 16.
+  function _decNsplit(S) { return Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / DEC_TK), Math.max(4, Math.ceil(S / 448)))); }
   function attnDecodeStream(qBuf, kBuf, vBuf, oBuf, S, nHq, nKv, hd, nsplitOverride) {
     ensureDecSplit(nHq);
-    const nsplit = nsplitOverride || Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640)));
+    const nsplit = nsplitOverride || _decNsplit(S);
     const p = uniform(new Uint32Array([1, S, nHq, nKv, hd, nsplit, 0, 0]));   // shared by both passes
     const pipe = E.getPipeline('q3.attnDecStream', attnDecStreamWgsl());
     E.dispatch(pipe, [qBuf, kBuf, vBuf, _decSplit.po, _decSplit.pml, p], [nHq, nsplit, 1]);
@@ -2303,6 +2400,34 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       }
       check('kvQuantWrite roundtrip', err/ref, 1.2e-2);
       [kb,vb,kv.kq,kv.ks,kv.vq,kv.vs].forEach(b=>b.destroy());
+    }
+    // --- attnPrepQ8 (fused rope+norm+quant) vs the sequential ropeQK+ropeQK+kvQuantWrite ---
+    {
+      const nHq=4,nKv=2,hd=128,posBase=7,cap=12,theta=10000,eps=1e-6;
+      const q=new Float32Array(nHq*hd), k=new Float32Array(nKv*hd), v=new Float32Array(nKv*hd);
+      const qw=new Float32Array(hd), kw=new Float32Array(hd);
+      for(let i=0;i<q.length;i++)q[i]=Math.sin(i*0.11);
+      for(let i=0;i<k.length;i++){ k[i]=Math.cos(i*0.07); v[i]=Math.sin(i*0.05+2)*(1+(i%3)); }
+      for(let i=0;i<hd;i++){ qw[i]=0.6+0.4*Math.sin(i*0.02); kw[i]=0.7+0.3*Math.cos(i*0.03); }
+      const UB=U.STORAGE|U.COPY_DST|U.COPY_SRC; const capN=cap*nKv*hd;
+      const mkKv=()=>({ kq:E.createBuffer(capN,UB,'pkq'), ks:E.createBuffer((capN/QGROUP)*4,UB,'pks'), vq:E.createBuffer(capN,UB,'pvq'), vs:E.createBuffer((capN/QGROUP)*4,UB,'pvs') });
+      const qb=f32buf(q), kb=f32buf(k), vb=f32buf(v), qwb=f16buf(qw), kwb=f16buf(kw);
+      const qr1=E.createBuffer(q.length*4,ST(),'qr1'), qr2=E.createBuffer(q.length*4,ST(),'qr2'), kr=E.createBuffer(k.length*4,ST(),'kr');
+      const kvA=mkKv(), kvB=mkKv();
+      // reference: the sequential path
+      await ropeQK(qb,qwb,qr1,1,nHq,hd,posBase,theta,eps);
+      await ropeQK(kb,kwb,kr,1,nKv,hd,posBase,theta,eps);
+      await kvQuantWrite(kr,vb,kvA,1,nKv,hd,posBase);
+      // fused
+      await attnPrepQ8(qb,kb,vb,qwb,kwb,qr2,kvB,nHq,nKv,hd,posBase,theta,eps);
+      const eq=async(a,b,n,u32)=>{ const A=u32?await readU32Range(a,0,n):await E.readF32(a,n); const B=u32?await readU32Range(b,0,n):await E.readF32(b,n); let m=0; for(let i=0;i<n;i++)m=Math.max(m,Math.abs(A[i]-B[i])); return m; };
+      const off=posBase*nKv*hd, n=nKv*hd;
+      let err = await eq(qr1,qr2,q.length);
+      err = Math.max(err, await eq(kvA.kq,kvB.kq,(off+n)/4,true) > 0 ? 1 : 0);   // packed words: bit-identical expected
+      err = Math.max(err, await eq(kvA.vq,kvB.vq,(off+n)/4,true) > 0 ? 1 : 0);
+      err = Math.max(err, await eq(kvA.ks,kvB.ks,(off+n)/QGROUP), await eq(kvA.vs,kvB.vs,(off+n)/QGROUP));
+      check('attnPrepQ8 (fused = sequential)', err, 2e-5);
+      [qb,kb,vb,qwb,kwb,qr1,qr2,kr,kvA.kq,kvA.ks,kvA.vq,kvA.vs,kvB.kq,kvB.ks,kvB.vq,kvB.vs].forEach(b=>b.destroy());
     }
     // --- int8-KV attention end-to-end (P2): GPU quant-write → Q8 decode + Q8 prefill vs CPU full-precision ---
     {
@@ -3159,15 +3284,23 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
       // read and a read_write binding is undefined behavior in WebGPU (miscompiles
       // on Intel). Write rope output to a separate buffer.
-      await ropeQK(s.q, W(p + 'self_attn.q_norm.weight'), s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
-      await ropeQK(s.k, W(p + 'self_attn.k_norm.weight'), s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
-      if (_kvQ8) {   // int8 KV: quantize-write replaces the two copies, Q8 attention reads it
-        kvQuantWrite(s.kr, s.v, _kv[l], T, nKv, hd, posBase);
+      if (T === 1 && _kvQ8) {
+        // Fused decode prep: rope+norm q→qr, rope+norm k + quantize into KV, quantize v —
+        // one dispatch instead of three (the three were ~40µs of launch overhead each at
+        // T=1); the f32 k row (s.kr) is never materialized.
+        attnPrepQ8(s.q, s.k, s.v, W(p + 'self_attn.q_norm.weight'), W(p + 'self_attn.k_norm.weight'), s.qr, _kv[l], nHq, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
         await attentionQ8(s.qr, _kv[l].kq, _kv[l].ks, _kv[l].vq, _kv[l].vs, s.attn, T, S, nHq, nKv, hd);
       } else {
-        copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
-        copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
-        await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
+        await ropeQK(s.q, W(p + 'self_attn.q_norm.weight'), s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
+        await ropeQK(s.k, W(p + 'self_attn.k_norm.weight'), s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
+        if (_kvQ8) {   // prefill: quantize-write replaces the two copies, Q8 attention reads it
+          kvQuantWrite(s.kr, s.v, _kv[l], T, nKv, hd, posBase);
+          await attentionQ8(s.qr, _kv[l].kq, _kv[l].ks, _kv[l].vq, _kv[l].vs, s.attn, T, S, nHq, nKv, hd);
+        } else {
+          copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
+          copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
+          await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
+        }
       }
       await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
       // MLP norm → gate/up. Decode fuses the same way: rmsnormQ emits the int8 activation,
@@ -3602,7 +3735,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       for (let i = 0; i < hd; i++) y[qo + i] = a[i] / den;
     }
     const relErrVs = async () => { const got = await E.readF32(ob, y.length); let mx = 0, rf = 1e-9; for (let i = 0; i < y.length; i++) { mx = Math.max(mx, Math.abs(got[i] - y[i])); rf = Math.max(rf, Math.abs(y[i])); } return +(mx / rf).toExponential(2); };
-    const nsplitAuto = Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640)));
+    const nsplitAuto = _decNsplit(S);
     const legacyOk = S <= _attnDecLegacyMaxS;
     const out = { S, nHq, nKv, hd, nsplit_auto: nsplitAuto, legacy_maxS: _attnDecLegacyMaxS };
     // correctness
@@ -3670,7 +3803,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'q8b'); E.device().queue.writeBuffer(b, 0, a.buffer, 0, a.byteLength); return b; };
     const qb = mk(Q), kfb = mk(Kf), vfb = mk(Vf), kqb = mk(kq.qw), ksb = mk(kq.sc), vqb = mk(vq.qw), vsb = mk(vq.sc), ob = E.createBuffer(Q.byteLength, UF, 'q8o');
     const relErrVs = async (ref) => { const got = await E.readF32(ob, ref.length); let mx = 0, rf = 1e-9; for (let i = 0; i < ref.length; i++) { mx = Math.max(mx, Math.abs(got[i] - ref[i])); rf = Math.max(rf, Math.abs(ref[i])); } return +(mx / rf).toExponential(2); };
-    const out = { S, nHq, nKv, hd, nsplit_auto: Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640))) };
+    const out = { S, nHq, nKv, hd, nsplit_auto: _decNsplit(S) };
     uniformReset(); await attnDecodeStreamQ8(qb, kqb, ksb, vqb, vsb, ob, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone();
     out.relErr_vs_full = await relErrVs(yFull);    // includes int8 quantization error
     out.relErr_vs_deq = await relErrVs(yDeq);      // kernel arithmetic only — should be ~1e-6
@@ -3680,8 +3813,17 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       f32Us = Math.min(f32Us, await prof(() => attnDecodeStream(qb, kfb, vfb, ob, S, nHq, nKv, hd)));
       q8Us = Math.min(q8Us, await prof(() => attnDecodeStreamQ8(qb, kqb, ksb, vqb, vsb, ob, S, nHq, nKv, hd)));
     }
-    [qb, kfb, vfb, kqb, ksb, vqb, vsb, ob].forEach(b => b.destroy());
     out.f32_us = +f32Us.toFixed(1); out.q8_us = +q8Us.toFixed(1); out.speedup = +(f32Us / q8Us).toFixed(2);
+    // nsplit sweep (q8 kernel): the auto formula is a heuristic — this measures the true
+    // optimum per S so it can be retuned (16 WGs at nsplit=1 starve a 96-EU iGPU).
+    out.nsplit_sweep = {};
+    for (const ns of [1, 2, 4, 8, 16]) {
+      if (ns > Math.ceil(S / DEC_TK) && ns !== 1) continue;   // pointless splits beyond one tile each
+      let u = Infinity;
+      for (let r = 0; r < reps; r++) u = Math.min(u, await prof(() => attnDecodeStreamQ8(qb, kqb, ksb, vqb, vsb, ob, S, nHq, nKv, hd, ns)));
+      out.nsplit_sweep['ns' + ns] = +u.toFixed(1);
+    }
+    [qb, kfb, vfb, kqb, ksb, vqb, vsb, ob].forEach(b => b.destroy());
     return out;
   }
 
@@ -3840,11 +3982,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     for (let i = 0; i < iters; i++) { globalThis.__noDp4 = (i % 2 === 1); await gateUpSiluQ(xb, gRec, uRec, yb, I, H); }
     await E.endBatch(); const p = await E.endProfile();
     globalThis.__noDp4 = saved;
-    [xb, gW, gS, uW, uS, yb].forEach(bf => bf.destroy());
     const half = iters / 2;
     const sum = (l) => p.filter(r => r.label === l).reduce((s, r) => s + r.us, 0) / half;
     const f32 = sum('q3.gateupQ'), dp4 = sum('q3.gateupDP4') + sum('q3.quantq8');
-    return { I, H, f32_us: +f32.toFixed(1), dp4_us: +dp4.toFixed(1), speedup: +(f32 / dp4).toFixed(3) };
+    const out = { I, H, f32_us: +f32.toFixed(1), dp4_us: +dp4.toFixed(1), speedup: +(f32 / dp4).toFixed(3) };
+    // NR sweep on the DP4 kernel (rows/WG) — min-of-reps GPU time per variant
+    await quantQ8(xb, H); await E.device().queue.onSubmittedWorkDone();
+    for (const nr of [2, 4, 8, 16]) {
+      let best = Infinity;
+      for (let r = 0; r < 5; r++) {
+        E.beginProfile(28); E.beginBatch();
+        for (let i = 0; i < 20; i++) { uniformReset(); await gateUpSiluDP4_only(gRec, uRec, yb, I, H, nr); }
+        await E.endBatch(); const pp = await E.endProfile();
+        best = Math.min(best, pp.reduce((s, x2) => s + x2.us, 0) / 20);
+      }
+      out['dp4_NR' + nr + '_us'] = +best.toFixed(1);
+    }
+    [xb, gW, gS, uW, uS, yb].forEach(bf => bf.destroy());
+    return out;
   }
 
   // ============================================================
