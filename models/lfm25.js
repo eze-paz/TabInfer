@@ -775,7 +775,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 
   const EMBED_WGSL = `
 enable f16;
-struct P { T:u32, H:u32, _a:u32, _b:u32 };
+struct P { T:u32, H:u32, idOff:u32, _b:u32 };   // reads ids[idOff + t] — chain mode passes tokHist + posBase
 @group(0) @binding(0) var<storage, read>       ids   : array<u32>;
 @group(0) @binding(1) var<storage, read>       embed : array<f16>;
 @group(0) @binding(2) var<storage, read_write> y     : array<f32>;
@@ -784,10 +784,10 @@ struct P { T:u32, H:u32, _a:u32, _b:u32 };
 fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
   let idx = gid.y*(nwg.x*64u)+gid.x; let total = p.T*p.H; if (idx >= total) { return; }
   let t = idx/p.H; let h = idx%p.H;
-  y[idx] = f32(embed[ids[t]*p.H + h]);
+  y[idx] = f32(embed[ids[p.idOff + t]*p.H + h]);
 }`;
-  function embedGather(idsBuf, embBuf, yBuf, T, H) {
-    const p = uniform(new Uint32Array([T, H, 0, 0]));
+  function embedGather(idsBuf, embBuf, yBuf, T, H, idOff) {
+    const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
     const n = Math.ceil((T * H) / 64), gx = Math.min(n, 65535), gy = Math.ceil(n / gx);
     return E.dispatch(E.getPipeline('lfm25.embed', EMBED_WGSL), [idsBuf, embBuf, yBuf, p], [gx, gy, 1]);
   }
@@ -1050,6 +1050,53 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
     return E.dispatch(E.getPipeline('lfm25.moeCombine', MOECOMBINE_WGSL), [xBuf, oBuf, wtBuf, d], [gx, gy, 1]);
   }
 
+  // ---- two-stage GPU argmax → token history (enables GPU-resident decode chaining) ---
+  // Stage 1: AMAX_WGS workgroups reduce interleaved logit slices → per-WG (max,idx). Stage 2:
+  // one workgroup folds them and writes the token id into tokHist[outPos] on the GPU — so the
+  // NEXT forward's embed can read it without any CPU readback. This is what lets GEN_BATCH
+  // decode tokens chain in one submit (the throughput win: 1 readback per batch, not per token).
+  const ARGMAX_WG = 256, AMAX_WGS = 64;
+  const AMAX_P1_WGSL = `
+struct P { n:u32, outPos:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       logits : array<f32>;
+@group(0) @binding(1) var<storage, read_write> pV : array<f32>;
+@group(0) @binding(2) var<storage, read_write> pI : array<u32>;
+@group(0) @binding(3) var<uniform>             p  : P;
+var<workgroup> sv : array<f32, ${ARGMAX_WG}>;
+var<workgroup> si : array<u32, ${ARGMAX_WG}>;
+@compute @workgroup_size(${ARGMAX_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  var bv=-3.0e38; var bi=0u;
+  var i = wg.x*${ARGMAX_WG}u + lid.x;
+  loop { if (i>=p.n) {break;} let v=logits[i]; if (v>bv){bv=v;bi=i;} i=i+${AMAX_WGS * ARGMAX_WG}u; }
+  sv[lid.x]=bv; si[lid.x]=bi; workgroupBarrier();
+  var s=${ARGMAX_WG}u/2u;
+  loop { if(s==0u){break;} if(lid.x<s){ if(sv[lid.x+s]>sv[lid.x]){sv[lid.x]=sv[lid.x+s];si[lid.x]=si[lid.x+s];} } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u){ pV[wg.x]=sv[0]; pI[wg.x]=si[0]; }
+}`;
+  const AMAX_P2_WGSL = `
+struct P { n:u32, outPos:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       pV : array<f32>;
+@group(0) @binding(1) var<storage, read>       pI : array<u32>;
+@group(0) @binding(2) var<storage, read_write> tok: array<u32>;
+@group(0) @binding(3) var<uniform>             p  : P;
+var<workgroup> sv : array<f32, ${AMAX_WGS}>;
+var<workgroup> si : array<u32, ${AMAX_WGS}>;
+@compute @workgroup_size(${AMAX_WGS},1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  sv[lid.x]=pV[lid.x]; si[lid.x]=pI[lid.x]; workgroupBarrier();
+  var s=${AMAX_WGS}u/2u;
+  loop { if(s==0u){break;} if(lid.x<s){ if(sv[lid.x+s]>sv[lid.x]){sv[lid.x]=sv[lid.x+s];si[lid.x]=si[lid.x+s];} } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u){ tok[p.outPos]=si[0]; }
+}`;
+  let _amaxV = null, _amaxI = null;
+  function argmaxKernel(logitsBuf, tokHistBuf, N, outPos) {
+    if (!_amaxV) { _amaxV = E.createBuffer(AMAX_WGS * 4, ST(), 'amV'); _amaxI = E.createBuffer(AMAX_WGS * 4, ST(), 'amI'); }
+    const p = uniform(new Uint32Array([N, outPos, 0, 0]));
+    E.dispatch(E.getPipeline('lfm25.amaxP1', AMAX_P1_WGSL), [logitsBuf, _amaxV, _amaxI, p], [AMAX_WGS, 1, 1]);
+    return E.dispatch(E.getPipeline('lfm25.amaxP2', AMAX_P2_WGSL), [_amaxV, _amaxI, tokHistBuf, p], [1, 1, 1]);
+  }
+
   // ---- forward state --------------------------------------------------------------
   const MAX_SEQ = 2048;   // bring-up context
   let _scr = null, _kv = null, _conv = null, _idsBuf = null;
@@ -1067,7 +1114,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
       qr: mk(T * C.nHeads * C.headDim, 'qr'), kr: mk(T * C.nKvHeads * C.headDim, 'kr'),
       attn: mk(T * C.nHeads * C.headDim, 'at'),
       gate: mk(T * I, 'g'), up: mk(T * I, 'u'), swi: mk(T * I, 's'),
-      last: mk(H, 'last'), logits: mk(C.vocab, 'lg'),
+      last: mk(H, 'last'), logits: mk(C.vocab, 'lg'), tokHist: E.createBuffer(MAX_SEQ * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'th'),
       // MoE scratch (harmless on dense models): expert output [H], router logits [nE], top-k idx/wt,
       // and the GPU-resident indexed-dispatch buffers [K,eI]/[K,H]
       eout: mk(H, 'eo'), rlogits: mk(Math.max(C.nExperts || 1, 1), 'rl'), ridx: mk(Math.max(C.topK || 1, 1), 'ri'), rwt: mk(Math.max(C.topK || 1, 1), 'rw'),
@@ -1084,21 +1131,29 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
     const kill = (o) => { for (const k in o) { const v = o[k]; if (v && v.destroy) try { v.destroy(); } catch (_) {} else if (v && typeof v === 'object') kill(v); } };
     if (_scr) kill(_scr); if (_kv) kill(_kv); if (_conv) kill(_conv);
     if (_idsBuf) try { _idsBuf.destroy(); } catch (_) {}
-    _scr = null; _kv = null; _conv = null; _idsBuf = null;
+    try { if (_amaxV) _amaxV.destroy(); if (_amaxI) _amaxI.destroy(); } catch (_) {}
+    _scr = null; _kv = null; _conv = null; _idsBuf = null; _amaxV = null; _amaxI = null;
   }
 
-  // One forward over T ≤ 32 tokens at absolute positions [posBase, posBase+T).
-  // Returns nothing; caller reads logits (computed for the LAST token only).
-  async function forward(idsArr, posBase) {
-    const C = _cfg, H = C.hidden, T = idsArr.length, S = posBase + T;
+  // One forward over T tokens at absolute positions [posBase, posBase+T).
+  // opts.chain: embed reads the GPU token history at posBase (no CPU ids) — for chained decode.
+  // opts.argmax: GPU-argmax the final logits into tokHist[posBase+T] (so the next chained
+  //   forward's embed reads it) instead of leaving logits for a CPU readback.
+  // opts.batched: caller owns beginBatch/endBatch (lets many forwards chain in one submit).
+  async function forward(idsArr, posBase, opts) {
+    opts = opts || {};
+    const C = _cfg, H = C.hidden, T = opts.chain ? 1 : idsArr.length, S = posBase + T;
     const W = (n) => _weights[n];
     _ensureState();
-    if (!_idsBuf) _idsBuf = E.createBuffer(MATVEC_MAXT * 4, U.STORAGE | U.COPY_DST, 'ids');
-    E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(idsArr));
-    uniformReset();
-    E.beginBatch();
     const s = _scr;
-    await embedGather(_idsBuf, W('model.embed_tokens.weight').buf, s.x, T, H);
+    if (!opts.chain) {
+      if (!_idsBuf) _idsBuf = E.createBuffer(MATVEC_MAXT * 4, U.STORAGE | U.COPY_DST, 'ids');
+      E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(idsArr));
+    }
+    uniformReset();
+    if (!opts.batched) E.beginBatch();
+    if (opts.chain) await embedGather(s.tokHist, W('model.embed_tokens.weight').buf, s.x, T, H, posBase);
+    else await embedGather(_idsBuf, W('model.embed_tokens.weight').buf, s.x, T, H, 0);
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'operator_norm.weight').buf, s.normed, T, H, C.rmsEps);
@@ -1166,40 +1221,85 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
     await rmsnorm(s.x, W('model.embedding_norm.weight').buf, s.normed, T, H, C.rmsEps);
     E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
     await matvecQ(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
-    await E.endBatch();
+    if (opts.argmax) await argmaxKernel(s.logits, s.tokHist, C.vocab, posBase + T);   // GPU argmax → tokHist (no CPU roundtrip)
+    if (!opts.batched) await E.endBatch();
   }
 
+  async function readU32Range(buf, idx, count) {
+    const bytes = count * 4;
+    const staging = E.createBuffer(bytes, U.COPY_DST | U.MAP_READ, 'rd');
+    const enc = E.device().createCommandEncoder();
+    enc.copyBufferToBuffer(buf, idx * 4, staging, 0, bytes);
+    E.device().queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap(); staging.destroy();
+    return out;
+  }
+
+  const GEN_BATCH = 8;   // decode tokens chained GPU-resident per submit (1 readback per batch)
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     if (!_loaded) throw new Error('loadModel first');
     const C = _cfg;
-    // fresh generation: conv states start cold (posBase 0 → useState=0) and KV restarts
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long for bring-up MAX_SEQ');
+    // chained decode needs the GPU-resident path (no mid-forward readback); the __noMoePack
+    // fallback can't chain, so it uses per-token CPU argmax.
+    const chainable = !(C.moe && globalThis.__noMoePack);
     let pos = 0;
-    const CH = C.moe ? 1 : MATVEC_MAXT;   // MoE bring-up runs T=1 everywhere (per-token routing); dense chunks at 32
-    for (let off = 0; off < ids.length; off += CH) {
+    const CH = C.moe ? 1 : MATVEC_MAXT;   // MoE runs T=1 (per-token routing); dense chunks at 32
+    for (let off = 0; off < ids.length; off += CH) {   // prefill; last forward GPU-argmaxes → tokHist[L]
       if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
       const chunk = ids.slice(off, Math.min(off + CH, ids.length));
-      await forward(chunk, pos); pos += chunk.length;
+      await forward(chunk, pos, { argmax: chainable && (off + CH >= ids.length) });
+      pos += chunk.length;
     }
-    const outIds = [];
-    const imEnd = TOK.imEnd();
-    let _amMs = 0, _fwdMs = 0;   // profiling: CPU-argmax(+readback) vs forward-compute wall time
-    for (let i = 0; i < maxTokens; i++) {
-      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-      const ta = performance.now();
-      const logits = await E.readF32(_scr.logits, C.vocab);   // CPU argmax (bring-up)
-      let best = 0, bv = -Infinity;
-      for (let j = 0; j < C.vocab; j++) if (logits[j] > bv) { bv = logits[j]; best = j; }
-      _amMs += performance.now() - ta;
-      if (best === C.eos || best === imEnd) break;
-      outIds.push(best);
-      if (onToken) { try { onToken(TOK.decode(outIds.slice(-4)).slice(-24), best); } catch (_) {} }
-      const tf = performance.now();
-      await forward([best], pos); pos++;
-      _fwdMs += performance.now() - tf;
+    const outIds = [], imEnd = TOK.imEnd();
+    if (chainable) {
+      // GPU-RESIDENT chained decode: GEN_BATCH forwards in one submit (embed←tokHist, argmax→tokHist),
+      // ONE readback per batch. Removes the per-token CPU roundtrip that starved GPU submit windows.
+      let _fwdMs = 0, _rbMs = 0;
+      // The FIRST token was argmax'd by the last prefill forward into tokHist[L]; emit it, then
+      // the chained forwards consume it as input and produce tokHist[L+1..].
+      let stopped = false;
+      { const f = (await readU32Range(_scr.tokHist, ids.length, 1))[0];
+        if (f === C.eos || f === imEnd) stopped = true;
+        else { outIds.push(f); if (onToken) { try { onToken(TOK.decode([f]), f); } catch (_) {} } } }
+      while (!stopped && outIds.length < maxTokens) {
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
+        if (K <= 0) break;
+        const tf = performance.now();
+        E.beginBatch();
+        for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, argmax: true, batched: true });
+        await E.endBatch();
+        _fwdMs += performance.now() - tf;
+        const tr = performance.now();
+        const toks = await readU32Range(_scr.tokHist, pos + 1, K);   // the K tokens argmax'd this batch
+        _rbMs += performance.now() - tr;
+        for (let k = 0; k < K; k++) { const t = toks[k]; if (t === C.eos || t === imEnd) { stopped = true; break; } outIds.push(t); if (onToken) { try { onToken(TOK.decode(outIds.slice(-4)).slice(-24), t); } catch (_) {} } }
+        pos += K;
+        if (stopped) break;
+      }
+      _lastProf = { mode: 'chained', batch: GEN_BATCH, forward_ms_per_tok: +(_fwdMs / Math.max(1, outIds.length)).toFixed(1), readback_ms_per_tok: +(_rbMs / Math.max(1, outIds.length)).toFixed(1) };
+    } else {
+      let _amMs = 0, _fwdMs = 0;   // fallback: per-token CPU argmax (readback path)
+      for (let i = 0; i < maxTokens; i++) {
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        const ta = performance.now();
+        const logits = await E.readF32(_scr.logits, C.vocab);
+        let best = 0, bv = -Infinity;
+        for (let j = 0; j < C.vocab; j++) if (logits[j] > bv) { bv = logits[j]; best = j; }
+        _amMs += performance.now() - ta;
+        if (best === C.eos || best === imEnd) break;
+        outIds.push(best);
+        if (onToken) { try { onToken(TOK.decode(outIds.slice(-4)).slice(-24), best); } catch (_) {} }
+        const tf = performance.now();
+        await forward([best], pos); pos++;
+        _fwdMs += performance.now() - tf;
+      }
+      _lastProf = { mode: 'cpu-argmax', argmax_ms_per_tok: +(_amMs / Math.max(1, outIds.length)).toFixed(1), forward_ms_per_tok: +(_fwdMs / Math.max(1, outIds.length)).toFixed(1) };
     }
-    _lastProf = { argmax_ms_per_tok: +(_amMs / Math.max(1, outIds.length)).toFixed(1), forward_ms_per_tok: +(_fwdMs / Math.max(1, outIds.length)).toFixed(1) };
     try { console.log('[lfm25 prof] ' + JSON.stringify(_lastProf)); } catch (_) {}
     return TOK.decode(outIds);
   }
