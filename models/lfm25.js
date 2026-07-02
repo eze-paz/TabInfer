@@ -750,6 +750,67 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, yBuf, d], [gx, gy, 1]);
   }
 
+  // Efficient T=1 int4 GEMV: GEMVQ_NR output rows per workgroup (input reused across the
+  // block in registers), subgroupAdd reduction — the design idxGemv/qwen use. Measured ~3×
+  // the old 1-row matvecQ. acc=1 → y += result (fused residual). y=[N].
+  const GEMV_WG = 64, GEMVQ_NR = 8;   // shared by gemvQ8 + idxGemv
+  const GEMVQ8_WGSL = `
+enable f16;
+enable subgroups;
+struct D { N:u32, K:u32, acc:u32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;
+@group(0) @binding(3) var<storage, read_write> y  : array<f32>;
+@group(0) @binding(4) var<uniform>             d  : D;
+var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let nBase = (wg.x + wg.y*nwg.x) * ${GEMVQ_NR}u;
+  let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
+  var acc : array<f32, ${GEMVQ_NR}>;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { acc[r] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = x[2u*w]; let xc = x[2u*w + 1u];
+    let grp = (w*8u)/${QGROUP}u;
+    for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+      let n = nBase + r; if (n >= d.N) { continue; }
+      let p = W[n*words + w];
+      let s = f32(sc[n*gpr + grp]);
+      let lo = vec4<f32>(unpack4xU8(p & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      let hi = vec4<f32>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+      acc[r] = acc[r] + s*( dot(vec4<f32>(lo.x,hi.x,lo.y,hi.y), xa) + dot(vec4<f32>(lo.z,hi.z,lo.w,hi.w), xc) );
+    }
+    w = w + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+    let ss = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${GEMVQ_NR}u) {
+    let n = nBase + lid.x;
+    if (n < d.N) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
+      y[n] = select(0.0, y[n], d.acc != 0u) + t;
+    }
+  }
+}`;
+  function gemvQ8(xBuf, rec, yBuf, N, K, acc) {
+    const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
+    const pipe = E.getPipeline('lfm25.gemvQ8', GEMVQ8_WGSL);
+    const nWG = Math.ceil(N / GEMVQ_NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, yBuf, d], [gx, gy, 1]);
+  }
+  // route T=1 to the fast 8-row GEMV; batched (prefill) T>1 stays on matvecQ
+  function mv(xBuf, rec, yBuf, T, N, K, acc) { return T === 1 ? gemvQ8(xBuf, rec, yBuf, N, K, acc) : matvecQ(xBuf, rec, yBuf, T, N, K, acc); }
+
   const RMSNORM_WGSL = `
 enable f16;
 struct P { T:u32, H:u32, eps:f32, _p:u32 };
@@ -972,7 +1033,6 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
   // GPU → runs expert e=idx[k]'s block (rows e*N..), input at k*inStride (0 for w1/w3 which
   // share `normed`; eI for w2 whose input is per-expert act[k]), output at k*N. No readback:
   // the whole MoE block stays batched. GEMVQ_NR rows/workgroup, subgroupAdd reduction.
-  const GEMV_WG = 64, GEMVQ_NR = 8;
   const IDXGEMV_WGSL = `
 enable f16;
 enable subgroups;
@@ -1158,23 +1218,23 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const p = 'model.layers.' + l + '.';
       await rmsnorm(s.x, W(p + 'operator_norm.weight').buf, s.normed, T, H, C.rmsEps);
       if (_conv[l]) {   // conv mixer
-        await matvecQ(s.normed, W(p + 'conv.in_proj.weight'), s.bcx, T, 3 * H, H);
+        await mv(s.normed, W(p + 'conv.in_proj.weight'), s.bcx, T, 3 * H, H);
         const st = _conv[l];
         const sIn = st.cur === 0 ? st.a : st.b, sOut = st.cur === 0 ? st.b : st.a;
         await shortConv(s.bcx, W(p + 'conv.conv.weight').buf, sIn, sOut, s.convy, T, H, C.convL, posBase > 0);
         st.cur ^= 1;
-        await matvecQ(s.convy, W(p + 'conv.out_proj.weight'), s.x, T, H, H, true);   // + residual
+        await mv(s.convy, W(p + 'conv.out_proj.weight'), s.x, T, H, H, true);   // + residual
       } else {          // GQA attention
         const nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim;
-        await matvecQ(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
-        await matvecQ(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
-        await matvecQ(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+        await mv(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+        await mv(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+        await mv(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
         await ropeQK(s.q, W(p + 'self_attn.q_layernorm.weight').buf, s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
         await ropeQK(s.k, W(p + 'self_attn.k_layernorm.weight').buf, s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
         E.copyBuffer(s.kr, 0, _kv[l].k, posBase * nKv * hd * 4, T * nKv * hd * 4);
         E.copyBuffer(s.v, 0, _kv[l].v, posBase * nKv * hd * 4, T * nKv * hd * 4);
         await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
-        await matvecQ(s.attn, W(p + 'self_attn.out_proj.weight'), s.x, T, H, nHq * hd, true);   // + residual
+        await mv(s.attn, W(p + 'self_attn.out_proj.weight'), s.x, T, H, nHq * hd, true);   // + residual
       }
       await rmsnorm(s.x, W(p + 'ffn_norm.weight').buf, s.normed, T, H, C.rmsEps);
       if (C.moe && l >= C.denseLayers) {
@@ -1185,7 +1245,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         // readback is the correctness-first shortcut; the GPU-resident indexed dispatch over
         // packed expert tensors (no readback) is the queued optimization.
         const nE = C.nExperts, K = C.topK, eI = C.expertI;
-        await matvecQ(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, 1, nE, H);   // router logits
+        await mv(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, 1, nE, H);   // router logits
         await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, 1, nE, K);
         if (_weights['moe.' + l + '.w1']) {
           // GPU-RESIDENT indexed dispatch — no readback, whole block stays batched.
@@ -1212,15 +1272,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         }
       } else {
         const I = C.ffI;
-        await matvecQ(s.normed, W(p + 'feed_forward.w1.weight'), s.gate, T, I, H);
-        await matvecQ(s.normed, W(p + 'feed_forward.w3.weight'), s.up, T, I, H);
+        await mv(s.normed, W(p + 'feed_forward.w1.weight'), s.gate, T, I, H);
+        await mv(s.normed, W(p + 'feed_forward.w3.weight'), s.up, T, I, H);
         await swiglu(s.gate, s.up, s.swi, T * I);
-        await matvecQ(s.swi, W(p + 'feed_forward.w2.weight'), s.x, T, H, I, true);              // + residual
+        await mv(s.swi, W(p + 'feed_forward.w2.weight'), s.x, T, H, I, true);              // + residual
       }
     }
     await rmsnorm(s.x, W('model.embedding_norm.weight').buf, s.normed, T, H, C.rmsEps);
     E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
-    await matvecQ(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
+    await mv(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
     if (opts.argmax) await argmaxKernel(s.logits, s.tokHist, C.vocab, posBase + T);   // GPU argmax → tokHist (no CPU roundtrip)
     if (!opts.batched) await E.endBatch();
   }
@@ -1305,7 +1365,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
   let _lastProf = null;
 
-  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf };
+  // GPU-timestamp per-kernel breakdown of ONE decode forward (the real bottleneck map).
+  async function _benchDecode(prompt) {
+    if (!_loaded) throw new Error('loadModel first');
+    const C = _cfg;
+    const ids = TOK.encodeChat([{ role: 'user', content: (prompt || 'Hello, tell me about yourself.') }]);
+    let pos = 0; const CH = C.moe ? 1 : MATVEC_MAXT;
+    for (let off = 0; off < ids.length; off += CH) { const chunk = ids.slice(off, Math.min(off + CH, ids.length)); await forward(chunk, pos, { argmax: off + CH >= ids.length }); pos += chunk.length; }
+    E.beginBatch(); await forward(null, pos, { chain: true, argmax: true, batched: true }); await E.endBatch(); pos++;   // warm
+    E.beginProfile(1024); E.beginBatch();
+    await forward(null, pos, { chain: true, argmax: true, batched: true });
+    await E.endBatch();
+    const prof = await E.endProfile();
+    const agg = {}; let total = 0;
+    for (const r of prof) { agg[r.label] = (agg[r.label] || 0) + r.us; total += r.us; }
+    const rows = Object.entries(agg).map(([k, v]) => ({ k, us: +v.toFixed(0), n: prof.filter(x => x.label === k).length })).sort((a, b) => b.us - a.us);
+    return { total_ms: +(total / 1000).toFixed(1), n_dispatch: prof.length, rows };
+  }
+
+  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, _benchDecode };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
