@@ -1830,6 +1830,35 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
                        : [kBuf, kwBuf, vBuf, kv.kq, kv.ks, kv.vq, kv.vs, p];
     return E.dispatch(pipe, [...bufs], [(fuseQ ? nHq : 0) + 2 * nKv, 1, 1]);
   }
+  // K/V-only prep (MoD-style layer skip): rope+quantize k and quantize v into the KV cache
+  // WITHOUT touching q — the skipped layer still contributes correct K/V rows so FUTURE
+  // tokens attend a coherent cache, while this token's hidden state passes through untouched.
+  function attnPrepKvOnly(kBuf, vBuf, kwBuf, kv, nHq, nKv, hd, posBase, theta, eps) {
+    const u = new Uint32Array(8); const dv = new DataView(u.buffer);
+    dv.setUint32(0, nHq, true); dv.setUint32(4, nKv, true); dv.setUint32(8, hd, true);
+    dv.setUint32(12, posBase, true); dv.setFloat32(16, theta, true); dv.setFloat32(20, eps, true);
+    const p = uniform(u);
+    const pipe = E.getPipeline('q3.attnPrep.kv', attnPrepWgsl(false));
+    return E.dispatch(pipe, [kBuf, kwBuf, vBuf, kv.kq, kv.ks, kv.vq, kv.vs, p], [2 * nKv, 1, 1]);
+  }
+  // MoD-style DECODE layer skipping (experiment, OFF by default). NOT true Mixture-of-Depths
+  // (no trained router) — a training-free heuristic: during decode (never prefill), layers in
+  // the configured band are reduced to norm + k/v projection + KV write (identity residual);
+  // q/attention/o_proj/MLP are skipped (~2/3 of the layer's decode cost). Configure via
+  // globalThis.__modSkip = { lo: 6, hi: 24, every: 4 } (skip layers lo ≤ l < hi where
+  // (l-lo) % every === 0), or falsy to disable.
+  // MEASURED VERDICT (2026-07-02, Qwen3-0.6B): quality COLLAPSES — skipping even 5/28 layers
+  // degenerates output into repetition loops; 9/28 is word salad. A 28-layer 0.6B has no
+  // spare layer redundancy and no trained router to route around the holes. Kept (off) as
+  // the hook for future LayerSkip/MoD-trained checkpoints or larger models only.
+  function _modSkipSet(numLayers) {
+    const c = globalThis.__modSkip;
+    if (!c || !c.every) return null;
+    const lo = c.lo | 0, hi = Math.min(c.hi | 0 || numLayers - 1, numLayers - 1), ev = Math.max(1, c.every | 0);
+    const s = new Set();
+    for (let l = Math.max(1, lo); l < hi; l++) if ((l - lo) % ev === 0) s.add(l);
+    return s.size ? s : null;
+  }
   // Persistent scratch for the split partials (grown by head count, freed in unload()).
   let _decSplit = null, _decSplitDead = [];
   function ensureDecSplit(nHq) {
@@ -3303,8 +3332,21 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // a single multi-second submit would trip the OS GPU watchdog / TDR).
     E.beginBatch(T === 1 ? Infinity : undefined);
     await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
+    const modSkip = (T === 1 && _kvQ8) ? _modSkipSet(C.numLayers) : null;   // decode-only layer skip (experiment)
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
+      if (modSkip && modSkip.has(l)) {
+        // MoD-style skip: keep the KV cache coherent (k/v projections + quantized write) but
+        // pass the hidden state through untouched — q/attention/o_proj/MLP don't run. The
+        // residual adds are fused into the skipped GEMVs (acc=true), so skipping them IS the
+        // identity: s.x is simply not modified by this layer.
+        const kW = Wq(p + 'self_attn.k_proj.weight'), vW = Wq(p + 'self_attn.v_proj.weight');
+        rmsnormQ(s.x, W(p + 'input_layernorm.weight'), H, C.rmsEps);
+        gemvDP4_only(kW.pack, kW.scales, s.k, nKv * hd, H);
+        gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
+        attnPrepKvOnly(s.k, s.v, W(p + 'self_attn.k_norm.weight'), _kv[l], nHq, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
+        continue;
+      }
       // Attention input norm → q/k/v. DECODE (T=1) is the fused int8 path: rmsnormQ emits the
       // per-group int8 activation DIRECTLY from the norm (no separate quantize dispatch) and
       // q/k/v all read that one quantized vector. PREFILL (T>1) keeps rmsnorm + linearQ.
