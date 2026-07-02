@@ -2234,6 +2234,35 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return E.dispatch(E.getPipeline('q3.logitMask', LOGITMASK_WGSL), [logitsBuf, _gmaskBuf, p], [Math.ceil(N / 256), 1, 1]);
   }
 
+  // ---- Gumbel-max temperature sampling ------------------------------------------------
+  // argmax(logits + T·g) with g = -log(-log(u)), u~U(0,1) is an EXACT sample from
+  // softmax(logits/T) — temperature sampling with NO softmax pass and NO readback, so the
+  // batched GPU-resident decode loop keeps working (each forward bakes its own seed into
+  // its pooled uniform at record time). Composes with the grammar mask: masked logits sit
+  // at -3e38 and T·g (≤ ~30·T) can never resurrect them. INTERNAL API (harness roles need
+  // per-call temperature); deliberately NOT exposed in provider settings — greedy stays the
+  // default everywhere (temperature was removed from local-backend UI by design).
+  const GUMBEL_WGSL = `
+struct P { n:u32, seed:u32, temp:f32, _c:u32 };
+@group(0) @binding(0) var<storage, read_write> logits : array<f32>;
+@group(0) @binding(1) var<uniform>             p      : P;
+fn pcg(v0:u32) -> u32 { var v = v0*747796405u + 2891336453u; let w = ((v >> ((v >> 28u) + 4u)) ^ v)*277803737u; return (w >> 22u) ^ w; }
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){
+  let i = gid.x; if (i >= p.n) { return; }
+  let h = pcg(i ^ (p.seed*2654435761u));
+  let u = (f32(h >> 8u) + 0.5) / 16777216.0;         // (0,1), never 0 or 1
+  logits[i] = logits[i] + p.temp * (-log(-log(u)));   // Gumbel(0,1) scaled by T
+}`;
+  let _rngSeed = 0x9E3779B9 >>> 0;   // per-forward seed stream (advanced on every sampled step)
+  function gumbelNoise(logitsBuf, N, temp) {
+    _rngSeed = (Math.imul(_rngSeed, 1664525) + 1013904223) >>> 0;
+    const u = new Uint32Array(4); const dv = new DataView(u.buffer);
+    dv.setUint32(0, N, true); dv.setUint32(4, _rngSeed, true); dv.setFloat32(8, temp, true);
+    const p = uniform(u);
+    return E.dispatch(E.getPipeline('q3.gumbel', GUMBEL_WGSL), [logitsBuf, p], [Math.ceil(N / 256), 1, 1]);
+  }
+
   // ============================================================
   // Self-tests — each kernel vs a CPU reference. Returns {name, ok, err}[].
   // ============================================================
@@ -2677,6 +2706,26 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       const enc=E.device().createCommandEncoder(); const st=E.createBuffer(16,U.COPY_DST|U.MAP_READ,'sm'); enc.copyBufferToBuffer(ob,0,st,0,16); E.device().queue.submit([enc.finish()]);
       await st.mapAsync(GPUMapMode.READ); const idx=new Uint32Array(st.getMappedRange())[0]; st.unmap(); st.destroy();
       check('logitMask + argmax', idx===44444?0:1);
+      [ab,ob].forEach(b=>b.destroy());
+    }
+    // --- gumbel temperature sampling: frequencies must track softmax(logits/T) ---
+    {
+      const N=1024; const base=new Float32Array(N); base.fill(-100);
+      base[5]=2.0; base[9]=1.0;                       // P(5)/P(9) = e at T=1
+      const ab=f32buf(base), ob=E.createBuffer(4, ST(),'og');
+      const readIdx=async()=>{ const enc=E.device().createCommandEncoder(); const st=E.createBuffer(4,U.COPY_DST|U.MAP_READ,'sg'); enc.copyBufferToBuffer(ob,0,st,0,4); E.device().queue.submit([enc.finish()]); await st.mapAsync(GPUMapMode.READ); const v=new Uint32Array(st.getMappedRange())[0]; st.unmap(); st.destroy(); return v; };
+      let c5=0,c9=0,other=0;
+      for(let i=0;i<240;i++){
+        E.device().queue.writeBuffer(ab,0,base.buffer,0,base.byteLength);   // restore (kernel mutates in place)
+        await gumbelNoise(ab,N,1.0); await argmaxKernel(ab,ob,N,0);
+        const v=await readIdx(); if(v===5)c5++; else if(v===9)c9++; else other++;
+      }
+      // e ≈ 2.72 → expect c5/c9 ≈ e; wide tolerance for 240 samples; `other` must be 0
+      const ratio=c5/Math.max(1,c9);
+      check('gumbel T=1 distribution', (other===0 && ratio>1.6 && ratio<4.6)?0:1);
+      let det=0;
+      for(let i=0;i<10;i++){ E.device().queue.writeBuffer(ab,0,base.buffer,0,base.byteLength); await gumbelNoise(ab,N,0.02); await argmaxKernel(ab,ob,N,0); if(await readIdx()===5)det++; }
+      check('gumbel T→0 ≈ greedy', det===10?0:1);
       [ab,ob].forEach(b=>b.destroy());
     }
     return out;
@@ -3412,6 +3461,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
       await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
       if (opts && opts.maskLogits) logitMask(s.logits, C.vocab);   // grammar mask (P4) — caller wrote _gmaskBuf
+      if (opts && opts.temp > 0) gumbelNoise(s.logits, C.vocab, opts.temp);   // temperature sampling (after mask: -3e38 stays dominated)
       // GPU-side greedy argmax → write the predicted token straight into the token
       // history at the NEXT position (posBase+T), so the next forward's embed reads it.
       await argmaxKernel(s.logits, _tokHist, C.vocab, posBase + T);
@@ -3477,14 +3527,14 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // is still its own bounded submit (no single giant submit → no TDR). On stop/abort
   // we stop emitting immediately and discard the ≤PIPE_DEPTH-1 already-queued batches
   // (bounded wasted compute + bounded KV overrun, both harmless).
-  async function decodeLoop(pos, maxTokens, emitTok, signal, count) {
+  async function decodeLoop(pos, maxTokens, emitTok, signal, count, temp) {
     let submitted = 0;
     const submitBatch = async () => {
       if (signal && signal.aborted) return null;
       const K = Math.min(GEN_BATCH, MAX_SEQ - 1 - pos, maxTokens + GEN_BATCH - submitted);
       if (K <= 0) return null;
       const base = pos;
-      for (let k = 0; k < K; k++) await forward(null, base + k, { chain: true, submitOnly: true });
+      for (let k = 0; k < K; k++) await forward(null, base + k, { chain: true, submitOnly: true, temp });
       pos += K; submitted += K;
       return { read: readU32Range(_tokHist, base + 1, K), K };   // copy submit enqueued AFTER the forwards
     };
@@ -3522,7 +3572,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   }
   // Per-token constrained loop from position `pos` (= L + count() - 1). Returns
   // { used, ok } — ok=false means the grammar died (bug/edge) → caller resumes free decode.
-  async function _decodeConstrained(pos, grammar, pushTok, signal, budget) {
+  async function _decodeConstrained(pos, grammar, pushTok, signal, budget, temp) {
     // discarded pipelined batches may still be writing _tokHist on the GPU — drain first
     // so our forced writeBuffer/argmax results can't be clobbered by stale in-flight work.
     await E.device().queue.onSubmittedWorkDone();
@@ -3551,7 +3601,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       } else {
         if (!_gmaskBuf) _gmaskBuf = E.createBuffer(Math.ceil(CONFIG.vocab / 32) * 4, U.STORAGE | U.COPY_DST, 'gmask');
         E.device().queue.writeBuffer(_gmaskBuf, 0, nx.maskWords.buffer, nx.maskWords.byteOffset, nx.maskWords.byteLength);
-        t = await forward(null, pos, { chain: true, maskLogits: true });
+        t = await forward(null, pos, { chain: true, maskLogits: true, temp });
         if (!grammar.advance(t)) { pushTok(t); pos++; used++; return { used, ok: false }; }
       }
       pushTok(t); pos++; used++;
@@ -3561,7 +3611,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Driver: batched decode until '<tool_call>' appears in the emitted text, then the
   // constrained loop for the span, then back to batched — repeat until stop/budget.
   const GRAMMAR_TRIGGER = '<tool_call>';
-  async function decodeWithGrammar(L, maxTokens, pushTok, signal, count, grammar, getText) {
+  async function decodeWithGrammar(L, maxTokens, pushTok, signal, count, grammar, getText, temp) {
     let trig = null, lastTrigLen = -1;
     const wrapped = (t) => {
       if (!pushTok(t)) return false;
@@ -3578,10 +3628,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     };
     while (count() < maxTokens) {
       trig = null;
-      await decodeLoop(L + count() - 1, maxTokens, wrapped, signal, count);
+      await decodeLoop(L + count() - 1, maxTokens, wrapped, signal, count, temp);
       if (trig == null) return;              // genuine stop (STOP token / budget / abort)
       if (grammar.reset(trig)) {
-        const r = await _decodeConstrained(L + count() - 1, grammar, pushTok, signal, maxTokens - count());
+        const r = await _decodeConstrained(L + count() - 1, grammar, pushTok, signal, maxTokens - count(), temp);
         if (!r.ok) _gdbg('grammar span ended without done — phase=' + grammar.phase() + ' used=' + r.used + ' (resuming free decode)');
       } else {
         await E.device().queue.onSubmittedWorkDone();   // residual didn't fit the grammar → free decode, but drain the discarded batches
@@ -3597,7 +3647,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   const GEN_BATCH = 32;   // tokens/GPU-resident batch (1 readback each) — big to amortize the
                           // vsync-throttled readback when the tab is focused (see decodeLoop).
   const PIPE_DEPTH = 3;   // batches kept in flight so the GPU never idles awaiting a readback.
-  async function generate(prompt, { maxTokens = 64, onToken, signal, toolNames } = {}) {
+  async function generate(prompt, { maxTokens = 64, onToken, signal, toolNames, temperature } = {}) {
     await loadModel({ variant: _variant });
     _cachedIds = null; _sysAnchor = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
@@ -3611,16 +3661,18 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       _growCtx(want);
     }
     let tok0;
+    const temp = temperature > 0 ? +temperature : 0;
     for (let off = 0; off < L; off += 256) {     // prefill → _tokHist[L]=token0
       if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-      tok0 = await forward(ids.slice(off, Math.min(off + 256, L)), off);
+      const last = off + 256 >= L;
+      tok0 = await forward(ids.slice(off, Math.min(off + 256, L)), off, last && temp ? { temp } : undefined);   // temperature applies to the FIRST sampled token too
     }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok0)) return TOK.decode(outIds);
     const grammar = toolNames && toolNames.length ? makeToolGrammar(toolNames) : null;
-    if (grammar) await decodeWithGrammar(L, maxTokens, emit, signal, () => outIds.length, grammar, () => TOK.decode(outIds.slice(-14)));
-    else await decodeLoop(pos, maxTokens, emit, signal, () => outIds.length);
+    if (grammar) await decodeWithGrammar(L, maxTokens, emit, signal, () => outIds.length, grammar, () => TOK.decode(outIds.slice(-14)), temp);
+    else await decodeLoop(pos, maxTokens, emit, signal, () => outIds.length, temp);
     return TOK.decode(outIds);
   }
 
@@ -4218,7 +4270,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
 
   // Stream from pre-encoded ids (same prefill+decode as generate(), but the
   // caller supplies the full chat token sequence and gets clean UTF-8 deltas).
-  async function _streamIds(ids, { maxTokens = 512, onToken, signal, grammar } = {}) {
+  async function _streamIds(ids, { maxTokens = 512, onToken, signal, grammar, temperature } = {}) {
+    const temp = temperature > 0 ? +temperature : 0;
     await loadModel({ variant: _variant });
     const L = ids.length;
     // Grow the allocated context JUST ENOUGH to fit this prompt + decode headroom (never the full
@@ -4271,7 +4324,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       for (let off = P; off < L; off += PREFILL_CHUNK) {
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
         const chunk = ids.slice(off, Math.min(off + PREFILL_CHUNK, L));
-        tok0 = await forward(chunk, off);                     // bounded submit (no TDR)
+        const last = off + PREFILL_CHUNK >= L;
+        tok0 = await forward(chunk, off, last && temp ? { temp } : undefined);   // bounded submit (no TDR); temp on the first sampled token
         if (_perfData) { _gpuMs += _perfData.gpu_drain_ms; _encMs += _perfData.encode_ms; }
       }
     } catch (e) {
@@ -4295,8 +4349,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       prevText = txt; return true;
     };
     if (!pushTok(tok0)) return prevText;
-    if (grammar) await decodeWithGrammar(L, maxTokens, pushTok, signal, () => outIds.length, grammar, () => prevText);
-    else await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length);
+    if (grammar) await decodeWithGrammar(L, maxTokens, pushTok, signal, () => outIds.length, grammar, () => prevText, temp);
+    else await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length, temp);
     const _te = performance.now();
     const _dms = _te - _tp1, _n = outIds.length;
     const _split = _pf ? (' | prefill split: encode=' + _pf.encode_ms + 'ms gpu=' + _pf.gpu_drain_ms + 'ms map=' + _pf.map_ms + 'ms') : '';
