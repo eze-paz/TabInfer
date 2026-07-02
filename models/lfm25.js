@@ -231,6 +231,45 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       check('lfm25 router (normalized weights)', maxAbs(gotW, refW), 1e-5);
       [lb, bb, ib, wb2].forEach(b => b.destroy());
     }
+    // --- MoE block: router → 2 experts → weighted combine (full dispatch composition) ---
+    {
+      const H = 64, nE = 8, K = 2, eI = 32;
+      const rnd = (n, s) => { const a = new Float32Array(n); let x = s; for (let i = 0; i < n; i++) { x = (x * 1103515245 + 12345) & 0x7fffffff; a[i] = (x / 0x3fffffff - 1) * 0.5; } return a; };
+      // f32 → int4 rec (+ dequantized copy so the CPU ref matches GPU dequant exactly)
+      const mk4 = (f32, N, Kd) => {
+        const u16 = new Uint16Array(N * Kd), t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+        for (let i = 0; i < N * Kd; i++) { t[0] = f32[i]; u16[i] = ti[0] >>> 16; }
+        const { pack, scales } = _quantInt4(u16, N, Kd);
+        const pb = E.createBuffer(pack.byteLength, ST(), 'tp'), sb = E.createBuffer(scales.byteLength, ST(), 'ts');
+        E.device().queue.writeBuffer(pb, 0, pack); E.device().queue.writeBuffer(sb, 0, scales);
+        const deq = new Float32Array(N * Kd);
+        for (let n = 0; n < N; n++) for (let g = 0; g < Kd / QGROUP; g++) { const sc = _f16ToF32s(scales[n * (Kd / QGROUP) + g]); for (let j = 0; j < QGROUP; j++) { const kk = g * QGROUP + j; const q = (pack[n * (Kd / 8) + (kk >> 3)] >>> (4 * (kk & 7))) & 0xF; deq[n * Kd + kk] = (q - 8) * sc; } }
+        return { rec: { pack: pb, scales: sb, N, K: Kd, int4: true }, deq };
+      };
+      const normed = rnd(H, 7);
+      const gate = mk4(rnd(nE * H, 11), nE, H);
+      const bias = rnd(nE, 13);
+      const experts = []; for (let e = 0; e < nE; e++) experts.push({ w1: mk4(rnd(eI * H, e * 3 + 1), eI, H), w3: mk4(rnd(eI * H, e * 3 + 2), eI, H), w2: mk4(rnd(H * eI, e * 3 + 3), H, eI) });
+      const nb = f32buf(normed), bb = f32buf(bias);
+      const rl = E.createBuffer(nE * 4, ST(), 'rl'), ri = E.createBuffer(K * 4, ST(), 'ri'), rw = E.createBuffer(K * 4, ST(), 'rw');
+      const g_ = E.createBuffer(eI * 4, ST(), 'g'), u_ = E.createBuffer(eI * 4, ST(), 'u'), sw = E.createBuffer(eI * 4, ST(), 's'), eo = E.createBuffer(H * 4, ST(), 'eo'), xo = f32buf(new Float32Array(H));
+      await matvecQ(nb, gate.rec, rl, 1, nE, H);
+      await router(rl, bb, ri, rw, 1, nE, K);
+      await E.device().queue.onSubmittedWorkDone();
+      const idx = new Uint32Array((await E.readF32(ri, K)).buffer), wt = await E.readF32(rw, K);
+      for (let k = 0; k < K; k++) { const e = idx[k]; await matvecQ(nb, experts[e].w1.rec, g_, 1, eI, H); await matvecQ(nb, experts[e].w3.rec, u_, 1, eI, H); await swiglu(g_, u_, sw, eI); await matvecQ(sw, experts[e].w2.rec, eo, 1, H, eI); await axpy(xo, eo, H, wt[k]); }
+      const got = await E.readF32(xo, H);
+      // CPU ref from the GPU's routing (router selection itself is covered by the router test)
+      const ref = new Float32Array(H);
+      for (let k = 0; k < K; k++) {
+        const e = idx[k], a = new Float32Array(eI);
+        for (let n = 0; n < eI; n++) { let d1 = 0, d3 = 0; for (let i = 0; i < H; i++) { d1 += normed[i] * experts[e].w1.deq[n * H + i]; d3 += normed[i] * experts[e].w3.deq[n * H + i]; } a[n] = (d1 / (1 + Math.exp(-d1))) * d3; }
+        for (let h = 0; h < H; h++) { let o = 0; for (let n = 0; n < eI; n++) o += a[n] * experts[e].w2.deq[h * eI + n]; ref[h] += wt[k] * o; }
+      }
+      check('lfm25 MoE block (route+experts+combine)', maxAbs(got, ref), 3e-3);
+      [nb, bb, rl, ri, rw, g_, u_, sw, eo, xo].forEach(b => b.destroy());
+      [gate, ...experts.flatMap(e => [e.w1, e.w3, e.w2])].forEach(o => { o.rec.pack.destroy(); o.rec.scales.destroy(); });
+    }
     return out;
   }
 
@@ -367,7 +406,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return { pack, scales };
   }
   // Quant plan by tensor name (lfm2 + lfm2_moe families).
-  const _isInt4 = (name) => /(_proj|\.w[123])\.weight$/.test(name) || /experts\.(gate_up_proj|down_proj)$/.test(name);
+  const _isInt4 = (name) => /(_proj|\.w[123]|feed_forward\.gate)\.weight$/.test(name);   // router gate int4 too (reuses matvecQ)
   const _isF32 = (name) => /expert_bias/.test(name);
 
   async function _uploadTensor(name, info, raw, sink) {
@@ -840,6 +879,23 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
     return E.dispatch(E.getPipeline('lfm25.swiglu', SWIGLU_WGSL), [gBuf, uBuf, yBuf, p], [gx, gy, 1]);
   }
 
+  // scaled residual add: x[i] += scale * v[i]  (MoE expert-output accumulation)
+  const AXPY_WGSL = `
+struct P { n:u32, scale:f32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read_write> x : array<f32>;
+@group(0) @binding(1) var<storage, read>       v : array<f32>;
+@group(0) @binding(2) var<uniform>             p : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i = gid.y*(nwg.x*64u)+gid.x; if (i >= p.n) { return; }
+  x[i] = x[i] + p.scale * v[i];
+}`;
+  function axpy(xBuf, vBuf, n, scale) {
+    const u = new Uint32Array(4); const dv = new DataView(u.buffer); dv.setUint32(0, n, true); dv.setFloat32(4, scale, true);
+    const c = Math.ceil(n / 64), gx = Math.min(c, 65535), gy = Math.ceil(c / gx);
+    return E.dispatch(E.getPipeline('lfm25.axpy', AXPY_WGSL), [xBuf, vBuf, uniform(u)], [gx, gy, 1]);
+  }
+
   // ---- forward state --------------------------------------------------------------
   const MAX_SEQ = 2048;   // bring-up context
   let _scr = null, _kv = null, _conv = null, _idsBuf = null;
@@ -858,6 +914,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
       attn: mk(T * C.nHeads * C.headDim, 'at'),
       gate: mk(T * I, 'g'), up: mk(T * I, 'u'), swi: mk(T * I, 's'),
       last: mk(H, 'last'), logits: mk(C.vocab, 'lg'),
+      // MoE scratch (harmless on dense models): expert output [H], router logits [nE], top-k idx/wt
+      eout: mk(H, 'eo'), rlogits: mk(Math.max(C.nExperts || 1, 1), 'rl'), ridx: mk(Math.max(C.topK || 1, 1), 'ri'), rwt: mk(Math.max(C.topK || 1, 1), 'rw'),
     };
     _kv = {}; _conv = {};
     for (let l = 0; l < C.numLayers; l++) {
@@ -907,11 +965,35 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
         await matvecQ(s.attn, W(p + 'self_attn.out_proj.weight'), s.x, T, H, nHq * hd, true);   // + residual
       }
       await rmsnorm(s.x, W(p + 'ffn_norm.weight').buf, s.normed, T, H, C.rmsEps);
-      const I = C.ffI;
-      await matvecQ(s.normed, W(p + 'feed_forward.w1.weight'), s.gate, T, I, H);
-      await matvecQ(s.normed, W(p + 'feed_forward.w3.weight'), s.up, T, I, H);
-      await swiglu(s.gate, s.up, s.swi, T * I);
-      await matvecQ(s.swi, W(p + 'feed_forward.w2.weight'), s.x, T, H, I, true);                // + residual
+      if (C.moe && l >= C.denseLayers) {
+        // Mixture-of-experts FFN (T=1). BRING-UP dispatch: compute the router on-GPU, read
+        // back the 4 chosen expert ids + weights, then run those 4 standard SwiGLU experts
+        // and weight-sum them into the residual. Each expert reuses the dense matvecQ/swiglu
+        // path (the checkpoint stores per-expert w1/w2/w3, not a fused tensor). The per-layer
+        // readback is the correctness-first shortcut; the GPU-resident indexed dispatch over
+        // packed expert tensors (no readback) is the queued optimization.
+        const nE = C.nExperts, K = C.topK, eI = C.expertI;
+        await matvecQ(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, 1, nE, H);   // router logits
+        await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, 1, nE, K);
+        await E.endBatch();                                     // drain to read the routing decision
+        const idx = new Uint32Array((await E.readF32(s.ridx, K)).buffer);
+        const wt = await E.readF32(s.rwt, K);
+        E.beginBatch();
+        for (let k = 0; k < K; k++) {
+          const ep = p + 'feed_forward.experts.' + idx[k] + '.';
+          await matvecQ(s.normed, W(ep + 'w1.weight'), s.gate, 1, eI, H);
+          await matvecQ(s.normed, W(ep + 'w3.weight'), s.up, 1, eI, H);
+          await swiglu(s.gate, s.up, s.swi, eI);
+          await matvecQ(s.swi, W(ep + 'w2.weight'), s.eout, 1, H, eI);
+          await axpy(s.x, s.eout, H, wt[k]);                    // x += wt[k] * expert_out
+        }
+      } else {
+        const I = C.ffI;
+        await matvecQ(s.normed, W(p + 'feed_forward.w1.weight'), s.gate, T, I, H);
+        await matvecQ(s.normed, W(p + 'feed_forward.w3.weight'), s.up, T, I, H);
+        await swiglu(s.gate, s.up, s.swi, T * I);
+        await matvecQ(s.swi, W(p + 'feed_forward.w2.weight'), s.x, T, H, I, true);              // + residual
+      }
     }
     await rmsnorm(s.x, W('model.embedding_norm.weight').buf, s.normed, T, H, C.rmsEps);
     E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
@@ -926,9 +1008,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long for bring-up MAX_SEQ');
     let pos = 0;
-    for (let off = 0; off < ids.length; off += MATVEC_MAXT) {   // chunked prefill (T ≤ 32)
+    const CH = C.moe ? 1 : MATVEC_MAXT;   // MoE bring-up runs T=1 everywhere (per-token routing); dense chunks at 32
+    for (let off = 0; off < ids.length; off += CH) {
       if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-      const chunk = ids.slice(off, Math.min(off + MATVEC_MAXT, ids.length));
+      const chunk = ids.slice(off, Math.min(off + CH, ids.length));
       await forward(chunk, pos); pos += chunk.length;
     }
     const outIds = [];

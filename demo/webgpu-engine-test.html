@@ -40,7 +40,8 @@
       <select id="model" style="background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:4px;padding:0.2rem;">
         <option value="qwen3">Qwen3-0.6B (~1.1GB)</option>
         <option value="qwen3-1.7b">Qwen3-1.7B (~3.9GB)</option>
-        <option value="lfm25-350m">LFM2.5-350M (~700MB — port bring-up: re-downloads each page load, no cache yet)</option>
+        <option value="lfm25-350m">LFM2.5-350M dense (~700MB — port bring-up)</option>
+        <option value="lfm25-8b">LFM2.5-8B-A1B MoE (~17GB download once → ~4.7GB cache; needs ~5GB free quota)</option>
       </select>
     </label>
     <button id="gen">Load model &amp; generate</button>
@@ -70,7 +71,7 @@
 <script src="../modules/webgpu-engine.js?v=46"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
 <script src="../modules/webgpu-qwen3.js?v=125"></script>
-<script src="../modules/webgpu-lfm25.js?v=4"></script>
+<script src="../modules/webgpu-lfm25.js?v=5"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -150,13 +151,14 @@
 
   async function runGen(stress) {
     const sel = $('model').value;
-    if (sel === 'lfm25-350m') {   // LFM2.5 port (Phase C bring-up path — greedy, MAX_SEQ 2048)
+    if (sel === 'lfm25-350m' || sel === 'lfm25-8b') {   // LFM2.5 port (Phase C bring-up — greedy, MAX_SEQ 2048)
       const L = window.SandpieLfm25;
+      const variant = sel === 'lfm25-8b' ? '8B-A1B' : '350M';
       $('gen').disabled = $('genStress').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
       try {
-        if (!L.isLoaded()) {
-          $('genstat').textContent = 'loading LFM2.5-350M (no quant cache yet — downloads ~700MB each page load)…';
-          await L.loadModel({ variant: '350M', onProgress: (p) => { $('genstat').textContent = p.phase + ' ' + (p.pct || 0) + '%'; } });
+        if (!L.isLoaded() || L.variant() !== variant) {
+          $('genstat').textContent = 'loading LFM2.5-' + variant + ' (first run downloads; cached after)…';
+          await L.loadModel({ variant, onProgress: (p) => { $('genstat').textContent = p.phase + ' ' + (p.pct || 0) + '%'; } });
         }
         $('genstat').textContent = 'generating…';
         const t0 = performance.now(); let n = 0;
