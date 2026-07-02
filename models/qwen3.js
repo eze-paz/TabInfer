@@ -1577,6 +1577,154 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     O[hq*hd4 + lid] = o / L;                    // T=1 ⇒ O row 0: O[hq*hd4 + d4]
   }
 }`;
+  // ---- int8-KV variant of the streaming split-KV decode kernel (P2) -----------
+  // Same structure as attnDecStreamWgsl, but K/V are read as per-QGROUP(32) symmetric
+  // int8: Kq/Vq are packed u32 words (4 int8 via pack4x8snorm — snorm stores x/maxabs,
+  // so the stored group scale IS maxabs and dequant = unpack4x8snorm(w)*scale), Ks/Vs
+  // hold one f32 scale per 32 elements. Decode attention is KV-BANDWIDTH-BOUND, so the
+  // 4× byte cut on the dominant stream is the point. The score loop hoists the group
+  // scale out of the inner dot (per-group partial × scale), keeping the 4-acc ILP.
+  // REQUIRES hd % 32 == 0 (quant groups never straddle a head row: 128→4, 64→2 groups).
+  function attnDecStreamQ8Wgsl() { return `
+struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, nsplit:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       Q  : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       Kq : array<u32>;
+@group(0) @binding(2) var<storage, read>       Ks : array<f32>;
+@group(0) @binding(3) var<storage, read>       Vq : array<u32>;
+@group(0) @binding(4) var<storage, read>       Vs : array<f32>;
+@group(0) @binding(5) var<storage, read_write> PO : array<vec4<f32>>;
+@group(0) @binding(6) var<storage, read_write> PML: array<f32>;
+@group(0) @binding(7) var<uniform>             p  : P;
+const DWG=128u; const HD4=${ATTN_HDMAX / 4}u; const TK=${DEC_TK}u; const GW=8u;   // GW = u32 words per quant group (32 int8)
+var<workgroup> qd  : array<vec4<f32>, HD4>;
+var<workgroup> sc  : array<f32, TK>;
+var<workgroup> red : array<f32, DWG>;
+var<workgroup> part: array<vec4<f32>, DWG>;
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>) {
+  let lid = lidv.x;
+  let hq = wg.x; let split = wg.y;
+  if (hq >= p.nHq) { return; }
+  let hd4 = p.hd/4u;
+  let grp = p.nHq/p.nKv; let hk = hq/grp;
+  let kv4 = (p.nKv*p.hd)/4u;                    // u32 words per cached position
+  let kvg = (p.nKv*p.hd)/32u;                   // quant groups per cached position
+  let hqoff = hq*hd4; let hkoff4 = hk*hd4; let hkoffg = (hk*p.hd)/32u;
+  let scale = 1.0/sqrt(f32(p.hd));
+  let per = (p.S + p.nsplit - 1u) / p.nsplit;
+  let c0 = split * per;
+  let c1 = min(p.S, c0 + per);
+  let pidx = hq*p.nsplit + split;
+  var e = lid; loop { if (e>=hd4) {break;} qd[e] = Q[hqoff + e]; e = e + DWG; }
+  workgroupBarrier();
+  var m = -3.0e38; var l = 0.0;
+  let nd = hd4; let ng = DWG / nd;
+  let d4 = lid % nd; let g = lid / nd;
+  var acc4 = vec4<f32>(0.0);
+  var k0 = c0;
+  loop { if (k0 >= c1) { break; }
+    let key = k0 + lid;
+    var s = -3.0e38;
+    if (key < c1) {
+      let wbase = key*kv4 + hkoff4;             // word offset of this key's head row
+      let gbase = key*kvg + hkoffg;             // group offset of this key's head row
+      var sum = 0.0;
+      let ngr = hd4 / GW;                       // groups per head row (hd=128 → 4)
+      var gi = 0u;
+      loop { if (gi >= ngr) { break; }
+        let wo = wbase + gi*GW; let qo = gi*GW;
+        var p0 = dot(qd[qo   ], unpack4x8snorm(Kq[wo   ])) + dot(qd[qo+4u], unpack4x8snorm(Kq[wo+4u]));
+        var p1 = dot(qd[qo+1u], unpack4x8snorm(Kq[wo+1u])) + dot(qd[qo+5u], unpack4x8snorm(Kq[wo+5u]));
+        var p2 = dot(qd[qo+2u], unpack4x8snorm(Kq[wo+2u])) + dot(qd[qo+6u], unpack4x8snorm(Kq[wo+6u]));
+        var p3 = dot(qd[qo+3u], unpack4x8snorm(Kq[wo+3u])) + dot(qd[qo+7u], unpack4x8snorm(Kq[wo+7u]));
+        sum = sum + ((p0+p1)+(p2+p3)) * Ks[gbase + gi];   // group scale hoisted out of the dot
+        gi = gi + 1u;
+      }
+      s = sum*scale;
+    }
+    red[lid] = s; workgroupBarrier();
+    var st = DWG/2u; loop { if(st==0u){break;} if(lid<st){ red[lid]=max(red[lid],red[lid+st]); } workgroupBarrier(); st=st/2u; }
+    let mnew = max(m, red[0]); workgroupBarrier();
+    let corr = exp(m - mnew);
+    let pe = select(0.0, exp(s - mnew), key < c1);
+    sc[lid] = pe;
+    red[lid] = pe; workgroupBarrier();
+    st = DWG/2u; loop { if(st==0u){break;} if(lid<st){ red[lid]=red[lid]+red[lid+st]; } workgroupBarrier(); st=st/2u; }
+    l = l*corr + red[0]; m = mnew;
+    var a = acc4*corr;
+    var kj = g; loop { if (kj >= TK) { break; }
+      let gk = k0 + kj;
+      if (gk < c1) {
+        let w = Vq[gk*kv4 + hkoff4 + d4];
+        let vs = Vs[gk*kvg + hkoffg + (d4*4u)/32u];   // adjacent d4 threads share a group scale (broadcast)
+        a = a + (sc[kj]*vs) * unpack4x8snorm(w);
+      }
+      kj = kj + ng;
+    }
+    acc4 = a;
+    workgroupBarrier();
+    k0 = k0 + TK;
+  }
+  part[lid] = acc4; workgroupBarrier();
+  if (lid < nd) {
+    var sum4 = vec4<f32>(0.0);
+    for (var gg=0u; gg<ng; gg=gg+1u){ sum4 = sum4 + part[gg*nd + lid]; }
+    PO[pidx*HD4 + lid] = sum4;
+  }
+  if (lid == 0u) { PML[pidx*2u] = m; PML[pidx*2u+1u] = l; }
+}`; }
+  function attnDecodeStreamQ8(qBuf, kqBuf, ksBuf, vqBuf, vsBuf, oBuf, S, nHq, nKv, hd, nsplitOverride) {
+    ensureDecSplit(nHq);
+    const nsplit = nsplitOverride || Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640)));
+    const p = uniform(new Uint32Array([1, S, nHq, nKv, hd, nsplit, 0, 0]));
+    const pipe = E.getPipeline('q3.attnDecStreamQ8', attnDecStreamQ8Wgsl());
+    E.dispatch(pipe, [qBuf, kqBuf, ksBuf, vqBuf, vsBuf, _decSplit.po, _decSplit.pml, p], [nHq, nsplit, 1]);
+    const cpipe = E.getPipeline('q3.attnDecCombine', ATTN_DEC_COMBINE_WGSL);
+    return E.dispatch(cpipe, [_decSplit.po, _decSplit.pml, oBuf, p], [nHq, 1, 1]);
+  }
+  // ---- KV quantize-write (P2) --------------------------------------------------
+  // Replaces the two per-layer f32 copyRange calls into the KV cache: quantizes the
+  // rope'd K row(s) and V row(s) (T tokens) per-32-group snorm int8 and writes them at
+  // posBase. ONE dispatch per layer per forward (the f16-KV attempt died on bolted-on
+  // cast passes; this is a copy REPLACEMENT, not an extra pass — same dispatch count).
+  // Thread = one quant group (32 elems): threads [0, nG) do K, [nG, 2nG) do V.
+  const KVQW_WGSL = `
+struct P { T:u32, nKv:u32, hd:u32, posBase:u32 };
+@group(0) @binding(0) var<storage, read>       kr : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       vv : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> Kq : array<u32>;
+@group(0) @binding(3) var<storage, read_write> Ks : array<f32>;
+@group(0) @binding(4) var<storage, read_write> Vq : array<u32>;
+@group(0) @binding(5) var<storage, read_write> Vs : array<f32>;
+@group(0) @binding(6) var<uniform>             p : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let nG = (p.T*p.nKv*p.hd)/32u;
+  let idx = gid.x;
+  if (idx >= 2u*nG) { return; }
+  let isV = idx >= nG;
+  let g = select(idx, idx-nG, isV);
+  let srcW = g*8u;
+  var mx = 1e-12;
+  for (var w=0u; w<8u; w=w+1u) {
+    let x = select(kr[srcW+w], vv[srcW+w], isV);
+    mx = max(mx, max(max(abs(x.x),abs(x.y)),max(abs(x.z),abs(x.w))));
+  }
+  let dstG = (p.posBase*p.nKv*p.hd)/32u + g;
+  let dstW = (p.posBase*p.nKv*p.hd)/4u + g*8u;
+  for (var w=0u; w<8u; w=w+1u) {
+    let x = select(kr[srcW+w], vv[srcW+w], isV);
+    let word = pack4x8snorm(x / mx);
+    if (isV) { Vq[dstW+w] = word; } else { Kq[dstW+w] = word; }
+  }
+  if (isV) { Vs[dstG] = mx; } else { Ks[dstG] = mx; }
+}`;
+  function kvQuantWrite(krBuf, vBuf, kv, T, nKv, hd, posBase) {
+    const p = uniform(new Uint32Array([T, nKv, hd, posBase]));
+    const pipe = E.getPipeline('q3.kvQuantWrite', KVQW_WGSL);
+    const items = 2 * (T * nKv * hd) / 32;
+    return E.dispatch(pipe, [krBuf, vBuf, kv.kq, kv.ks, kv.vq, kv.vs, p], [Math.ceil(items / 64), 1, 1]);
+  }
   // Persistent scratch for the split partials (grown by head count, freed in unload()).
   let _decSplit = null, _decSplitDead = [];
   function ensureDecSplit(nHq) {
@@ -1762,6 +1910,57 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
     const blocks = nHq * Math.ceil(T / ATTN_QT);
     const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
     return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
+  }
+
+  // ---- int8-KV prefill attention (P2) ------------------------------------------
+  // Same kernels as ATTN_WGSL / attnF16Wgsl with ONLY the K/V tile-load phase changed:
+  // K/V arrive as per-32-group snorm int8 (u32 words + f32 group scales) and are
+  // dequantized while staging into shared memory — the compute phases are untouched.
+  // Prefill is ALU/latency-bound (NOT bandwidth-bound like decode), so the unpack cost
+  // is a real risk: gated by _benchAttnPrefillQ8 before any model wiring.
+  function _q8PrefillWgsl(f16, KT) {
+    const base = f16 ? attnF16Wgsl(KT) : ATTN_WGSL;
+    const cast = f16 ? 'vec4<f16>' : 'vec4<f32>';
+    const out = base
+      .replace(`@group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
+@group(0) @binding(4) var<uniform>             p : P;`,
+        `@group(0) @binding(1) var<storage, read>       Kq : array<u32>;
+@group(0) @binding(2) var<storage, read>       Ks : array<f32>;
+@group(0) @binding(3) var<storage, read>       Vq : array<u32>;
+@group(0) @binding(4) var<storage, read>       Vs : array<f32>;
+@group(0) @binding(5) var<storage, read_write> O : array<vec4<f32>>;
+@group(0) @binding(6) var<uniform>             p : P;`)
+      .replace('let scale = 1.0/sqrt(f32(p.hd));',
+        'let scale = 1.0/sqrt(f32(p.hd)); let kvg = (p.nKv*p.hd)/32u; let hkoffg = (hk*p.hd)/32u;')
+      // K/V tile-load lines → dequantizing loads. Generic over the f16/f32 cast forms.
+      .replace('let kj = e/hd4; let d4 = e%hd4; let gk = k0+kj; let ok = gk < p.S;',
+        `let kj = e/hd4; let d4 = e%hd4; let gk = k0+kj; let ok = gk < p.S;
+      let wo = gk*kv4 + hkoff + d4;
+      let go = gk*kvg + hkoffg + (d4*4u)/32u;   // one group scale per 8 words (32 int8)`)
+      .replace(/ksh\[kj\*HD4\+d4\] = select\([^;]+;/,
+        `ksh[kj*HD4+d4] = select(${cast}(0.0), ${cast}(unpack4x8snorm(Kq[wo]) * Ks[go]), ok);`)
+      .replace(/vsh\[kj\*HD4\+d4\] = select\([^;]+;/,
+        `vsh[kj*HD4+d4] = select(${cast}(0.0), ${cast}(unpack4x8snorm(Vq[wo]) * Vs[go]), ok);`);
+    // Fail fast if the base kernel drifted and a replacement missed (a silent miss would
+    // otherwise surface as an inscrutable WGSL compile error at pipeline creation).
+    if (!out.includes('Kq[wo]') || !out.includes('Vq[wo]') || /\bK\s*:\s*array/.test(out)) throw new Error('q8 prefill WGSL transform failed — base kernel changed?');
+    return out;
+  }
+  // Q8 dispatcher — mirrors attention(): T==1 → streaming split-KV Q8 (ALWAYS streaming:
+  // there is deliberately no Q8 legacy kernel; __noKvQ8 reverts the whole KV to f32);
+  // T>1 → f16 prefill variant when available, f32 otherwise.
+  function attentionQ8(qBuf, kqBuf, ksBuf, vqBuf, vsBuf, oBuf, T, S, nHq, nKv, hd) {
+    if (T === 1) return attnDecodeStreamQ8(qBuf, kqBuf, ksBuf, vqBuf, vsBuf, oBuf, S, nHq, nKv, hd);
+    const useF16 = !globalThis.__noAttnF16 && !!(E.caps && E.caps() && E.caps().hasF16);
+    const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
+    const KT = 8;
+    const pipe = useF16 ? E.getPipeline('q3.attnFlashF16Q8.' + KT, _q8PrefillWgsl(true, KT))
+                        : E.getPipeline('q3.attnFlashQ8', _q8PrefillWgsl(false));
+    const blocks = nHq * Math.ceil(T / ATTN_QT);
+    const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
+    return E.dispatch(pipe, [qBuf, kqBuf, ksBuf, vqBuf, vsBuf, oBuf, p], [gx, gy, 1]);
   }
 
   // ============================================================
@@ -2023,6 +2222,60 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await attnDecodeStream(qb,kb,vb,ob,S,nHq,nKv,hd,16);
       check('attnDecodeStream (empty split)', maxAbs(await E.readF32(ob,Q.length),y), 2e-3);
       [qb,kb,vb,ob].forEach(b=>b.destroy());
+    }
+    // --- kvQuantWrite roundtrip (int8 KV, P2): GPU quant-write at an offset vs CPU quantize ---
+    {
+      const T=3,nKv=2,hd=64,posBase=5,cap=16;   // write rows [5..8) of a 16-row cache
+      const n=T*nKv*hd;
+      const kr=new Float32Array(n), vv=new Float32Array(n);
+      for(let i=0;i<n;i++){ kr[i]=Math.sin(i*0.13)*(1+(i%7)); vv[i]=Math.cos(i*0.09)*(1+(i%5)); }
+      const kb=f32buf(kr), vb=f32buf(vv);
+      const capN=cap*nKv*hd;
+      const UB=U.STORAGE|U.COPY_DST|U.COPY_SRC;
+      const kv={ kq:E.createBuffer(capN,UB,'tkq'), ks:E.createBuffer((capN/QGROUP)*4,UB,'tks'), vq:E.createBuffer(capN,UB,'tvq'), vs:E.createBuffer((capN/QGROUP)*4,UB,'tvs') };
+      await kvQuantWrite(kb, vb, kv, T, nKv, hd, posBase);
+      const off=posBase*nKv*hd;
+      const kqW=await readU32Range(kv.kq, off/4, n/4), ksF=await E.readF32(kv.ks, off/QGROUP + n/QGROUP);
+      const vqW=await readU32Range(kv.vq, off/4, n/4), vsF=await E.readF32(kv.vs, off/QGROUP + n/QGROUP);
+      // dequantize GPU output and compare against the SOURCE (per-group int8: rel tol ~1/127)
+      let err=0, ref=1e-9;
+      for(let i=0;i<n;i++){
+        const gk=off/QGROUP + Math.floor(i/QGROUP);
+        let bK=(kqW[i>>2]>>>(8*(i&3)))&0xFF; if(bK>127)bK-=256;
+        let bV=(vqW[i>>2]>>>(8*(i&3)))&0xFF; if(bV>127)bV-=256;
+        err=Math.max(err, Math.abs((bK/127)*ksF[gk]-kr[i]), Math.abs((bV/127)*vsF[gk]-vv[i]));
+        ref=Math.max(ref, Math.abs(kr[i]), Math.abs(vv[i]));
+      }
+      check('kvQuantWrite roundtrip', err/ref, 1.2e-2);
+      [kb,vb,kv.kq,kv.ks,kv.vq,kv.vs].forEach(b=>b.destroy());
+    }
+    // --- int8-KV attention end-to-end (P2): GPU quant-write → Q8 decode + Q8 prefill vs CPU full-precision ---
+    {
+      const S=300,nHq=4,nKv=2,hd=128;
+      const n=S*nKv*hd;
+      const Q=new Float32Array(nHq*hd),Kk=new Float32Array(n),Vv=new Float32Array(n);
+      for(let i=0;i<Q.length;i++)Q[i]=Math.sin(i*0.017);
+      // hash-decorrelated K/V (periodic data creates softmax near-ties that inflate int8 error)
+      let xs=12345; const rnd=()=>{ xs=(xs*1103515245+12345)&0x7fffffff; return xs/0x3fffffff-1; };
+      for(let i=0;i<n;i++){ Kk[i]=rnd()*0.5; Vv[i]=rnd()*0.5; }
+      const y=new Float32Array(nHq*hd); const grp=nHq/nKv; const scale=1/Math.sqrt(hd);
+      for(let hq=0;hq<nHq;hq++){const hk=Math.floor(hq/grp);const qo=hq*hd;
+        let m=-1e38;for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];d*=scale;if(d>m)m=d;}
+        let den=0;const a=new Float32Array(hd);for(let s=0;s<S;s++){const ko=s*(nKv*hd)+hk*hd;let d=0;for(let i=0;i<hd;i++)d+=Q[qo+i]*Kk[ko+i];const w=Math.exp(d*scale-m);den+=w;for(let i=0;i<hd;i++)a[i]+=w*Vv[ko+i];}
+        for(let i=0;i<hd;i++)y[qo+i]=a[i]/den;}
+      const qb=f32buf(Q), kb=f32buf(Kk), vb=f32buf(Vv), ob=E.createBuffer(Q.length*4,ST(),'o');
+      const UB=U.STORAGE|U.COPY_DST|U.COPY_SRC;
+      const kv={ kq:E.createBuffer(n,UB,'e2kq'), ks:E.createBuffer((n/QGROUP)*4,UB,'e2ks'), vq:E.createBuffer(n,UB,'e2vq'), vs:E.createBuffer((n/QGROUP)*4,UB,'e2vs') };
+      await kvQuantWrite(kb, vb, kv, S, nKv, hd, 0);   // quantize the whole "cache" in one shot
+      await attentionQ8(qb, kv.kq, kv.ks, kv.vq, kv.vs, ob, 1, S, nHq, nKv, hd);
+      check('attnQ8 decode (GPU-quantized KV)', maxAbs(await E.readF32(ob,Q.length),y)/Math.max(...y.map(Math.abs).filter(Number.isFinite)), 2e-2);
+      // prefill path: T=S queries, compare LAST row (attends all S keys — same CPU ref)
+      const Qp=new Float32Array(S*nHq*hd); Qp.set(Q, (S-1)*nHq*hd);   // only the last query row matters
+      const qpb=f32buf(Qp), opb=E.createBuffer(Qp.length*4,ST(),'op');
+      await attentionQ8(qpb, kv.kq, kv.ks, kv.vq, kv.vs, opb, S, S, nHq, nKv, hd);
+      const gotP=(await E.readF32(opb,Qp.length)).slice((S-1)*nHq*hd);
+      check('attnQ8 prefill (GPU-quantized KV)', maxAbs(gotP,y)/Math.max(...y.map(Math.abs).filter(Number.isFinite)), 2e-2);
+      [qb,kb,vb,ob,qpb,opb,kv.kq,kv.ks,kv.vq,kv.vs].forEach(b=>b.destroy());
     }
     // --- swiglu ---
     {
@@ -2622,7 +2875,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // (qd/red/part) must fit the device's workgroup-storage limit (4KB slack). The default
     // STREAMING kernel has no such limit — its ceiling is the KV memory budget DEC_STREAM_CTX.
     try { const lim = (E.device().limits.maxComputeWorkgroupStorageSize | 0); if (lim >= 8192) _attnDecLegacyMaxS = Math.max(2048, Math.min(8192, Math.floor((lim - 4096) / 4))); } catch (_) {}
-    _attnMaxS = globalThis.__noStreamDecAttn ? _attnDecLegacyMaxS : DEC_STREAM_CTX;
+    // int8 KV (P2) rides the streaming kernels only — __noStreamDecAttn implies f32 KV too.
+    _kvQ8 = !globalThis.__noKvQ8 && !globalThis.__noStreamDecAttn;
+    _attnMaxS = globalThis.__noStreamDecAttn ? _attnDecLegacyMaxS : (_kvQ8 ? DEC_STREAM_CTX_Q8 : DEC_STREAM_CTX);
     _ctxCap = (nCtx | 0) > 0 ? Math.max(1024, Math.min(_attnMaxS, nCtx | 0)) : _attnMaxS;
     if (MAX_SEQ > _attnMaxS) MAX_SEQ = _attnMaxS;   // never allocate beyond the decode-attn capacity
     try { await probeF16Gemm(); } catch (_) {}   // pick f16 vs f32 prefill-GEMM dot for this GPU
@@ -2712,7 +2967,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // scores in a workgroup array, so ITS ceiling (_attnDecLegacyMaxS) comes from the device's
   // workgroup-storage limit (32KB on gen-12lp → 7168): exceeding it wrote sc[] out of bounds
   // → corruption → "!!!!" garbage (the bug that hit at S>4096).
-  const DEC_STREAM_CTX = 16384;   // streaming-kernel context cap (KV memory budget, not a shader limit)
+  const DEC_STREAM_CTX = 16384;   // streaming-kernel context cap, f32 KV (memory budget, not a shader limit)
+  const DEC_STREAM_CTX_Q8 = 32768; // int8 KV: 3.5× smaller KV (1.125B/elem) → 32K ≈ 2.1GB on the 0.6B
   let _attnDecLegacyMaxS = 4096;  // legacy kernel's shared-memory key capacity; set in loadModel
   let _attnMaxS = 4096;     // effective decode-attn context ceiling; set in loadModel
   // MAX_SEQ = KV buffer size = the context actually ALLOCATED. Starts small and grows ON DEMAND
@@ -2726,12 +2982,13 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   function _growCtx(want) {
     if (want <= MAX_SEQ) return;
     MAX_SEQ = want;
-    try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
+    try { if (_kv) for (const l of _kv) for (const b of Object.values(l)) { if (b && b.destroy) b.destroy(); } } catch (_) {}
     try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
     _kv = null; _tokHist = null; _cachedIds = null; _sysAnchor = null;   // realloc + invalidate prefix caches
   }
   let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
-  let _kv = null;     // [{k,v}] per layer, sized MAX_SEQ
+  let _kv = null;     // per layer, sized MAX_SEQ: {k,v} f32, or {kq,ks,vq,vs} when _kvQ8
+  let _kvQ8 = true;   // int8 KV cache (P2): 4× less decode-attention bandwidth; set in loadModel (__noKvQ8 or __noStreamDecAttn revert to f32 KV)
   let _scr = null;    // scratch buffers, sized to _scrT rows
   let _scrT = 0;
   // PREFIX CACHE: the exact token sequence currently resident in KV[0..length).
@@ -2757,7 +3014,15 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const { numLayers, nKvHeads, headDim } = CONFIG;
     const per = MAX_SEQ * nKvHeads * headDim;
     _kv = [];
-    for (let l = 0; l < numLayers; l++) _kv.push({ k: scrBuf(per, 'k' + l), v: scrBuf(per, 'v' + l) });
+    const UB = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    for (let l = 0; l < numLayers; l++) {
+      if (_kvQ8) {   // int8 words (1B/elem) + f32 scale per 32 elems → 1.125B/elem vs 4B f32
+        _kv.push({
+          kq: E.createBuffer(per, UB, 'kq' + l), ks: E.createBuffer((per / QGROUP) * 4, UB, 'ks' + l),
+          vq: E.createBuffer(per, UB, 'vq' + l), vs: E.createBuffer((per / QGROUP) * 4, UB, 'vs' + l),
+        });
+      } else _kv.push({ k: scrBuf(per, 'k' + l), v: scrBuf(per, 'v' + l) });
+    }
     _tokHist = E.createBuffer(MAX_SEQ * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'tokHist');
   }
   function ensureScratch(T) {
@@ -2830,9 +3095,14 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       // on Intel). Write rope output to a separate buffer.
       await ropeQK(s.q, W(p + 'self_attn.q_norm.weight'), s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
       await ropeQK(s.k, W(p + 'self_attn.k_norm.weight'), s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
-      copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
-      copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
-      await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
+      if (_kvQ8) {   // int8 KV: quantize-write replaces the two copies, Q8 attention reads it
+        kvQuantWrite(s.kr, s.v, _kv[l], T, nKv, hd, posBase);
+        await attentionQ8(s.qr, _kv[l].kq, _kv[l].ks, _kv[l].vq, _kv[l].vs, s.attn, T, S, nHq, nKv, hd);
+      } else {
+        copyRange(s.kr, _kv[l].k, posBase * nKv * hd, T * nKv * hd);
+        copyRange(s.v, _kv[l].v, posBase * nKv * hd, T * nKv * hd);
+        await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
+      }
       await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
       // MLP norm → gate/up. Decode fuses the same way: rmsnormQ emits the int8 activation,
       // gateUpSiluDP4_only consumes it (no separate quantize). Prefill (T>1) keeps the
@@ -2953,7 +3223,19 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _cachedIds = null; _sysAnchor = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     const L = ids.length;
-    const tok0 = await forward(ids, 0);          // prefill → _tokHist[L]=token0
+    // Grow + CHUNK the prefill exactly like _streamIds. generate() is the harness path, but a
+    // long test prompt must not overflow the allocated KV (silent OOB writes → garbage output)
+    // nor go out in one multi-second submit (TDR). Same PREFILL_CHUNK=256 blocks.
+    if (L + 64 > MAX_SEQ) {
+      const want = Math.max(1024, Math.min(_ctxCap, L + 1024));
+      if (L + 64 > want) throw new Error('prompt too long: ' + L + ' tokens — exceeds the context limit (' + _ctxCap + '). Raise "Context size" or shorten the prompt.');
+      _growCtx(want);
+    }
+    let tok0;
+    for (let off = 0; off < L; off += 256) {     // prefill → _tokHist[L]=token0
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      tok0 = await forward(ids.slice(off, Math.min(off + 256, L)), off);
+    }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok0)) return TOK.decode(outIds);
@@ -3275,6 +3557,113 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return out;
   }
 
+  // Debug bench (no model load): int8-KV decode attention (P2 Phase A gate). Quantizes
+  // synthetic K/V on the CPU (per-32-group symmetric, snorm convention: q=round(x/max*127),
+  // scale=maxabs), checks the Q8 kernel against the FULL-PRECISION CPU reference (so the
+  // reported error includes the quantization error itself — expect ~1e-2 rel), and
+  // GPU-timestamps Q8 vs the f32 streaming kernel. This is the go/no-go measurement BEFORE
+  // any model wiring (lesson of the f16-KV 12× regression: prove the kernel in isolation).
+  async function _benchAttnDecQ8({ S = 2688, nHq = 16, nKv = 8, hd = 128, iters = 20, reps = 6 } = {}) {
+    const Q = new Float32Array(nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.011) * 0.5;
+    const Kf = new Float32Array(S * nKv * hd); for (let i = 0; i < Kf.length; i++) Kf[i] = Math.cos(i * 0.007) * 0.5;
+    const Vf = new Float32Array(S * nKv * hd); for (let i = 0; i < Vf.length; i++) Vf[i] = Math.sin(i * 0.005 + 1) * 0.5;
+    // CPU per-32-group snorm quantize (the exact convention the WGSL dequant assumes)
+    const quant = (src) => {
+      const nG = src.length / QGROUP;
+      const qw = new Uint32Array(src.length / 4), sc = new Float32Array(nG);
+      for (let g = 0; g < nG; g++) {
+        let mx = 1e-12; for (let i = 0; i < QGROUP; i++) mx = Math.max(mx, Math.abs(src[g * QGROUP + i]));
+        sc[g] = mx;
+        for (let w = 0; w < QGROUP / 4; w++) {
+          let word = 0;
+          for (let b = 0; b < 4; b++) { const x = src[g * QGROUP + w * 4 + b] / mx; let q = Math.round(Math.max(-1, Math.min(1, x)) * 127); if (q < 0) q += 256; word |= (q << (8 * b)); }
+          qw[(g * QGROUP) / 4 + w] = word >>> 0;
+        }
+      }
+      return { qw, sc };
+    };
+    const kq = quant(Kf), vq = quant(Vf);
+    // dequantized copies → the CPU reference measures ONLY the kernel's arithmetic when
+    // compared against dequant, and quant+kernel when compared against full-precision.
+    const deq = (q) => { const out = new Float32Array(q.qw.length * 4); for (let i = 0; i < out.length; i++) { let b = (q.qw[i >> 2] >>> (8 * (i & 3))) & 0xFF; if (b > 127) b -= 256; out[i] = (b / 127) * q.sc[Math.floor(i / QGROUP)]; } return out; };
+    const Kd = deq(kq), Vd = deq(vq);
+    const cpuRef = (K, V) => {
+      const y = new Float32Array(nHq * hd); const grp = nHq / nKv; const scl = 1 / Math.sqrt(hd);
+      for (let hq = 0; hq < nHq; hq++) {
+        const hk = Math.floor(hq / grp), qo = hq * hd;
+        let m = -1e38; const scv = new Float32Array(S);
+        for (let s = 0; s < S; s++) { const ko = s * (nKv * hd) + hk * hd; let d = 0; for (let i = 0; i < hd; i++) d += Q[qo + i] * K[ko + i]; scv[s] = d * scl; if (scv[s] > m) m = scv[s]; }
+        let den = 0; const a = new Float32Array(hd);
+        for (let s = 0; s < S; s++) { const ko = s * (nKv * hd) + hk * hd; const w = Math.exp(scv[s] - m); den += w; for (let i = 0; i < hd; i++) a[i] += w * V[ko + i]; }
+        for (let i = 0; i < hd; i++) y[qo + i] = a[i] / den;
+      }
+      return y;
+    };
+    const yFull = cpuRef(Kf, Vf), yDeq = cpuRef(Kd, Vd);
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'q8b'); E.device().queue.writeBuffer(b, 0, a.buffer, 0, a.byteLength); return b; };
+    const qb = mk(Q), kfb = mk(Kf), vfb = mk(Vf), kqb = mk(kq.qw), ksb = mk(kq.sc), vqb = mk(vq.qw), vsb = mk(vq.sc), ob = E.createBuffer(Q.byteLength, UF, 'q8o');
+    const relErrVs = async (ref) => { const got = await E.readF32(ob, ref.length); let mx = 0, rf = 1e-9; for (let i = 0; i < ref.length; i++) { mx = Math.max(mx, Math.abs(got[i] - ref[i])); rf = Math.max(rf, Math.abs(ref[i])); } return +(mx / rf).toExponential(2); };
+    const out = { S, nHq, nKv, hd, nsplit_auto: Math.max(1, Math.min(DEC_NSPLIT_MAX, Math.ceil(S / 640))) };
+    uniformReset(); await attnDecodeStreamQ8(qb, kqb, ksb, vqb, vsb, ob, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone();
+    out.relErr_vs_full = await relErrVs(yFull);    // includes int8 quantization error
+    out.relErr_vs_deq = await relErrVs(yDeq);      // kernel arithmetic only — should be ~1e-6
+    const prof = async (fn) => { E.beginProfile(iters * 2 + 8); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); const p = await E.endProfile(); return p.reduce((s, r) => s + r.us, 0) / iters; };
+    let f32Us = Infinity, q8Us = Infinity;
+    for (let r = 0; r < reps; r++) {
+      f32Us = Math.min(f32Us, await prof(() => attnDecodeStream(qb, kfb, vfb, ob, S, nHq, nKv, hd)));
+      q8Us = Math.min(q8Us, await prof(() => attnDecodeStreamQ8(qb, kqb, ksb, vqb, vsb, ob, S, nHq, nKv, hd)));
+    }
+    [qb, kfb, vfb, kqb, ksb, vqb, vsb, ob].forEach(b => b.destroy());
+    out.f32_us = +f32Us.toFixed(1); out.q8_us = +q8Us.toFixed(1); out.speedup = +(f32Us / q8Us).toFixed(2);
+    return out;
+  }
+
+  // Debug bench (no model load): int8-KV PREFILL attention (P2 Phase B gate). Correctness:
+  // Q8 kernel vs the plain kernel run on the CPU-dequantized K/V (isolates kernel arithmetic
+  // from quantization error). Timing: plain vs Q8, GPU timestamps, min-of-reps. Prefill is
+  // ALU-bound, so Q8 may cost here — this bench decides whether that cost is acceptable.
+  async function _benchAttnPrefillQ8({ T = 2560, S = 2560, nHq = 16, nKv = 8, hd = 128, iters = 4, reps = 6 } = {}) {
+    const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.011) * 0.5;
+    const Kf = new Float32Array(S * nKv * hd); for (let i = 0; i < Kf.length; i++) Kf[i] = Math.cos(i * 0.007) * 0.5;
+    const Vf = new Float32Array(S * nKv * hd); for (let i = 0; i < Vf.length; i++) Vf[i] = Math.sin(i * 0.005 + 1) * 0.5;
+    const quant = (src) => {
+      const nG = src.length / QGROUP;
+      const qw = new Uint32Array(src.length / 4), sc = new Float32Array(nG);
+      for (let g = 0; g < nG; g++) {
+        let mx = 1e-12; for (let i = 0; i < QGROUP; i++) mx = Math.max(mx, Math.abs(src[g * QGROUP + i]));
+        sc[g] = mx;
+        for (let w = 0; w < QGROUP / 4; w++) {
+          let word = 0;
+          for (let b = 0; b < 4; b++) { const x = src[g * QGROUP + w * 4 + b] / mx; let q = Math.round(Math.max(-1, Math.min(1, x)) * 127); if (q < 0) q += 256; word |= (q << (8 * b)); }
+          qw[(g * QGROUP) / 4 + w] = word >>> 0;
+        }
+      }
+      return { qw, sc };
+    };
+    const deq = (q) => { const out = new Float32Array(q.qw.length * 4); for (let i = 0; i < out.length; i++) { let b = (q.qw[i >> 2] >>> (8 * (i & 3))) & 0xFF; if (b > 127) b -= 256; out[i] = (b / 127) * q.sc[Math.floor(i / QGROUP)]; } return out; };
+    const kq = quant(Kf), vq = quant(Vf);
+    const Kd = deq(kq), Vd = deq(vq);
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'pq8'); E.device().queue.writeBuffer(b, 0, a.buffer, 0, a.byteLength); return b; };
+    const qb = mk(Q), kdb = mk(Kd), vdb = mk(Vd), kqb = mk(kq.qw), ksb = mk(kq.sc), vqb = mk(vq.qw), vsb = mk(vq.sc);
+    const oa = E.createBuffer(Q.byteLength, UF, 'poa'), ob = E.createBuffer(Q.byteLength, UF, 'pob');
+    // correctness: plain kernel on dequantized K/V vs Q8 kernel on quantized K/V
+    uniformReset(); await attention(qb, kdb, vdb, oa, T, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone();
+    uniformReset(); await attentionQ8(qb, kqb, ksb, vqb, vsb, ob, T, S, nHq, nKv, hd); await E.device().queue.onSubmittedWorkDone();
+    const n = Math.min(Q.length, 200000);
+    const a = await E.readF32(oa, n), b = await E.readF32(ob, n);
+    let mx = 0, rf = 1e-9; for (let i = 0; i < n; i++) { mx = Math.max(mx, Math.abs(a[i] - b[i])); rf = Math.max(rf, Math.abs(a[i])); }
+    const prof = async (fn) => { E.beginProfile(iters + 8); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); const p = await E.endProfile(); return p.reduce((s, r) => s + r.us, 0) / iters; };
+    let plainUs = Infinity, q8Us = Infinity;
+    for (let r = 0; r < reps; r++) {
+      plainUs = Math.min(plainUs, await prof(() => attention(qb, kdb, vdb, oa, T, S, nHq, nKv, hd)));
+      q8Us = Math.min(q8Us, await prof(() => attentionQ8(qb, kqb, ksb, vqb, vsb, ob, T, S, nHq, nKv, hd)));
+    }
+    [qb, kdb, vdb, kqb, ksb, vqb, vsb, oa, ob].forEach(x => x.destroy());
+    return { T, S, relErr_vs_deq: +(mx / rf).toExponential(2), plain_us: +plainUs.toFixed(1), q8_us: +q8Us.toFixed(1), ratio: +(plainUs / q8Us).toFixed(2) };
+  }
+
   // Debug bench (no model load): time the tiled attention at a realistic prefill shape.
   async function _benchAttn({ T = 128, S = 2790, nHq = 16, nKv = 8, hd = 128, iters = 3 } = {}) {
     const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.01);
@@ -3375,7 +3764,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   // + loadModel rebuild everything on next use. deep=false (variant swap) keeps the device.
   async function unload(deep) {
     try { if (_weights) for (const k in _weights) { const w = _weights[k]; if (!w) continue; if (w.pack && w.pack.destroy) try { w.pack.destroy(); } catch (_) {} if (w.scales && w.scales.destroy) try { w.scales.destroy(); } catch (_) {} if (w.buf && w.buf.destroy) try { w.buf.destroy(); } catch (_) {} } } catch (_) {}
-    try { if (_kv) for (const l of _kv) { if (l.k && l.k.destroy) l.k.destroy(); if (l.v && l.v.destroy) l.v.destroy(); } } catch (_) {}
+    try { if (_kv) for (const l of _kv) for (const b of Object.values(l)) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } } catch (_) {}
     try { if (_scr) for (const b of Object.values(_scr)) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } } catch (_) {}
     try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
     try { if (_idsBuf && _idsBuf.destroy) _idsBuf.destroy(); } catch (_) {}
@@ -3707,7 +4096,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
