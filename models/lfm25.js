@@ -331,7 +331,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       const bytes = []; for (const ch of s) { const b = byteDec[ch]; if (b !== undefined) bytes.push(b); }
       return dec.decode(new Uint8Array(bytes));
     }
-    return { load, encodeText, encodeChat, decode, isReady: () => ready, specialIds: () => _addedIds };
+    return { load, encodeText, encodeChat, decode, isReady: () => ready, specialIds: () => _addedIds, imEnd: () => imEnd };
   })();
 
   // ---- streaming single-pass loader: safetensors header via Range request, then one
@@ -481,7 +481,378 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return inv;
   }
 
-  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant };
+  // ============================================================
+  // PHASE C — forward graph + generate (bring-up: correctness first).
+  // Kernels adapted from the proven qwen3 set: rmsnorm, embed gather, batched int4
+  // matvec (T ≤ 32; prefill runs in 32-token chunks), per-head norm + rotate_half RoPE
+  // (LFM2's q/k_layernorm is [head_dim] — same contract), f32 flash attention (used for
+  // BOTH prefill and decode for now), SwiGLU. Greedy decode with CPU argmax readback per
+  // token. Deliberately unoptimized: the GPU-argmax chain / int8 KV / DP4A come after
+  // the 350M speaks coherent text.
+  // ============================================================
+  const MATVEC_WG = 64, MATVEC_MAXT = 32;
+  const MATVECQ_WGSL = `
+enable f16;
+enable subgroups;
+struct D { T:u32, N:u32, K:u32, tBase:u32, acc:u32, _p0:u32, _p1:u32, _p2:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;
+@group(0) @binding(3) var<storage, read_write> y  : array<f32>;
+@group(0) @binding(4) var<uniform>             d  : D;
+var<workgroup> part : array<f32, ${MATVEC_MAXT * MATVEC_WG}>;
+@compute @workgroup_size(${MATVEC_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let n = wg.x + wg.y * nwg.x;
+  if (n >= d.N) { return; }
+  let words = d.K / 8u; let wbase = n*words;
+  let gpr = d.K / ${QGROUP}u; let sbase = n*gpr;
+  let K4 = d.K / 4u; let T = d.T;
+  var acc : array<f32, ${MATVEC_MAXT}>;
+  for (var t:u32=0u; t<${MATVEC_MAXT}u; t=t+1u) { acc[t] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let p = W[wbase + w];
+    let s = f32(sc[sbase + (w*8u)/${QGROUP}u]);
+    let lo = vec4<f32>(unpack4xU8(p & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+    let hi = vec4<f32>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu)) - vec4<f32>(8.0);
+    let wa = vec4<f32>(lo.x,hi.x,lo.y,hi.y); let wb_ = vec4<f32>(lo.z,hi.z,lo.w,hi.w);
+    for (var t:u32=0u; t<T; t=t+1u) {
+      let base = t*K4;
+      acc[t] = acc[t] + s*( dot(wa, x[base + 2u*w]) + dot(wb_, x[base + 2u*w + 1u]) );
+    }
+    w = w + ${MATVEC_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var t:u32=0u; t<T; t=t+1u) {
+    let ssum = subgroupAdd(acc[t]);
+    if (sgi == 0u) { part[t*${MATVEC_WG}u + sgIdx] = ssum; }
+  }
+  workgroupBarrier();
+  if (lid.x < T) {
+    let t = lid.x; let nsg=(${MATVEC_WG}u+sgs-1u)/sgs; var tot:f32=0.0;
+    for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[t*${MATVEC_WG}u + i]; }
+    let idx = t*d.N + n;
+    y[idx] = select(0.0, y[idx], d.acc != 0u) + tot;
+  }
+}`;
+  function matvecQ(xBuf, rec, yBuf, T, N, K, acc) {
+    const d = uniform(new Uint32Array([T, N, K, 0, acc ? 1 : 0, 0, 0, 0]));
+    const pipe = E.getPipeline('lfm25.matvecQ', MATVECQ_WGSL);
+    const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
+    return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, yBuf, d], [gx, gy, 1]);
+  }
+
+  const RMSNORM_WGSL = `
+enable f16;
+struct P { T:u32, H:u32, eps:f32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       x : array<f32>;
+@group(0) @binding(1) var<storage, read>       w : array<f16>;
+@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+@group(0) @binding(3) var<uniform>             p : P;
+var<workgroup> red : array<f32, 256>;
+@compute @workgroup_size(256,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let t = wg.x; let H = p.H; let base = t*H;
+  var ss = 0.0;
+  var i = lid.x; loop { if (i >= H) { break; } let v = x[base+i]; ss = ss + v*v; i = i + 256u; }
+  red[lid.x] = ss; workgroupBarrier();
+  var st = 128u; loop { if (st==0u) { break; } if (lid.x < st) { red[lid.x] = red[lid.x] + red[lid.x+st]; } workgroupBarrier(); st = st/2u; }
+  let inv = inverseSqrt(red[0]/f32(H) + p.eps);
+  i = lid.x; loop { if (i >= H) { break; } y[base+i] = x[base+i]*inv*f32(w[i]); i = i + 256u; }
+}`;
+  function rmsnorm(xBuf, wBuf, yBuf, T, H, eps) {
+    const u = new Uint32Array(4); new DataView(u.buffer).setUint32(0, T, true); new DataView(u.buffer).setUint32(4, H, true); new DataView(u.buffer).setFloat32(8, eps, true);
+    return E.dispatch(E.getPipeline('lfm25.rmsnorm', RMSNORM_WGSL), [xBuf, wBuf, yBuf, uniform(u)], [T, 1, 1]);
+  }
+
+  const EMBED_WGSL = `
+enable f16;
+struct P { T:u32, H:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       ids   : array<u32>;
+@group(0) @binding(1) var<storage, read>       embed : array<f16>;
+@group(0) @binding(2) var<storage, read_write> y     : array<f32>;
+@group(0) @binding(3) var<uniform>             p     : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let idx = gid.y*(nwg.x*64u)+gid.x; let total = p.T*p.H; if (idx >= total) { return; }
+  let t = idx/p.H; let h = idx%p.H;
+  y[idx] = f32(embed[ids[t]*p.H + h]);
+}`;
+  function embedGather(idsBuf, embBuf, yBuf, T, H) {
+    const p = uniform(new Uint32Array([T, H, 0, 0]));
+    const n = Math.ceil((T * H) / 64), gx = Math.min(n, 65535), gy = Math.ceil(n / gx);
+    return E.dispatch(E.getPipeline('lfm25.embed', EMBED_WGSL), [idsBuf, embBuf, yBuf, p], [gx, gy, 1]);
+  }
+
+  const ROPEQK_WGSL = `
+enable f16;
+struct P { T:u32, nH:u32, hd:u32, posBase:u32, theta:f32, eps:f32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       inp  : array<f32>;
+@group(0) @binding(1) var<storage, read>       normW: array<f16>;
+@group(0) @binding(2) var<storage, read_write> outp : array<f32>;
+@group(0) @binding(3) var<uniform>             p    : P;
+var<workgroup> red : array<f32, 128>;
+var<workgroup> nrm : array<f32, 128>;
+@compute @workgroup_size(128,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let hd = p.hd; let j = lid.x;
+  let unit = wg.x; let t = unit/p.nH; let head = unit%p.nH;
+  let base = t*(p.nH*hd) + head*hd;
+  var v:f32 = 0.0; if (j < hd) { v = inp[base+j]; }
+  red[j] = select(0.0, v*v, j < hd); workgroupBarrier();
+  var stride = 64u;
+  loop { if (stride==0u) { break; } if (j < stride) { red[j] = red[j] + red[j+stride]; } workgroupBarrier(); stride = stride/2u; }
+  let inv = inverseSqrt(red[0]/f32(hd) + p.eps);
+  if (j < hd) { nrm[j] = v*inv*f32(normW[j]); }
+  workgroupBarrier();
+  if (j >= hd) { return; }
+  let half = hd/2u;
+  let pos = f32(p.posBase + t);
+  let freqIdx = select(j-half, j, j<half);
+  let ang = pos * pow(p.theta, -2.0*f32(freqIdx)/f32(hd));
+  let c = cos(ang); let s = sin(ang);
+  let partner = select(nrm[j-half], nrm[j+half], j<half);
+  let rot = select(partner, -partner, j<half);
+  outp[base+j] = nrm[j]*c + rot*s;
+}`;
+  function ropeQK(inBuf, normWBuf, outBuf, T, nH, hd, posBase, theta, eps) {
+    const u = new Uint32Array(8); const dv = new DataView(u.buffer);
+    dv.setUint32(0, T, true); dv.setUint32(4, nH, true); dv.setUint32(8, hd, true);
+    dv.setUint32(12, posBase, true); dv.setFloat32(16, theta, true); dv.setFloat32(20, eps, true);
+    return E.dispatch(E.getPipeline('lfm25.ropeqk', ROPEQK_WGSL), [inBuf, normWBuf, outBuf, uniform(u)], [T * nH, 1, 1]);
+  }
+
+  // f32 tiled flash attention (QT=16 query block × KT=8 key tiles, online softmax) —
+  // used for prefill AND decode in the bring-up (decode wastes 15/16 of the block; the
+  // dedicated T=1 kernel is a later port).
+  const AQT = 16, AKT = 8, AHD4 = 32, AWG = 128;
+  const ATTN_WGSL = `
+struct P { T:u32, S:u32, nHq:u32, nKv:u32, hd:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       Q : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       K : array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read>       V : array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> O : array<vec4<f32>>;
+@group(0) @binding(4) var<uniform>             p : P;
+const QT=${AQT}u; const KT=${AKT}u; const HD4=${AHD4}u; const WG=${AWG}u;
+var<workgroup> qsh : array<vec4<f32>, QT*HD4>;
+var<workgroup> ksh : array<vec4<f32>, KT*HD4>;
+var<workgroup> vsh : array<vec4<f32>, KT*HD4>;
+var<workgroup> acc : array<vec4<f32>, QT*HD4>;
+var<workgroup> scr : array<f32, QT*KT>;
+var<workgroup> msh : array<f32, QT>;
+var<workgroup> lsh : array<f32, QT>;
+var<workgroup> csh : array<f32, QT>;
+@compute @workgroup_size(${AWG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>) {
+  let tid = lidv.x;
+  let hd4 = p.hd / 4u;
+  let nqb = (p.T + QT - 1u)/QT;
+  let blk = wg.x + wg.y*nwg.x;
+  let hq = blk / nqb;
+  if (hq >= p.nHq) { return; }
+  let qbase = (blk % nqb) * QT;
+  let grp = p.nHq / p.nKv; let hk = hq / grp;
+  let kv4 = (p.nKv*p.hd)/4u; let qhs4 = (p.nHq*p.hd)/4u; let hkoff = hk*hd4; let hqoff = hq*hd4;
+  let scale = 1.0/sqrt(f32(p.hd));
+  let qmax = (p.S - p.T) + min(qbase + QT, p.T) - 1u;
+  var e = tid;
+  loop { if (e >= QT*hd4) { break; }
+    let qi = e/hd4; let d4 = e%hd4; let gq = qbase+qi;
+    qsh[qi*HD4+d4] = select(vec4<f32>(0.0), Q[gq*qhs4 + hqoff + d4], gq < p.T);
+    acc[qi*HD4+d4] = vec4<f32>(0.0);
+    e = e + WG;
+  }
+  if (tid < QT) { msh[tid] = -3.0e38; lsh[tid] = 0.0; }
+  workgroupBarrier();
+  var k0 = 0u;
+  loop {
+    if (k0 >= p.S || k0 > qmax) { break; }
+    e = tid;
+    loop { if (e >= KT*hd4) { break; }
+      let kj = e/hd4; let d4 = e%hd4; let gk = k0+kj; let ok = gk < p.S;
+      ksh[kj*HD4+d4] = select(vec4<f32>(0.0), K[gk*kv4 + hkoff + d4], ok);
+      vsh[kj*HD4+d4] = select(vec4<f32>(0.0), V[gk*kv4 + hkoff + d4], ok);
+      e = e + WG;
+    }
+    workgroupBarrier();
+    { let qi = tid / KT; let kj = tid % KT;
+      var s4 = vec4<f32>(0.0);
+      for (var i4=0u;i4<hd4;i4=i4+1u){ s4 = s4 + qsh[qi*HD4+i4]*ksh[kj*HD4+i4]; }
+      let dot = s4.x + s4.y + s4.z + s4.w;
+      let gq = qbase+qi; let gk = k0+kj; let gqpos = (p.S - p.T) + gq;
+      let valid = (gq < p.T) && (gk < p.S) && (gk <= gqpos);
+      scr[tid] = select(-3.0e38, dot*scale, valid);
+    }
+    workgroupBarrier();
+    if (tid < QT) {
+      let qi = tid;
+      var tm = -3.0e38;
+      for (var kj=0u;kj<KT;kj=kj+1u){ tm = max(tm, scr[qi*KT+kj]); }
+      let mnew = max(msh[qi], tm);
+      let corr = exp(msh[qi] - mnew);
+      var sum = 0.0;
+      for (var kj=0u;kj<KT;kj=kj+1u){
+        let pw = select(0.0, exp(scr[qi*KT+kj]-mnew), scr[qi*KT+kj] > -3.0e37);
+        scr[qi*KT+kj] = pw; sum = sum + pw;
+      }
+      lsh[qi] = lsh[qi]*corr + sum; msh[qi] = mnew; csh[qi] = corr;
+    }
+    workgroupBarrier();
+    e = tid;
+    loop { if (e >= QT*hd4) { break; }
+      let qi = e/hd4; let d4 = e%hd4;
+      var a = acc[qi*HD4+d4]*csh[qi];
+      for (var kj=0u;kj<KT;kj=kj+1u){ a = a + scr[qi*KT+kj]*vsh[kj*HD4+d4]; }
+      acc[qi*HD4+d4] = a;
+      e = e + WG;
+    }
+    workgroupBarrier();
+    k0 = k0 + KT;
+  }
+  e = tid;
+  loop { if (e >= QT*hd4) { break; }
+    let qi = e/hd4; let d4 = e%hd4; let gq = qbase+qi;
+    if (gq < p.T) { O[gq*qhs4 + hqoff + d4] = acc[qi*HD4+d4] / lsh[qi]; }
+    e = e + WG;
+  }
+}`;
+  function attention(qBuf, kBuf, vBuf, oBuf, T, S, nHq, nKv, hd) {
+    const p = uniform(new Uint32Array([T, S, nHq, nKv, hd, 0, 0, 0]));
+    const pipe = E.getPipeline('lfm25.attn', ATTN_WGSL);
+    const blocks = nHq * Math.ceil(T / AQT);
+    const gx = Math.min(blocks, 65535), gy = Math.ceil(blocks / gx);
+    return E.dispatch(pipe, [qBuf, kBuf, vBuf, oBuf, p], [gx, gy, 1]);
+  }
+
+  const SWIGLU_WGSL = `
+struct P { n:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       g : array<f32>;
+@group(0) @binding(1) var<storage, read>       u : array<f32>;
+@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+@group(0) @binding(3) var<uniform>             p : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let i = gid.y*(nwg.x*64u)+gid.x; if (i >= p.n) { return; }
+  let gv = g[i];
+  y[i] = (gv / (1.0 + exp(-gv))) * u[i];
+}`;
+  function swiglu(gBuf, uBuf, yBuf, n) {
+    const p = uniform(new Uint32Array([n, 0, 0, 0]));
+    const c = Math.ceil(n / 64), gx = Math.min(c, 65535), gy = Math.ceil(c / gx);
+    return E.dispatch(E.getPipeline('lfm25.swiglu', SWIGLU_WGSL), [gBuf, uBuf, yBuf, p], [gx, gy, 1]);
+  }
+
+  // ---- forward state --------------------------------------------------------------
+  const MAX_SEQ = 2048;   // bring-up context
+  let _scr = null, _kv = null, _conv = null, _idsBuf = null;
+  function _ensureState() {
+    if (_scr) return;
+    const C = _cfg, H = C.hidden, T = MATVEC_MAXT;
+    const mk = (n, l) => E.createBuffer(n * 4, ST(), l);
+    // w1 shapes are auto-adjusted — read the real intermediate from the weights
+    const I = _weights['model.layers.0.feed_forward.w1.weight'].N;
+    _cfg.ffI = I;
+    _scr = {
+      x: mk(T * H, 'x'), normed: mk(T * H, 'nrm'),
+      bcx: mk(T * 3 * H, 'bcx'), convy: mk(T * H, 'cy'),
+      q: mk(T * C.nHeads * C.headDim, 'q'), k: mk(T * C.nKvHeads * C.headDim, 'k'), v: mk(T * C.nKvHeads * C.headDim, 'v'),
+      qr: mk(T * C.nHeads * C.headDim, 'qr'), kr: mk(T * C.nKvHeads * C.headDim, 'kr'),
+      attn: mk(T * C.nHeads * C.headDim, 'at'),
+      gate: mk(T * I, 'g'), up: mk(T * I, 'u'), swi: mk(T * I, 's'),
+      last: mk(H, 'last'), logits: mk(C.vocab, 'lg'),
+    };
+    _kv = {}; _conv = {};
+    for (let l = 0; l < C.numLayers; l++) {
+      if (C.attnLayers.includes(l)) _kv[l] = { k: mk(MAX_SEQ * C.nKvHeads * C.headDim, 'k' + l), v: mk(MAX_SEQ * C.nKvHeads * C.headDim, 'v' + l) };
+      else _conv[l] = { a: mk(C.hidden * (C.convL - 1), 'ca' + l), b: mk(C.hidden * (C.convL - 1), 'cb' + l), cur: 0 };
+    }
+  }
+  function _freeState() {
+    const kill = (o) => { for (const k in o) { const v = o[k]; if (v && v.destroy) try { v.destroy(); } catch (_) {} else if (v && typeof v === 'object') kill(v); } };
+    if (_scr) kill(_scr); if (_kv) kill(_kv); if (_conv) kill(_conv);
+    if (_idsBuf) try { _idsBuf.destroy(); } catch (_) {}
+    _scr = null; _kv = null; _conv = null; _idsBuf = null;
+  }
+
+  // One forward over T ≤ 32 tokens at absolute positions [posBase, posBase+T).
+  // Returns nothing; caller reads logits (computed for the LAST token only).
+  async function forward(idsArr, posBase) {
+    const C = _cfg, H = C.hidden, T = idsArr.length, S = posBase + T;
+    const W = (n) => _weights[n];
+    _ensureState();
+    if (!_idsBuf) _idsBuf = E.createBuffer(MATVEC_MAXT * 4, U.STORAGE | U.COPY_DST, 'ids');
+    E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(idsArr));
+    uniformReset();
+    E.beginBatch();
+    const s = _scr;
+    await embedGather(_idsBuf, W('model.embed_tokens.weight').buf, s.x, T, H);
+    for (let l = 0; l < C.numLayers; l++) {
+      const p = 'model.layers.' + l + '.';
+      await rmsnorm(s.x, W(p + 'operator_norm.weight').buf, s.normed, T, H, C.rmsEps);
+      if (_conv[l]) {   // conv mixer
+        await matvecQ(s.normed, W(p + 'conv.in_proj.weight'), s.bcx, T, 3 * H, H);
+        const st = _conv[l];
+        const sIn = st.cur === 0 ? st.a : st.b, sOut = st.cur === 0 ? st.b : st.a;
+        await shortConv(s.bcx, W(p + 'conv.conv.weight').buf, sIn, sOut, s.convy, T, H, C.convL, posBase > 0);
+        st.cur ^= 1;
+        await matvecQ(s.convy, W(p + 'conv.out_proj.weight'), s.x, T, H, H, true);   // + residual
+      } else {          // GQA attention
+        const nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim;
+        await matvecQ(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+        await matvecQ(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+        await matvecQ(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+        await ropeQK(s.q, W(p + 'self_attn.q_layernorm.weight').buf, s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps);
+        await ropeQK(s.k, W(p + 'self_attn.k_layernorm.weight').buf, s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
+        E.copyBuffer(s.kr, 0, _kv[l].k, posBase * nKv * hd * 4, T * nKv * hd * 4);
+        E.copyBuffer(s.v, 0, _kv[l].v, posBase * nKv * hd * 4, T * nKv * hd * 4);
+        await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
+        await matvecQ(s.attn, W(p + 'self_attn.out_proj.weight'), s.x, T, H, nHq * hd, true);   // + residual
+      }
+      await rmsnorm(s.x, W(p + 'ffn_norm.weight').buf, s.normed, T, H, C.rmsEps);
+      const I = C.ffI;
+      await matvecQ(s.normed, W(p + 'feed_forward.w1.weight'), s.gate, T, I, H);
+      await matvecQ(s.normed, W(p + 'feed_forward.w3.weight'), s.up, T, I, H);
+      await swiglu(s.gate, s.up, s.swi, T * I);
+      await matvecQ(s.swi, W(p + 'feed_forward.w2.weight'), s.x, T, H, I, true);                // + residual
+    }
+    await rmsnorm(s.x, W('model.embedding_norm.weight').buf, s.normed, T, H, C.rmsEps);
+    E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
+    await matvecQ(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
+    await E.endBatch();
+  }
+
+  async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
+    if (!_loaded) throw new Error('loadModel first');
+    const C = _cfg;
+    // fresh generation: conv states start cold (posBase 0 → useState=0) and KV restarts
+    const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
+    if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long for bring-up MAX_SEQ');
+    let pos = 0;
+    for (let off = 0; off < ids.length; off += MATVEC_MAXT) {   // chunked prefill (T ≤ 32)
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      const chunk = ids.slice(off, Math.min(off + MATVEC_MAXT, ids.length));
+      await forward(chunk, pos); pos += chunk.length;
+    }
+    const outIds = [];
+    const imEnd = TOK.imEnd();
+    for (let i = 0; i < maxTokens; i++) {
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      const logits = await E.readF32(_scr.logits, C.vocab);   // CPU argmax (bring-up)
+      let best = 0, bv = -Infinity;
+      for (let j = 0; j < C.vocab; j++) if (logits[j] > bv) { bv = logits[j]; best = j; }
+      if (best === C.eos || best === imEnd) break;
+      outIds.push(best);
+      if (onToken) { try { onToken(TOK.decode(outIds.slice(-4)).slice(-24), best); } catch (_) {} }
+      await forward([best], pos); pos++;
+    }
+    return TOK.decode(outIds);
+  }
+
+  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
