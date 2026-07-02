@@ -259,7 +259,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 
   // ---- INT4 decode GEMV (T=1), GEMVQ_NR rows/workgroup (activation reused) ----
   const GEMVQ_NR = 8;
-  const GEMVQ_WGSL = `
+  // Parameterized by NR (rows per workgroup) so the big-N shape (lm_head) can be tuned
+  // separately — the kernel text is identical, only the row-block factor varies.
+  function gemvQWgsl(NR) { return `
 enable f16;
 enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused residual)
@@ -268,22 +270,22 @@ struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused
 @group(0) @binding(2) var<storage, read>       sc : array<f16>;          // [N*K/QGROUP] scales
 @group(0) @binding(3) var<storage, read_write> y  : array<f32>;          // [N]
 @group(0) @binding(4) var<uniform>             d  : D;
-var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(num_workgroups) nwg:vec3<u32>,
         @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
-  let rowBase = (wg.x + wg.y * nwg.x) * ${GEMVQ_NR}u;
+  let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
   if (rowBase >= d.N) { return; }
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
-  var acc : array<f32, ${GEMVQ_NR}>;
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) { acc[r] = 0.0; }
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
   var w = lid.x;
   loop {
     if (w >= words) { break; }
     let xa = x[2u*w]; let xb = x[2u*w + 1u];      // activation chunk — read once, reused across rows
     let grp = (w*8u)/${QGROUP}u;
-    for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
       let row = rowBase + r;
       let p = W[row*words + w];
       let s = f32(sc[row*gpr + grp]);
@@ -294,12 +296,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     w = w + ${GEMV_WG}u;
   }
   let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
     let ss = subgroupAdd(acc[r]);
     if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
   }
   workgroupBarrier();
-  if (lid.x < ${GEMVQ_NR}u) {
+  if (lid.x < ${NR}u) {
     let row = rowBase + lid.x;
     if (row < d.N) {
       let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
@@ -307,11 +309,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       y[row] = select(0.0, y[row], d.acc != 0u) + t;
     }
   }
-}`;
-  function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
-    const pipe = E.getPipeline('q3.gemvQ', GEMVQ_WGSL);
+}`; }
+  function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K, acc, NR) {
+    NR = NR || GEMVQ_NR;
+    const pipe = E.getPipeline(NR === GEMVQ_NR ? 'q3.gemvQ' : 'q3.gemvQ.' + NR, gemvQWgsl(NR));
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
-    const nWG = Math.ceil(N / GEMVQ_NR);
+    const nWG = Math.ceil(N / NR);
     const gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, packBuf, scBuf, yBuf, d], [gx, gy, 1]);
   }
@@ -1178,7 +1181,15 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Router for the int4 weight path. wrec = { pack, scales, N, K }. acc=true →
   // y += result (fused residual add, saves a separate addInPlace pass).
   async function linearQ(xBuf, wrec, yBuf, T, N, K, acc) {
-    if (T === 1) return (globalThis.__noDp4 ? gemvQ : gemvDP4A)(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
+    // Decode: DP4A for the layer projections (measured 1.03-1.13× over gemvQ at N≤3072),
+    // but the HUGE-N shape (lm_head, N=151936) is bandwidth-bound and DP4A's int4→int8
+    // repack ALU makes it 0.81× there — route big N to the f32-dequant gemvQ, and at NR=4
+    // rows/WG (2494µs/35.1GB/s vs NR8 2592/NR16 3002 at the lm_head shape — more WGs win
+    // when N is huge; all GPU timestamps min-of-reps on gen-12lp, warm).
+    if (T === 1) {
+      if (!globalThis.__noDp4 && N < 16384) return gemvDP4A(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
+      return gemvQ(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc, N >= 16384 ? 4 : undefined);
+    }
     // Prefill: int8 DP4A GEMM by default — GPU-timestamp min-of-14 measured 1.25–1.57× over
     // the f16 GEMM on EVERY 0.6B/1.7B shape (gen-12lp's native matmul path is DP4A); the
     // activation-quantize is <2% of the GEMM. __noDp4Gemm forces the f16 path.
@@ -2026,10 +2037,54 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   loop { if (s==0u) { break; } if (lid.x < s) { if (sv[lid.x+s] > sv[lid.x]) { sv[lid.x]=sv[lid.x+s]; si[lid.x]=si[lid.x+s]; } } workgroupBarrier(); s=s/2u; }
   if (lid.x==0u) { outIdx[p.outPos] = si[0]; }   // write into the GPU token history at outPos (next position)
 }`;
+  // TWO-STAGE argmax for the real vocab (151936): the single-workgroup kernel above makes
+  // 256 threads stride ~594 logits each — profiled 306µs/token of pure underparallelization.
+  // Stage 1: AMAX_WGS workgroups reduce interleaved slices → per-WG (max, idx) partials;
+  // stage 2: one workgroup folds the partials and writes the token. Small N keeps 1-stage.
+  const AMAX_WGS = 64;
+  const ARGMAX_P1_WGSL = `
+struct P { n:u32, outPos:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       logits : array<f32>;
+@group(0) @binding(1) var<storage, read_write> partV  : array<f32>;
+@group(0) @binding(2) var<storage, read_write> partI  : array<u32>;
+@group(0) @binding(3) var<uniform>             p      : P;
+var<workgroup> sv : array<f32, ${ARGMAX_WG}>;
+var<workgroup> si : array<u32, ${ARGMAX_WG}>;
+@compute @workgroup_size(${ARGMAX_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  var bv : f32 = -3.0e38; var bi : u32 = 0u;
+  var i = wg.x*${ARGMAX_WG}u + lid.x;                       // interleaved slices → coalesced
+  loop { if (i >= p.n) { break; } let v = logits[i]; if (v > bv) { bv = v; bi = i; } i = i + ${AMAX_WGS * ARGMAX_WG}u; }
+  sv[lid.x] = bv; si[lid.x] = bi; workgroupBarrier();
+  var s = ${ARGMAX_WG}u/2u;
+  loop { if (s==0u) { break; } if (lid.x < s) { if (sv[lid.x+s] > sv[lid.x]) { sv[lid.x]=sv[lid.x+s]; si[lid.x]=si[lid.x+s]; } } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u) { partV[wg.x] = sv[0]; partI[wg.x] = si[0]; }
+}`;
+  const ARGMAX_P2_WGSL = `
+struct P { n:u32, outPos:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       partV  : array<f32>;
+@group(0) @binding(1) var<storage, read>       partI  : array<u32>;
+@group(0) @binding(2) var<storage, read_write> outIdx : array<u32>;
+@group(0) @binding(3) var<uniform>             p      : P;
+var<workgroup> sv : array<f32, ${AMAX_WGS}>;
+var<workgroup> si : array<u32, ${AMAX_WGS}>;
+@compute @workgroup_size(${AMAX_WGS},1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  sv[lid.x] = partV[lid.x]; si[lid.x] = partI[lid.x]; workgroupBarrier();
+  var s = ${AMAX_WGS}u/2u;
+  loop { if (s==0u) { break; } if (lid.x < s) { if (sv[lid.x+s] > sv[lid.x]) { sv[lid.x]=sv[lid.x+s]; si[lid.x]=si[lid.x+s]; } } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u) { outIdx[p.outPos] = si[0]; }
+}`;
+  let _amaxPart = null;   // {v, i} partial buffers (AMAX_WGS entries), freed in unload
   function argmaxKernel(logitsBuf, outBuf, N, outPos) {
-    const pipe = E.getPipeline('q3.argmax', ARGMAX_WGSL);
     const p = uniform(new Uint32Array([N, outPos || 0, 0, 0]));
-    return E.dispatch(pipe, [logitsBuf, outBuf, p], [1, 1, 1]);
+    if (N < 16384 || globalThis.__no2StageArgmax) {   // small N: 1-stage is fine (and what selfTests exercise directly)
+      const pipe = E.getPipeline('q3.argmax', ARGMAX_WGSL);
+      return E.dispatch(pipe, [logitsBuf, outBuf, p], [1, 1, 1]);
+    }
+    if (!_amaxPart) _amaxPart = { v: E.createBuffer(AMAX_WGS * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'amaxV'), i: E.createBuffer(AMAX_WGS * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'amaxI') };
+    E.dispatch(E.getPipeline('q3.argmaxP1', ARGMAX_P1_WGSL), [logitsBuf, _amaxPart.v, _amaxPart.i, p], [AMAX_WGS, 1, 1]);
+    return E.dispatch(E.getPipeline('q3.argmaxP2', ARGMAX_P2_WGSL), [_amaxPart.v, _amaxPart.i, outBuf, p], [1, 1, 1]);
   }
 
   // ============================================================
@@ -2419,6 +2474,17 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       const enc=E.device().createCommandEncoder(); const st=E.createBuffer(4,U.COPY_DST|U.MAP_READ,'s'); enc.copyBufferToBuffer(ob,0,st,0,4); E.device().queue.submit([enc.finish()]);
       await st.mapAsync(GPUMapMode.READ); const idx=new Uint32Array(st.getMappedRange())[0]; st.unmap(); st.destroy();
       check('argmax', idx===3712?0:1);
+      [ab,ob].forEach(b=>b.destroy());
+    }
+    // --- argmax two-stage (vocab-sized N routes to P1+P2; max NOT in slice 0, outPos offset) ---
+    {
+      const N=151936; const a=new Float32Array(N);
+      for(let i=0;i<N;i++)a[i]=Math.sin(i*0.0007)*3; a[98765]=99.0;  // known max deep in the array
+      const ab=f32buf(a), ob=E.createBuffer(16, ST(),'oi2');
+      await argmaxKernel(ab,ob,N,2);   // writes outIdx[2]
+      const enc=E.device().createCommandEncoder(); const st=E.createBuffer(16,U.COPY_DST|U.MAP_READ,'s2'); enc.copyBufferToBuffer(ob,0,st,0,16); E.device().queue.submit([enc.finish()]);
+      await st.mapAsync(GPUMapMode.READ); const idx=new Uint32Array(st.getMappedRange())[2]; st.unmap(); st.destroy();
+      check('argmax 2-stage', idx===98765?0:1);
       [ab,ob].forEach(b=>b.destroy());
     }
     return out;
@@ -3664,6 +3730,34 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { T, S, relErr_vs_deq: +(mx / rf).toExponential(2), plain_us: +plainUs.toFixed(1), q8_us: +q8Us.toFixed(1), ratio: +(plainUs / q8Us).toFixed(2) };
   }
 
+  // Debug bench (no model load): big-N decode GEMV (lm_head shape) — gemvQ NR variants +
+  // the two argmax kernels, GPU-timestamped. P3 tuning gate.
+  async function _benchBigN({ N = 151936, K = 1024, iters = 20, reps = 5 } = {}) {
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); scales.fill(0x3000);
+    const x = new Float32Array(K); for (let i = 0; i < K; i++) x[i] = Math.sin(i * 0.017);
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bn'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), yb = E.createBuffer(N * 4, UF, 'bny'), ob = E.createBuffer(64, UF, 'bno');
+    const prof = async (fn, label) => { E.beginProfile(iters * 2 + 8); E.beginBatch(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.endBatch(); const p = await E.endProfile(); return p.filter(r => !label || r.label.startsWith(label)).reduce((s, r) => s + r.us, 0) / iters; };
+    const out = { N, K };
+    for (const NR of [4, 8, 16]) {
+      let best = Infinity;
+      for (let r = 0; r < reps; r++) best = Math.min(best, await prof(() => gemvQ(xb, pb, sb, yb, N, K, false, NR)));
+      out['gemvQ_NR' + NR + '_us'] = +best.toFixed(1);
+      out['gemvQ_NR' + NR + '_GBs'] = +((N * words * 4 + N * gpr * 2) / best / 1e3).toFixed(1);
+    }
+    let a1 = Infinity, a2 = Infinity;
+    for (let r = 0; r < reps; r++) {
+      globalThis.__no2StageArgmax = true;  a1 = Math.min(a1, await prof(() => argmaxKernel(yb, ob, N, 0), 'q3.argmax'));
+      globalThis.__no2StageArgmax = false; a2 = Math.min(a2, await prof(() => argmaxKernel(yb, ob, N, 0), 'q3.argmax'));
+    }
+    out.argmax_1stage_us = +a1.toFixed(1); out.argmax_2stage_us = +a2.toFixed(1); out.argmax_speedup = +(a1 / a2).toFixed(2);
+    [xb, pb, sb, yb, ob].forEach(b => b.destroy());
+    return out;
+  }
+
   // Debug bench (no model load): time the tiled attention at a realistic prefill shape.
   async function _benchAttn({ T = 128, S = 2790, nHq = 16, nKv = 8, hd = 128, iters = 3 } = {}) {
     const Q = new Float32Array(T * nHq * hd); for (let i = 0; i < Q.length; i++) Q[i] = Math.sin(i * 0.01);
@@ -3773,6 +3867,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _dp4 = null; _dp4dead = []; _dp4g = null; _dp4gDead = [];
     try { for (const b of _decSplitDead) { if (b && b.destroy) try { b.destroy(); } catch (_) {} } if (_decSplit) { _decSplit.po.destroy(); _decSplit.pml.destroy(); } } catch (_) {}
     _decSplit = null; _decSplitDead = [];
+    try { if (_amaxPart) { _amaxPart.v.destroy(); _amaxPart.i.destroy(); } } catch (_) {}
+    _amaxPart = null;
     _weights = null; _kv = null; _scr = null; _scrT = 0; _tokHist = null; _idsBuf = null; _idsCap = 0; _loaded = false; _cachedIds = null; _sysAnchor = null; MAX_SEQ = 4096;
     if (deep) {
       _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
@@ -4096,7 +4192,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels,
     TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
