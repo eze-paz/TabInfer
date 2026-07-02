@@ -1425,7 +1425,39 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return out;
   }
 
-  const GEN_BATCH = 8;   // decode tokens chained GPU-resident per submit (1 readback per batch)
+  const GEN_BATCH = 8;    // decode tokens chained GPU-resident per submit (1 readback per batch)
+  const PIPE_DEPTH = 3;   // batches kept in flight so CPU-encode + GPU-compute + readback overlap
+  // Deep-pipelined decode: submit up to PIPE_DEPTH batches WITHOUT draining, then await the
+  // oldest batch's readback while the GPU chews the queued ones and the CPU encodes the next.
+  // This is the throttle fix — the old loop awaited each batch's drain, so CPU-encode (~58ms)
+  // and GPU-compute (~58ms) ran serially with the vsync-paced readback idle in between.
+  // Pooled uniforms stay correct under pipelining: writeBuffer is queue-ordered and the engine
+  // flushes every 32 ops, so each batch's dispatches consume their uniform values before the
+  // next batch overwrites the pool. emitTok(t) → false to stop. Returns when done/stopped.
+  async function _pipeDecode(startPos, maxTokens, emitTok, signal) {
+    let pos = startPos, submitted = 0;
+    const submitBatch = async () => {
+      if (signal && signal.aborted) return null;
+      const K = Math.min(GEN_BATCH, maxTokens - submitted, MAX_SEQ - 1 - pos);
+      if (K <= 0) return null;
+      const base = pos;
+      E.beginBatch();
+      for (let k = 0; k < K; k++) await forward(null, base + k, { chain: true, argmax: true, batched: true });
+      E.endBatch();   // submit; DON'T await the drain (the readback below implies completion)
+      pos += K; submitted += K;
+      return { read: readU32Range(_scr.tokHist, base + 1, K), K };
+    };
+    const inflight = [];
+    while (inflight.length < PIPE_DEPTH) { const b = await submitBatch(); if (!b) break; inflight.push(b); }
+    while (inflight.length) {
+      const cur = inflight.shift();
+      const toks = await cur.read;
+      let stop = false;
+      for (let k = 0; k < cur.K; k++) { if (!emitTok(toks[k])) { stop = true; break; } }
+      if (stop) break;
+      const b = await submitBatch(); if (b) inflight.push(b);
+    }
+  }
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     if (!_loaded) throw new Error('loadModel first');
     const C = _cfg;
@@ -1444,32 +1476,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     }
     const outIds = [], imEnd = TOK.imEnd();
     if (chainable) {
-      // GPU-RESIDENT chained decode: GEN_BATCH forwards in one submit (embed←tokHist, argmax→tokHist),
-      // ONE readback per batch. Removes the per-token CPU roundtrip that starved GPU submit windows.
-      let _fwdMs = 0, _rbMs = 0;
       // The FIRST token was argmax'd by the last prefill forward into tokHist[L]; emit it, then
-      // the chained forwards consume it as input and produce tokHist[L+1..].
+      // the deep-pipelined loop consumes it as input and produces tokHist[L+1..].
+      const t0 = performance.now();
       let stopped = false;
       { const f = (await readU32Range(_scr.tokHist, ids.length, 1))[0];
         if (f === C.eos || f === imEnd) stopped = true;
         else { outIds.push(f); if (onToken) { try { onToken(TOK.decode([f]), f); } catch (_) {} } } }
-      while (!stopped && outIds.length < maxTokens) {
-        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-        const K = Math.min(GEN_BATCH, maxTokens - outIds.length, MAX_SEQ - 1 - pos);
-        if (K <= 0) break;
-        const tf = performance.now();
-        E.beginBatch();
-        for (let k = 0; k < K; k++) await forward(null, pos + k, { chain: true, argmax: true, batched: true });
-        await E.endBatch();
-        _fwdMs += performance.now() - tf;
-        const tr = performance.now();
-        const toks = await readU32Range(_scr.tokHist, pos + 1, K);   // the K tokens argmax'd this batch
-        _rbMs += performance.now() - tr;
-        for (let k = 0; k < K; k++) { const t = toks[k]; if (t === C.eos || t === imEnd) { stopped = true; break; } outIds.push(t); if (onToken) { try { onToken(TOK.decode(outIds.slice(-4)).slice(-24), t); } catch (_) {} } }
-        pos += K;
-        if (stopped) break;
+      if (!stopped) {
+        await _pipeDecode(pos, maxTokens, (t) => {
+          if (t === C.eos || t === imEnd) return false;
+          outIds.push(t); if (onToken) { try { onToken(TOK.decode(outIds.slice(-4)).slice(-24), t); } catch (_) {} }
+          return outIds.length < maxTokens;
+        }, signal);
       }
-      _lastProf = { mode: 'chained', batch: GEN_BATCH, forward_ms_per_tok: +(_fwdMs / Math.max(1, outIds.length)).toFixed(1), readback_ms_per_tok: +(_rbMs / Math.max(1, outIds.length)).toFixed(1) };
+      _lastProf = { mode: 'pipelined', batch: GEN_BATCH, depth: PIPE_DEPTH, tokps: +(outIds.length / Math.max(1e-3, (performance.now() - t0) / 1000)).toFixed(2) };
     } else {
       let _amMs = 0, _fwdMs = 0;   // fallback: per-token CPU argmax (readback path)
       for (let i = 0; i < maxTokens; i++) {
