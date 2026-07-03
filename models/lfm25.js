@@ -826,8 +826,35 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // distinct experts/forward; the LRU (Map insertion-order = recency) keeps the hot working set
   // resident so skewed routing mostly hits. Misses read one Cache Storage entry (~5.5MB) → slot.
   let _elru = null, _elruFree = [], _slotPool = [], _maxSlots = 256, _estat = { hit: 0, miss: 0 };
-  let _pstat = { syncMs: 0, diskMs: 0, layers: 0 };   // streaming decode timing split (baseline instrument)
+  let _pstat = { syncMs: 0, diskMs: 0, layers: 0, covLayers: 0 };   // streaming decode timing + coverage
   let _routeStage = null;   // persistent COPY_DST|MAP_READ staging for the per-layer routing readback
+  let _logitStage = null;   // persistent staging for the 32 raw router logits (cache-aware selection)
+  let _biasCache = {};      // layer -> Float32Array(nE) expert_bias, primed once (sync access in forward)
+  // CACHE-AWARE ROUTING: replicate the router's top-K on the CPU (sc=sigmoid(logit), sel=sc+bias,
+  // top-K by sel, weights = normalized sc of the chosen) but add a residency bonus λ to experts
+  // already in the LRU. λ=0 → the model's exact routing; λ>0 nudges borderline picks toward
+  // resident experts → higher cache coverage → fewer disk misses. Tunable: globalThis.__cacheRouteLambda.
+  function _cacheAwareSelect(l, logits, nE, K) {
+    const bias = _biasCache[l] || _ZERO32, lam = +globalThis.__cacheRouteLambda || 0;
+    const sc = new Float32Array(nE), sel = new Float32Array(nE);
+    for (let e = 0; e < nE; e++) { const s = 1 / (1 + Math.exp(-logits[e])); sc[e] = s; sel[e] = s + bias[e] + (lam && _elru.has(l + '.' + e) ? lam : 0); }
+    const idx = new Array(K), used = new Uint8Array(nE);
+    for (let k = 0; k < K; k++) { let best = 0, bv = -1e30; for (let j = 0; j < nE; j++) if (!used[j] && sel[j] > bv) { bv = sel[j]; best = j; } used[best] = 1; idx[k] = best; }
+    let sum = 0; for (let k = 0; k < K; k++) sum += sc[idx[k]];
+    const wt = new Float32Array(K); for (let k = 0; k < K; k++) wt[k] = sc[idx[k]] / (sum + 1e-6);
+    let cov = 0; for (let k = 0; k < K; k++) if (_elru.has(l + '.' + idx[k])) cov++;   // resident BEFORE fetch
+    if (cov === K) _pstat.covLayers++;
+    return { idx, wt };
+  }
+  const _ZERO32 = new Float32Array(64);
+  async function _primeBias() {   // read every MoE layer's expert_bias to the CPU once (sync in forward)
+    _biasCache = {};
+    const C = _cfg, nE = C.nExperts;
+    for (let l = C.denseLayers; l < C.numLayers; l++) {
+      const rec = _weights['model.layers.' + l + '.feed_forward.expert_bias'];
+      if (rec && rec.buf) _biasCache[l] = await E.readF32(rec.buf, nE);
+    }
+  }
   function _ensureSlotPool() {
     if (_elru) return;
     const C = _cfg, eI = C.expertI, H = C.hidden;
@@ -916,6 +943,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     if (_streamExperts) {
       _ensureSlotPool();
+      await _primeBias();   // expert_bias to CPU for cache-aware routing's top-K selection
       try { console.log('[lfm25] expert streaming: ' + Object.keys(_expertCatalog).length + ' experts on disk, ' + _maxSlots + ' GPU slots'); } catch (_) {}
     } else if (_cfg.moe && !globalThis.__noMoePack) {
       // all-resident GPU-packed path (only used with __noStreamExperts)
@@ -1611,26 +1639,21 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         // packed expert tensors (no readback) is the queued optimization.
         const nE = C.nExperts, K = C.topK, eI = C.expertI;
         await mv(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, 1, nE, H);   // router logits
-        await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, 1, nE, K);
+        if (!_streamExperts) await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, 1, nE, K);
         if (_streamExperts) {
-          // STREAMING: read the routing back, ensure the 4 chosen experts are resident (fetch
-          // from disk on LRU miss), then run them from their GPU slots. Drains per layer (the
-          // fetch needs the routing on the CPU) — the memory-for-latency tradeoff that lets the
-          // 8B fit. Slots overwritten here are safe: the endBatch below drained prior layers.
-          // ONE round-trip/layer: copy ridx+rwt into a persistent staging buffer inside the
-          // batch, submit (no separate drain), and mapAsync once. Replaces the old 3 round-trips
-          // (endBatch drain + readF32(ridx) + readF32(rwt)) — the sync was 76% of decode time.
+          // STREAMING + CACHE-AWARE ROUTING: read back the 32 RAW router logits (one round-trip/layer
+          // via a persistent staging buffer) and do the top-K selection on the CPU with a residency
+          // bonus λ, so borderline picks prefer experts already in the LRU → fewer disk misses. The
+          // per-slot path consumes CPU idx/wt directly, so no writeBuffer back to the GPU is needed.
           const _ts = performance.now();
-          if (!_routeStage) _routeStage = E.createBuffer(2 * K * 4, U.COPY_DST | U.MAP_READ, 'routeStage');
-          E.copyBuffer(s.ridx, 0, _routeStage, 0, K * 4);
-          E.copyBuffer(s.rwt, 0, _routeStage, K * 4, K * 4);
-          E.endBatch();   // submit only (do NOT await the drain — the mapAsync below waits for the copies)
-          await _routeStage.mapAsync(GPUMapMode.READ);
-          const _mb = _routeStage.getMappedRange();
-          const idx = new Uint32Array(_mb.slice(0, K * 4));
-          const wt = new Float32Array(_mb.slice(K * 4, 2 * K * 4));
-          _routeStage.unmap();
+          if (!_logitStage) _logitStage = E.createBuffer(nE * 4, U.COPY_DST | U.MAP_READ, 'logitStage');
+          E.copyBuffer(s.rlogits, 0, _logitStage, 0, nE * 4);
+          E.endBatch();   // submit only (do NOT await the drain — the mapAsync below waits for the copy)
+          await _logitStage.mapAsync(GPUMapMode.READ);
+          const lg = new Float32Array(_logitStage.getMappedRange().slice(0, nE * 4));
+          _logitStage.unmap();
           _pstat.syncMs += performance.now() - _ts;
+          const { idx, wt } = _cacheAwareSelect(l, lg, nE, K);
           const _td = performance.now();
           const slots = await ensureExpertBatch(l, idx);   // sync slot assign + concurrent miss reads
           _pstat.diskMs += performance.now() - _td; _pstat.layers++;
@@ -1732,7 +1755,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long for bring-up MAX_SEQ');
     _estat = { hit: 0, miss: 0 };   // expert LRU stats for this generation
-    _pstat = { syncMs: 0, diskMs: 0, layers: 0 };   // streaming timing split for this generation
+    _pstat = { syncMs: 0, diskMs: 0, layers: 0, covLayers: 0 };   // streaming timing + coverage for this generation
     // chained decode needs a single-submit forward (no mid-forward readback). Streaming and the
     // __noMoePack fallback both drain per MoE layer, so they use the per-token CPU-argmax path.
     const chainable = !(C.moe && (globalThis.__noMoePack || _streamExperts));
@@ -1744,7 +1767,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       await forward(chunk, pos, { argmax: chainable && (off + CH >= ids.length) });
       pos += chunk.length;
     }
-    _pstat = { syncMs: 0, diskMs: 0, layers: 0 };   // reset after prefill → decode-only split
+    _pstat = { syncMs: 0, diskMs: 0, layers: 0, covLayers: 0 };   // reset after prefill → decode-only split
     const outIds = [], imEnd = TOK.imEnd();
     if (chainable) {
       // The FIRST token was argmax'd by the last prefill forward into tokHist[L]; emit it, then
@@ -1779,7 +1802,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         _fwdMs += performance.now() - tf;
       }
       const _n = Math.max(1, outIds.length);
-      _lastProf = { mode: 'cpu-argmax', argmax_ms_per_tok: +(_amMs / _n).toFixed(1), forward_ms_per_tok: +(_fwdMs / _n).toFixed(1), sync_ms_per_tok: +(_pstat.syncMs / _n).toFixed(1), disk_ms_per_tok: +(_pstat.diskMs / _n).toFixed(1), moe_layers_per_tok: +(_pstat.layers / _n).toFixed(1) };
+      _lastProf = { mode: 'cpu-argmax', argmax_ms_per_tok: +(_amMs / _n).toFixed(1), forward_ms_per_tok: +(_fwdMs / _n).toFixed(1), sync_ms_per_tok: +(_pstat.syncMs / _n).toFixed(1), disk_ms_per_tok: +(_pstat.diskMs / _n).toFixed(1), moe_layers_per_tok: +(_pstat.layers / _n).toFixed(1), lambda: +globalThis.__cacheRouteLambda || 0, layer_coverage: +(_pstat.covLayers / Math.max(1, _pstat.layers)).toFixed(3) };
     }
     try { console.log('[lfm25 prof] ' + JSON.stringify(_lastProf)); } catch (_) {}
     return TOK.decode(outIds);
