@@ -860,7 +860,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const C = _cfg, eI = C.expertI, H = C.hidden, nE = C.nExperts;
     const specs = [['w1', eI, H], ['w3', eI, H], ['w2', H, eI]];
     const nL = C.numLayers - C.denseLayers;
-    let done = 0;
+    let done = 0, requanted = 0;
     for (let l = C.denseLayers; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.feed_forward.';
       for (const [wt, rows, K] of specs) {
@@ -868,19 +868,36 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         const pb3 = rows * gpr * 12, sb3 = rows * gpr * 2;   // per-expert int3 bytes
         const packBuf = E.createBuffer(pb3 * nE, ST(), 'moe3' + l + wt + 'p');
         const scBuf = E.createBuffer(sb3 * nE, ST(), 'moe3' + l + wt + 's');
-        for (let e = 0; e < nE; e++) {
-          const name = p + 'experts.' + e + '.' + wt + '.weight';
-          const ab = await _readExpertBlob(name);
-          const packLen = rows * K / 2;
-          const { p3, s3 } = _requant43(new Uint32Array(ab, 0, packLen / 4), new Uint16Array(ab, packLen, rows * gpr), rows, K);
-          E.device().queue.writeBuffer(packBuf, e * pb3, p3);
-          E.device().queue.writeBuffer(scBuf, e * sb3, s3);
+        // WARM PATH: the int3 artifact is cached per (layer, tensor) — one ~51MB entry of all 32
+        // experts' pack bytes then all scales — so a reload skips the ~3min JS requant entirely.
+        // Entries live under the same /lfm25/v2/ prefix as the int4 set (survive _cleanOldCache).
+        const url = _qcUrl(_variant, 'e3/' + l + '.' + wt);
+        let blob = null;
+        try { const r = _qcache && await _qcache.match(url); if (r) blob = await r.arrayBuffer(); } catch (_) {}
+        if (blob && blob.byteLength === nE * (pb3 + sb3)) {
+          E.device().queue.writeBuffer(packBuf, 0, blob, 0, nE * pb3);
+          E.device().queue.writeBuffer(scBuf, 0, blob, nE * pb3, nE * sb3);
+        } else {
+          // COLD PATH: requant each expert's cached int4 → int3, upload, and persist the pooled entry.
+          const all = new Uint8Array(nE * (pb3 + sb3));
+          for (let e = 0; e < nE; e++) {
+            const ab = await _readExpertBlob(p + 'experts.' + e + '.' + wt + '.weight');
+            const packLen = rows * K / 2;
+            const { p3, s3 } = _requant43(new Uint32Array(ab, 0, packLen / 4), new Uint16Array(ab, packLen, rows * gpr), rows, K);
+            all.set(new Uint8Array(p3.buffer, 0, p3.byteLength), e * pb3);
+            all.set(new Uint8Array(s3.buffer, 0, s3.byteLength), nE * pb3 + e * sb3);
+          }
+          E.device().queue.writeBuffer(packBuf, 0, all.buffer, 0, nE * pb3);
+          E.device().queue.writeBuffer(scBuf, 0, all.buffer, nE * pb3, nE * sb3);
+          try { if (_qcache) await _qcache.put(url, new Response(all)); } catch (_) {}   // best-effort (quota)
+          requanted++;
         }
         _weights['moe3.' + l + '.' + wt] = { pack: packBuf, scales: scBuf, N: rows * nE, K, int3: true, rowsPerExpert: rows };
       }
       done++;
       onProgress && onProgress({ phase: 'int3', pct: Math.round(done / nL * 100) });
     }
+    try { if (requanted) console.log('[lfm25] int3: requantized+cached ' + requanted + ' tensors (next load reads the int3 cache)'); } catch (_) {}
   }
   // Full-chain int3 self-test: random int4 tensors → _requant43 → idxGemv3 vs a CPU reference
   // that dequants the SAME int3 data. Catches packing/extraction layout disagreements exactly.
@@ -1022,7 +1039,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     // EXPERT STREAMING for MoE: experts live on disk, only the ~1.3GB non-expert weights stay
     // GPU-resident (fits the 15GB iGPU). __noStreamExperts forces the old all-resident path.
     _streamExperts = !!m.cfg.moe && !globalThis.__noStreamExperts;
-    _int3Mode = !!m.cfg.moe && !!globalThis.__int3Experts;   // experiment: int3 experts, all-resident
+    // int3 all-resident is the DEFAULT MoE path (15 tok/s vs streaming's ~4.4 on the test box);
+    // __noInt3Experts falls back to int4 streaming for machines without the ~4.3GB residency.
+    _int3Mode = !!m.cfg.moe && !globalThis.__noInt3Experts;
+    MAX_SEQ = Math.max(2048, (globalThis.__lfmMaxSeq | 0) || 8192);
     await E.init();
     _qcache = await caches.open(QC_NAME).catch(() => null);   // on-demand expert reads
     await _cleanOldCache();   // drop prior-version lfm25 entries so v(old)+v(new) can't blow quota
@@ -1726,7 +1746,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   }
 
   // ---- forward state --------------------------------------------------------------
-  const MAX_SEQ = 2048;   // bring-up context
+  // Context window. KV is only on 6 attn layers (conv state is seq-independent) so long ctx is
+  // cheap: 8192 ≈ 200MB f32 KV. Override with globalThis.__lfmMaxSeq (applied at loadModel).
+  let MAX_SEQ = 8192;
   let _scr = null, _kv = null, _conv = null, _idsBuf = null;
   function _ensureState() {
     if (_scr) return;
@@ -1940,19 +1962,36 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (!_loaded) throw new Error('loadModel first');
     const C = _cfg;
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
-    if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long for bring-up MAX_SEQ');
+    if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long: ' + ids.length + ' tokens + ' + maxTokens + ' max new > context ' + MAX_SEQ + ' (raise globalThis.__lfmMaxSeq and reload)');
     _estat = { hit: 0, miss: 0 };   // expert LRU stats for this generation
     _pstat = { syncMs: 0, diskMs: 0, layers: 0, covLayers: 0 };   // streaming timing + coverage for this generation
     // chained decode needs a single-submit forward (no mid-forward readback). Streaming and the
     // __noMoePack fallback both drain per MoE layer, so they use the per-token CPU-argmax path.
     const chainable = !(C.moe && (globalThis.__noMoePack || _streamExperts));
     let pos = 0;
-    const CH = C.moe ? 1 : MATVEC_MAXT;   // MoE runs T=1 (per-token routing); dense chunks at 32
-    for (let off = 0; off < ids.length; off += CH) {   // prefill; last forward GPU-argmaxes → tokHist[L]
-      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-      const chunk = ids.slice(off, Math.min(off + CH, ids.length));
-      await forward(chunk, pos, { argmax: chainable && (off + CH >= ids.length) });
-      pos += chunk.length;
+    if (chainable && C.moe) {
+      // PIPELINED MoE PREFILL: write the whole prompt into tokHist up front, then run chained
+      // T=1 forwards (embed reads tokHist[pos] on the GPU — no per-token ids upload) in groups
+      // of GEN_BATCH with ONE drain per group instead of per token. Same pooled-uniform safety
+      // pattern as _pipeDecode. The last forward GPU-argmaxes the first new token → tokHist[L].
+      _ensureState();
+      E.device().queue.writeBuffer(_scr.tokHist, 0, new Uint32Array(ids));
+      while (pos < ids.length) {
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        const n = Math.min(GEN_BATCH, ids.length - pos);
+        E.beginBatch();
+        for (let i = 0; i < n; i++) await forward(null, pos + i, { chain: true, batched: true, argmax: pos + i === ids.length - 1 });
+        await E.endBatch();
+        pos += n;
+      }
+    } else {
+      const CH = C.moe ? 1 : MATVEC_MAXT;   // MoE runs T=1 (per-token routing); dense chunks at 32
+      for (let off = 0; off < ids.length; off += CH) {   // prefill; last forward GPU-argmaxes → tokHist[L]
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        const chunk = ids.slice(off, Math.min(off + CH, ids.length));
+        await forward(chunk, pos, { argmax: chainable && (off + CH >= ids.length) });
+        pos += chunk.length;
+      }
     }
     _pstat = { syncMs: 0, diskMs: 0, layers: 0, covLayers: 0 };   // reset after prefill → decode-only split
     const outIds = [], imEnd = TOK.imEnd();
