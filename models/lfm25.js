@@ -936,6 +936,54 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     [xb, ib, pb, sb, yb].forEach(b => b.destroy());
     return { maxErr, pass: maxErr < 1e-3 };
   }
+  // Full-chain test for the token-sorted per-expert GEMM: synthetic int3 experts + routing →
+  // moeGemm3 vs a CPU ref that replicates the SAME int8-activation quant + int3 dequant, so a
+  // tight tolerance catches any sort/gather/scatter/tiling index bug (which produce gross errors).
+  async function selfTestMoeGemm() {
+    await E.init(); uniformReset();
+    const nE = 32, N = 128, Kc = 256, T = 64, K = 4, P = T * K, gpr = Kc / QGROUP;
+    const rnd = (n, seed) => { const a = new Float32Array(n); let s = seed; for (let i = 0; i < n; i++) { s = (s * 16807) % 2147483647; a[i] = (s / 2147483647) * 2 - 1; } return a; };
+    const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+    const toBf16 = (f) => { const u = new Uint16Array(f.length); for (let i = 0; i < f.length; i++) { t[0] = f[i]; u[i] = ti[0] >>> 16; } return u; };
+    // per-expert int3 weights [nE, N, Kc] → pool + CPU dequant
+    const pool = new Uint32Array(nE * N * gpr * 3), psc = new Uint16Array(nE * N * gpr);
+    const wdeq = new Float32Array(nE * N * Kc);
+    for (let e = 0; e < nE; e++) {
+      const { pack, scales } = _quantInt4(toBf16(rnd(N * Kc, 5 + e)), N, Kc);
+      const { p3, s3 } = _requant43(pack, scales, N, Kc);
+      pool.set(p3, e * N * gpr * 3); psc.set(s3, e * N * gpr);
+      for (let n = 0; n < N; n++) for (let g = 0; g < gpr; g++) {
+        const sc = _f16ToF32s(s3[(n * gpr + g)]), b0 = p3[(n * gpr + g) * 3], b1 = p3[(n * gpr + g) * 3 + 1], b2 = p3[(n * gpr + g) * 3 + 2];
+        for (let i = 0; i < QGROUP; i++) { const st = ((b0 >>> i) & 1) | (((b1 >>> i) & 1) << 1) | (((b2 >>> i) & 1) << 2); wdeq[(e * N + n) * Kc + g * QGROUP + i] = sc * (st - 4); }
+      }
+    }
+    const srcDiv = 1, srcRows = srcDiv === 1 ? P : T;   // srcDiv=1 exercises the w2 path
+    const src = rnd(srcRows * Kc, 999);
+    const ridx = new Uint32Array(P); { let s = 7; for (let p = 0; p < P; p++) { s = (s * 16807) % 2147483647; ridx[p] = s % nE; } }
+    const mk = (arr) => { const b = E.createBuffer(arr.byteLength, ST(), 'mt'); E.device().queue.writeBuffer(b, 0, arr.buffer, arr.byteOffset, arr.byteLength); return b; };
+    const srcB = mk(src), poolB = mk(pool), pscB = mk(psc), ridxB = mk(ridx);
+    const yB = E.createBuffer(P * N * 4, ST(), 'my');
+    await moeGemm3(srcB, srcRows, { pack: poolB, scales: pscB }, ridxB, yB, P, N, Kc, srcDiv, nE);
+    await E.device().queue.onSubmittedWorkDone();
+    const got = await E.readF32(yB, P * N);
+    // CPU ref: int8-quant src per group (matches QUANTQ8T), int3-dequant weights
+    let maxErr = 0, _dbg = null;
+    for (let p = 0; p < P; p++) {
+      const token = Math.floor(p / srcDiv), e = ridx[p];
+      for (let n = 0; n < N; n++) {
+        let acc = 0;
+        for (let g = 0; g < gpr; g++) {
+          let m = 0; for (let i = 0; i < QGROUP; i++) { const v = Math.abs(src[token * Kc + g * QGROUP + i]); if (v > m) m = v; }
+          const asc = m / 127, inv = asc > 0 ? 1 / asc : 0;
+          for (let i = 0; i < QGROUP; i++) { const kk = g * QGROUP + i; const aq = Math.max(-127, Math.min(127, Math.round(src[token * Kc + kk] * inv))); acc += aq * asc * wdeq[(e * N + n) * Kc + kk]; }
+        }
+        const err = Math.abs(acc - got[p * N + n]);
+        if (err > maxErr) { maxErr = err; _dbg = { p, n, e, got: got[p * N + n], ref: acc }; }
+      }
+    }
+    [srcB, poolB, pscB, ridxB, yB].forEach(b => b.destroy());
+    return { maxErr, pass: maxErr < 3e-2, dbg: _dbg };   // tol covers int8 activation-quant noise
+  }
 
   // ---- expert LRU: fixed pool of GPU slots; disk-resident experts fetched on miss ----------
   // A slot holds one expert (w1/w3/w2 pack+scales). Per-token the router picks 4/layer → 88
@@ -1043,6 +1091,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     // __noInt3Experts falls back to int4 streaming for machines without the ~4.3GB residency.
     _int3Mode = !!m.cfg.moe && !globalThis.__noInt3Experts;
     MAX_SEQ = Math.max(2048, (globalThis.__lfmMaxSeq | 0) || 8192);
+    PREFILL_T = Math.max(MATVEC_MAXT, (globalThis.__lfmPrefillT | 0) || 256);
     await E.init();
     _qcache = await caches.open(QC_NAME).catch(() => null);   // on-demand expert reads
     await _cleanOldCache();   // drop prior-version lfm25 entries so v(old)+v(new) can't blow quota
@@ -1105,6 +1154,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // the 350M speaks coherent text.
   // ============================================================
   const MATVEC_WG = 64, MATVEC_MAXT = 32;
+  let PREFILL_T = 256;     // int3 prefill chunk — big enough for ~PREFILL_T/nE tokens/expert so the
+                           // per-expert GEMM's shared-mem weight tile amortizes across the batch.
+                           // Set from globalThis.__lfmPrefillT at loadModel.
   const MATVECQ_WGSL = `
 enable f16;
 enable subgroups;
@@ -1425,7 +1477,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     _dp4g = { cap: need, xq: E.createBuffer(need, ST(), 'gxq'), xs: E.createBuffer((need / QGROUP) * 4, ST(), 'gxs') };
   }
   function gemmDP4A(xBuf, wrec, yBuf, T, N, K, acc) {
-    ensureDp4G(MATVEC_MAXT, Math.max(K, 8192));   // sized once for the largest dense K (ffI)
+    // Floor K to 8192 so the scratch is a CONSTANT size across every projection in a forward
+    // (K jumps 2048↔7168 between layers) — otherwise a mid-batch grow would destroy a buffer
+    // still referenced by already-recorded dispatches → garbage. T-aware for big prefill chunks.
+    ensureDp4G(Math.max(T, MATVEC_MAXT), Math.max(K, 8192));
     const gpr = K / QGROUP, ng = T * gpr;
     const qp = E.getPipeline('lfm25.quantq8t', QUANTQ8T_WGSL);
     const qd = uniform(new Uint32Array([K, gpr, ng, 0]));
@@ -1434,6 +1489,168 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const pipe = E.getPipeline('lfm25.gemmDP4v2', gemmdp4Wgsl());
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
     return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
+  }
+  // Standalone int8 activation quant of [rows,K] f32 → qBuf [rows,K/4] packed + sBuf [rows,gpr].
+  function quantAct8(srcBuf, qBuf, sBuf, rows, K) {
+    const gpr = K / QGROUP, ng = rows * gpr;
+    const qp = E.getPipeline('lfm25.quantq8t', QUANTQ8T_WGSL);
+    const qd = uniform(new Uint32Array([K, gpr, ng, 0]));
+    const qgx = Math.min(ng, 65535), qgy = Math.ceil(ng / qgx);
+    E.dispatch(qp, [srcBuf, qBuf, sBuf, qd], [qgx, qgy, 1]);
+  }
+
+  // ---- TOKEN-SORTED PER-EXPERT MoE GEMM (mul_mat_id style) — the real prefill fix ------------
+  // The pair-indexed GEMV re-read each expert's weights once PER PAIR (no token reuse). llama.cpp
+  // sorts the T·K (token,expert) pairs by expert, then runs a DENSE tiled GEMM per expert so the
+  // weight tile loaded to shared memory is reused across ALL that expert's token columns. At a big
+  // prefill chunk (~64 tokens/expert) that is the whole batched-prefill win. Steps: counting-sort
+  // the pairs → eoff[nE+1] offsets + sidx[P] (sorted pos → original pair); int8-quant the input;
+  // per-expert DP4A GEMM that GATHERS A-rows via sidx (src = pair/srcDiv) and SCATTERS Y-rows to
+  // the original pair position — so no gather/scatter buffers and downstream stays in pair order.
+  const MOESORT_WG = 256;
+  const MOECOUNT_WGSL = `
+struct D { P:u32, nE:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       ridx : array<u32>;
+@group(0) @binding(1) var<storage, read_write> cnt  : array<atomic<u32>>;
+@group(0) @binding(2) var<uniform>             d    : D;
+@compute @workgroup_size(${MOESORT_WG},1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let p=gid.x; if(p<d.P){ atomicAdd(&cnt[ridx[p]],1u); } }`;
+  const MOEPREFIX_WGSL = `
+struct D { P:u32, nE:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read_write> cnt  : array<u32>;
+@group(0) @binding(1) var<storage, read_write> eoff : array<u32>;
+@group(0) @binding(2) var<storage, read_write> fill : array<atomic<u32>>;
+@group(0) @binding(3) var<uniform>             d    : D;
+@compute @workgroup_size(1,1,1)
+fn main(){ var acc=0u; for(var e=0u;e<d.nE;e=e+1u){ eoff[e]=acc; atomicStore(&fill[e],acc); acc=acc+cnt[e]; }
+  eoff[d.nE]=acc;
+  for(var e=0u;e<d.nE;e=e+1u){ cnt[e]=0u; }   // reset for the next sort IN THIS batch (queue.writeBuffer
+}`;                                            // can't: it flushes before all encoder dispatches, not between
+  const MOESCATTER_WGSL = `
+struct D { P:u32, nE:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       ridx : array<u32>;
+@group(0) @binding(1) var<storage, read_write> fill : array<atomic<u32>>;
+@group(0) @binding(2) var<storage, read_write> sidx : array<u32>;
+@group(0) @binding(3) var<uniform>             d    : D;
+@compute @workgroup_size(${MOESORT_WG},1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>){ let p=gid.x; if(p<d.P){ let pos=atomicAdd(&fill[ridx[p]],1u); sidx[pos]=p; } }`;
+  function moeSort(ridxBuf, P, nE, cntBuf, eoffBuf, fillBuf, sidxBuf) {
+    const d = uniform(new Uint32Array([P, nE, 0, 0]));
+    // cnt starts zero (WebGPU zero-inits new buffers) and moePrefix re-zeros it after each sort,
+    // so counts never accumulate across the many sorts batched into one command encoder.
+    const gx = Math.ceil(P / MOESORT_WG);
+    E.dispatch(E.getPipeline('lfm25.moeCount', MOECOUNT_WGSL), [ridxBuf, cntBuf, d], [gx, 1, 1]);
+    E.dispatch(E.getPipeline('lfm25.moePrefix', MOEPREFIX_WGSL), [cntBuf, eoffBuf, fillBuf, d], [1, 1, 1]);
+    E.dispatch(E.getPipeline('lfm25.moeScatter', MOESCATTER_WGSL), [ridxBuf, fillBuf, sidxBuf, d], [gx, 1, 1]);
+  }
+  // Per-expert int3 GEMM. wg=(N-tile, expert, M-tile); empty (expert,mtile) exit after one read.
+  const MGEMM_BM = 32, MGEMM_BN = 64, MGEMM_TM = 4, MGEMM_TN = 4;
+  function moeGemm3Wgsl() {
+    const BM = MGEMM_BM, BN = MGEMM_BN, BK = QGROUP, TM = MGEMM_TM, TN = MGEMM_TN, BK4 = BK / 4;
+    const NTH = (BM / TM) * (BN / TN), RN = BN / TN, TILEA = BM * BK4, TILEB = BN * BK4;
+    let s = `
+enable f16;
+struct D { N:u32, Kc:u32, K4:u32, gpr:u32, srcDiv:u32, P:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       xq   : array<u32>;   // [srcRows, Kc/4] int8 act
+@group(0) @binding(1) var<storage, read>       xs   : array<f32>;   // [srcRows, gpr] act scales
+@group(0) @binding(2) var<storage, read>       W    : array<u32>;   // int3 bitplane [nE*N, Kc]
+@group(0) @binding(3) var<storage, read>       sc   : array<f16>;   // [nE*N, gpr] weight scales
+@group(0) @binding(4) var<storage, read>       eoff : array<u32>;   // [nE+1]
+@group(0) @binding(5) var<storage, read>       sidx : array<u32>;   // [P] sorted pos → pair
+@group(0) @binding(6) var<storage, read_write> Y    : array<f32>;   // [P, N] (pair-major)
+@group(0) @binding(7) var<uniform>             d    : D;
+var<workgroup> As : array<u32, ${TILEA}>;   // [BM][BK4] int8 act (gathered)
+var<workgroup> Bs : array<u32, ${TILEB}>;   // [BN][BK4] int8 weights (int3→int8)
+var<workgroup> Ss : array<u32, ${BM}>;      // sidx[mBase + lt] for this tile (0 if OOB)
+var<workgroup> Vv : array<u32, ${BM}>;      // valid flag per A-row
+@compute @workgroup_size(${NTH}, 1, 1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let e = wg.y;
+  let eStart = eoff[e]; let eEnd = eoff[e+1u];
+  let mBase = eStart + wg.z*${BM}u;
+  if (mBase >= eEnd) { return; }
+  let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
+  let nBase = wg.x*${BN}u;
+  let nTiles = d.Kc/${BK}u;
+  // resolve this M-tile's source rows once
+  for (var r:u32=0u; r<${Math.ceil(BM / NTH)}u; r=r+1u) {
+    let lt = lx + r*${NTH}u;
+    if (lt < ${BM}u) {
+      let sPos = mBase + lt; let ok = sPos < eEnd;
+      Vv[lt] = select(0u, 1u, ok);
+      Ss[lt] = select(0u, sidx[sPos] / d.srcDiv, ok);   // source activation row
+    }
+  }
+  workgroupBarrier();
+`;
+    for (let r = 0; r < TM * TN; r++) s += `  var f${r}:f32=0.0;\n`;
+    s += `  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
+    let k0 = kt*${BK}u;
+    for (var rr:u32=0u; rr<${TILEA / NTH}u; rr=rr+1u) {
+      let idx = lx + rr*${NTH}u; let lt = idx/${BK4}u; let kk4 = idx%${BK4}u;
+      As[idx] = select(0u, xq[Ss[lt]*d.K4 + k0/4u + kk4], Vv[lt]==1u);
+    }
+    for (var rr:u32=0u; rr<${TILEB / NTH}u; rr=rr+1u) {
+      let idx = lx + rr*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
+      var packed = 0u;
+      if (gn < d.N) {
+        let gwrow = e*d.N + gn; let kk = k0 + kk4*4u; let g = kk/${QGROUP}u; let off = kk%${QGROUP}u;
+        let base = (gwrow*d.gpr + g)*3u; let b0=W[base]; let b1=W[base+1u]; let b2=W[base+2u];
+        let n0 = i32(((b0>>(off))&1u)|(((b1>>(off))&1u)<<1u)|(((b2>>(off))&1u)<<2u)) - 4;
+        let n1 = i32(((b0>>(off+1u))&1u)|(((b1>>(off+1u))&1u)<<1u)|(((b2>>(off+1u))&1u)<<2u)) - 4;
+        let n2 = i32(((b0>>(off+2u))&1u)|(((b1>>(off+2u))&1u)<<1u)|(((b2>>(off+2u))&1u)<<2u)) - 4;
+        let n3 = i32(((b0>>(off+3u))&1u)|(((b1>>(off+3u))&1u)<<1u)|(((b2>>(off+3u))&1u)<<2u)) - 4;
+        packed = pack4xI8(vec4<i32>(n0,n1,n2,n3));
+      }
+      Bs[idx] = packed;
+    }
+    workgroupBarrier();
+`;
+    for (let r = 0; r < TM * TN; r++) s += `    var i${r}:i32=0;\n`;
+    s += `    for (var cc:u32=0u; cc<${BK4}u; cc=cc+1u) {
+`;
+    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u+${i}u)*${BK4}u + cc];\n`;
+    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u+${j}u)*${BK4}u + cc];\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      i${i * TN + j} = i${i * TN + j} + dot4I8Packed(a${i}, b${j});\n`;
+    s += `    }
+`;
+    for (let i = 0; i < TM; i++) s += `    let xsc${i} = select(0.0, xs[Ss[tM*${TM}u+${i}u]*d.gpr + kt], Vv[tM*${TM}u+${i}u]==1u);\n`;
+    for (let j = 0; j < TN; j++) s += `    let wsc${j} = select(0.0, f32(sc[(e*d.N + nBase+tN*${TN}u+${j}u)*d.gpr + kt]), (nBase+tN*${TN}u+${j}u)<d.N);\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `    f${i * TN + j} = f${i * TN + j} + f32(i${i * TN + j}) * xsc${i} * wsc${j};\n`;
+    s += `    workgroupBarrier();
+  }
+`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `  { let lt=tM*${TM}u+${i}u; let gn=nBase+tN*${TN}u+${j}u; if (Vv[lt]==1u && gn<d.N) { Y[Ss2(lt)*d.N + gn] = f${i * TN + j}; } }\n`;
+    s += `}`;
+    // Ss holds src rows (pair/srcDiv); for scatter we need the ORIGINAL pair = sidx[mBase+lt].
+    // Recompute inline via a helper macro replaced below (WGSL has no fn closures over wg vars).
+    s = s.replace(/Ss2\(lt\)/g, 'sidx[mBase + lt]');
+    return s;
+  }
+  let _mgemm = null;   // scratch for MoE GEMM: sort buffers + gathered int8 act
+  function ensureMgemm(P, K, nE) {
+    if (_mgemm && _mgemm.P >= P && _mgemm.K >= K) return;
+    if (_mgemm) { for (const k in _mgemm) if (_mgemm[k] && _mgemm[k].destroy) try { _mgemm[k].destroy(); } catch (_) {} }
+    _mgemm = {
+      P, K,
+      cnt: E.createBuffer(nE * 4, ST(), 'mgc'), eoff: E.createBuffer((nE + 1) * 4, ST(), 'mge'),
+      fill: E.createBuffer(nE * 4, ST(), 'mgf'), sidx: E.createBuffer(P * 4, ST(), 'mgs'),
+      xq: E.createBuffer(P * K, ST(), 'mgxq'), xs: E.createBuffer(P * (K / QGROUP) * 4, ST(), 'mgxs'),
+    };
+  }
+  // Full MoE expert application over T tokens: y[pair,N] = expert(ridx[pair]) applied to src rows.
+  // srcBuf is the input matrix; srcRows = P/srcDiv rows of width Kc (srcDiv=K → per-token normed,
+  // srcDiv=1 → per-pair moeAct). Returns via yBuf [P, N].
+  function moeGemm3(srcBuf, srcRows, wrec, ridxBuf, yBuf, P, N, Kc, srcDiv, nE) {
+    nE = nE || (_cfg && _cfg.nExperts);
+    ensureMgemm(P, Math.max(Kc, 2048), nE);
+    moeSort(ridxBuf, P, nE, _mgemm.cnt, _mgemm.eoff, _mgemm.fill, _mgemm.sidx);
+    quantAct8(srcBuf, _mgemm.xq, _mgemm.xs, srcRows, Kc);
+    const gpr = Kc / QGROUP;
+    const d = uniform(new Uint32Array([N, Kc, Kc / 4, gpr, srcDiv, P, 0, 0]));
+    const pipe = E.getPipeline('lfm25.moeGemm3', moeGemm3Wgsl());
+    return E.dispatch(pipe, [_mgemm.xq, _mgemm.xs, wrec.pack, wrec.scales, _mgemm.eoff, _mgemm.sidx, yBuf, d],
+      [Math.ceil(N / MGEMM_BN), nE, Math.ceil(P / MGEMM_BM)]);
   }
 
   const RMSNORM_WGSL = `
@@ -1865,7 +2082,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   let _scr = null, _kv = null, _conv = null, _idsBuf = null;
   function _ensureState() {
     if (_scr) return;
-    const C = _cfg, H = C.hidden, T = MATVEC_MAXT;
+    const C = _cfg, H = C.hidden, T = Math.max(MATVEC_MAXT, PREFILL_T);   // scratch sized for prefill chunks
     const mk = (n, l) => E.createBuffer(n * 4, ST(), l);
     // w1 shapes are auto-adjusted — read the real intermediate from the weights
     const I = _weights['model.layers.0.feed_forward.w1.weight'].N;
@@ -1915,7 +2132,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     _ensureState();
     const s = _scr;
     if (!opts.chain) {
-      if (!_idsBuf) _idsBuf = E.createBuffer(MATVEC_MAXT * 4, U.STORAGE | U.COPY_DST, 'ids');
+      // Sized for the prefill chunk (was MATVEC_MAXT=32 → the writeBuffer of a >64-token chunk
+      // silently overflowed the 256-byte buffer and was rejected → wrong embeddings → garbage).
+      if (!_idsBuf) _idsBuf = E.createBuffer(Math.max(MATVEC_MAXT, PREFILL_T) * 4, U.STORAGE | U.COPY_DST, 'ids');
       E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(idsArr));
     }
     uniformReset();
@@ -1956,21 +2175,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         await mv(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, T, nE, H);   // router logits [T,nE]
         if (!_streamExperts) await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, T, nE, K);
         if (_int3Mode && _weights['moe3.' + l + '.w1']) {
-          // INT3 ALL-RESIDENT, T-BATCHED: one indexed dispatch covers all T*K (token,expert)
-          // pairs — per-token routing preserved (router emits [T,K] on the GPU), no readback, no
-          // disk. T=32 prefill chunks run through the same three dispatches as T=1 decode, which
-          // is what kills the per-token dispatch overhead that made MoE prefill T=1-bound.
-          // Pair-batched: one dispatch covers all T*K (token,expert) pairs. NOTE an expert-major
-          // "dedup" GEMM (read each active expert once, apply to its pairs) was built + measured
-          // 3× SLOWER despite 4× less traffic — idxGemv3 at P=128 already runs at this GPU's
-          // effective bandwidth wall (~17.5GB/s, L2-assisted) and per-pair cost is flat in P.
           const m1 = W('moe3.' + l + '.w1'), m3 = W('moe3.' + l + '.w3'), m2 = W('moe3.' + l + '.w2');
           const P = T * K;
-          await idxGemv3(s.normed, m1, s.ridx, s.moeGate, P, eI, H, H, K);    // [P, eI]; x row = pair/K
-          await idxGemv3(s.normed, m3, s.ridx, s.moeUp, P, eI, H, H, K);      // [P, eI]
-          await swiglu(s.moeGate, s.moeUp, s.moeAct, P * eI);
-          await idxGemv3(s.moeAct, m2, s.ridx, s.moeOut, P, H, eI, eI, 1);    // [P, H]; x row = pair
-          await moeCombine(s.x, s.moeOut, s.rwt, H, K, T);                    // x[t] += Σ_k wt[t,k]·out[t,k]
+          if (T > 1 && !globalThis.__forceGemv) {
+            // PREFILL: token-sorted per-expert tiled GEMM (mul_mat_id style). At a big chunk
+            // (~PREFILL_T/nE tokens/expert) the shared-mem weight tile is reused across all of an
+            // expert's token columns — the batched-prefill amortization the pair GEMV can't get.
+            await moeGemm3(s.normed, T, m1, s.ridx, s.moeGate, P, eI, H, K);   // srcDiv=K (per-token in)
+            await moeGemm3(s.normed, T, m3, s.ridx, s.moeUp, P, eI, H, K);
+            await swiglu(s.moeGate, s.moeUp, s.moeAct, P * eI);
+            await moeGemm3(s.moeAct, P, m2, s.ridx, s.moeOut, P, H, eI, 1);    // srcDiv=1 (per-pair in)
+          } else {
+            // DECODE (T=1): pair-indexed GEMV — only 4 pairs, sorting/tiling isn't worth it.
+            await idxGemv3(s.normed, m1, s.ridx, s.moeGate, P, eI, H, H, K);
+            await idxGemv3(s.normed, m3, s.ridx, s.moeUp, P, eI, H, H, K);
+            await swiglu(s.moeGate, s.moeUp, s.moeAct, P * eI);
+            await idxGemv3(s.moeAct, m2, s.ridx, s.moeOut, P, H, eI, eI, 1);
+          }
+          await moeCombine(s.x, s.moeOut, s.rwt, H, K, T);                     // x[t] += Σ_k wt[t,k]·out[t,k]
         } else if (_streamExperts) {
           // STREAMING + CACHE-AWARE ROUTING: read back the 32 RAW router logits (one round-trip/layer
           // via a persistent staging buffer) and do the top-K selection on the CPU with a residency
@@ -2105,9 +2327,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         pos += n;
       }
     } else {
-      // CHUNKED PREFILL: dense always; MoE too in int3 mode (the T-batched pair dispatch keeps
-      // per-token routing exact). Streaming MoE stays T=1 (its readback path is per-token).
-      const CH = (C.moe && !_int3Mode) ? 1 : MATVEC_MAXT;
+      // CHUNKED PREFILL: int3 MoE runs big PREFILL_T chunks (token-sorted per-expert GEMM);
+      // dense chunks at MATVEC_MAXT; streaming MoE stays T=1 (its readback path is per-token).
+      const CH = _int3Mode ? PREFILL_T : ((C.moe && !_int3Mode) ? 1 : MATVEC_MAXT);
       for (let off = 0; off < ids.length; off += CH) {   // prefill; last forward GPU-argmaxes → tokHist[L]
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
         const chunk = ids.slice(off, Math.min(off + CH, ids.length));
@@ -2175,7 +2397,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { total_ms: +(total / 1000).toFixed(1), n_dispatch: prof.length, rows };
   }
 
-  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, selfTestInt3, _benchDecode };
+  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, selfTestInt3, selfTestMoeGemm, _benchDecode };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
