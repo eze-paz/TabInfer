@@ -821,6 +821,105 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
   }
 
+  // ---- INT3 EXPERTS (all-resident) ---------------------------------------------------------
+  // int4 experts (~4.35GB) don't fit this GPU resident; int3 (~3.4GB incl. f16 scales) does.
+  // Experts are requantized int4→int3 from the cache at load (cascade requant: dequant the int4
+  // group, rescale so max|q|→4, clamp to [-4,3]) and stored BITPLANE-packed: each group of 32
+  // weights = 3 u32s where u32[b] holds bit b of all 32 (clean WGSL extraction, no straddling).
+  // With everything resident the whole forward is one batch — no readback, no disk, and the
+  // deep-pipelined GEN_BATCH decode path engages. Enable: globalThis.__int3Experts (experiment).
+  let _int3Mode = false;
+  // int4 entry (pack nibbles=q+8, f16 scales, group 32) → int3 bitplanes (stored=q3+4) + f16 scales
+  function _requant43(packU32, scalesU16, rows, K) {
+    const gpr = K / QGROUP, nG = rows * gpr;
+    const p3 = new Uint32Array(nG * 3), s3f = new Float32Array(nG);   // scales as f32, f16-converted in one batch
+    const q4 = new Int32Array(QGROUP);
+    for (let gi = 0; gi < nG; gi++) {
+      const wBase = gi * (QGROUP / 8);   // 4 u32s of int4 per group
+      let m = 0;
+      for (let wI = 0; wI < QGROUP / 8; wI++) {
+        const word = packU32[wBase + wI];
+        for (let i = 0; i < 8; i++) { const q = ((word >>> (4 * i)) & 15) - 8; q4[wI * 8 + i] = q; const a = q < 0 ? -q : q; if (a > m) m = a; }
+      }
+      if (m === 0) { s3f[gi] = 0; p3[gi * 3] = 0; p3[gi * 3 + 1] = 0; p3[gi * 3 + 2] = 0xFFFFFFFF; continue; }   // scale 0 → value irrelevant; store q3=0 (stored 4 = bit2 set)
+      const ratio = 4 / m;
+      s3f[gi] = _f16ToF32s(scalesU16[gi]) * m / 4;
+      let b0 = 0, b1 = 0, b2 = 0;
+      for (let i = 0; i < QGROUP; i++) {
+        let q = Math.round(q4[i] * ratio); if (q > 3) q = 3; else if (q < -4) q = -4;
+        const st = q + 4;   // 0..7
+        b0 |= (st & 1) << i; b1 |= ((st >> 1) & 1) << i; b2 |= ((st >> 2) & 1) << i;
+      }
+      p3[gi * 3] = b0 >>> 0; p3[gi * 3 + 1] = b1 >>> 0; p3[gi * 3 + 2] = b2 >>> 0;
+    }
+    return { p3, s3: E.f32ToF16(s3f) };
+  }
+  // Build the all-resident int3 expert pools from the cached int4 entries: one pack+scales buffer
+  // per (layer, w1|w3|w2), rows laid out expert-major so idxGemv3 indexes row = e*N + n.
+  async function packMoE3(onProgress) {
+    const C = _cfg, eI = C.expertI, H = C.hidden, nE = C.nExperts;
+    const specs = [['w1', eI, H], ['w3', eI, H], ['w2', H, eI]];
+    const nL = C.numLayers - C.denseLayers;
+    let done = 0;
+    for (let l = C.denseLayers; l < C.numLayers; l++) {
+      const p = 'model.layers.' + l + '.feed_forward.';
+      for (const [wt, rows, K] of specs) {
+        const gpr = K / QGROUP;
+        const pb3 = rows * gpr * 12, sb3 = rows * gpr * 2;   // per-expert int3 bytes
+        const packBuf = E.createBuffer(pb3 * nE, ST(), 'moe3' + l + wt + 'p');
+        const scBuf = E.createBuffer(sb3 * nE, ST(), 'moe3' + l + wt + 's');
+        for (let e = 0; e < nE; e++) {
+          const name = p + 'experts.' + e + '.' + wt + '.weight';
+          const ab = await _readExpertBlob(name);
+          const packLen = rows * K / 2;
+          const { p3, s3 } = _requant43(new Uint32Array(ab, 0, packLen / 4), new Uint16Array(ab, packLen, rows * gpr), rows, K);
+          E.device().queue.writeBuffer(packBuf, e * pb3, p3);
+          E.device().queue.writeBuffer(scBuf, e * sb3, s3);
+        }
+        _weights['moe3.' + l + '.' + wt] = { pack: packBuf, scales: scBuf, N: rows * nE, K, int3: true, rowsPerExpert: rows };
+      }
+      done++;
+      onProgress && onProgress({ phase: 'int3', pct: Math.round(done / nL * 100) });
+    }
+  }
+  // Full-chain int3 self-test: random int4 tensors → _requant43 → idxGemv3 vs a CPU reference
+  // that dequants the SAME int3 data. Catches packing/extraction layout disagreements exactly.
+  async function selfTestInt3() {
+    await E.init(); uniformReset();
+    const nE = 4, rows = 8, K = 64, topK = 2, gpr = K / QGROUP;
+    const rnd = (n, seed) => { const a = new Float32Array(n); let s = seed; for (let i = 0; i < n; i++) { s = (s * 16807) % 2147483647; a[i] = (s / 2147483647) * 2 - 1; } return a; };
+    // build per-expert int4 (via the real quantizer path: f32→bf16 u16→_quantInt4), then requant
+    const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+    const toBf16 = (f) => { const u = new Uint16Array(f.length); for (let i = 0; i < f.length; i++) { t[0] = f[i]; u[i] = ti[0] >>> 16; } return u; };
+    const p3All = new Uint32Array(nE * rows * gpr * 3), s3All = new Uint16Array(nE * rows * gpr);
+    const deq = [];   // per-expert CPU dequant of the int3 data
+    for (let e = 0; e < nE; e++) {
+      const { pack, scales } = _quantInt4(toBf16(rnd(rows * K, 31 + e)), rows, K);
+      const { p3, s3 } = _requant43(pack, scales, rows, K);
+      p3All.set(p3, e * rows * gpr * 3); s3All.set(s3, e * rows * gpr);
+      const d = new Float32Array(rows * K);
+      for (let gi = 0; gi < rows * gpr; gi++) {
+        const s = _f16ToF32s(s3[gi]), b0 = p3[gi * 3], b1 = p3[gi * 3 + 1], b2 = p3[gi * 3 + 2];
+        for (let i = 0; i < QGROUP; i++) { const st = ((b0 >>> i) & 1) | (((b1 >>> i) & 1) << 1) | (((b2 >>> i) & 1) << 2); d[gi * QGROUP + i] = s * (st - 4); }
+      }
+      deq.push(d);
+    }
+    const mkBuf = (arr) => { const b = E.createBuffer(arr.byteLength, ST(), 'i3t'); E.device().queue.writeBuffer(b, 0, arr.buffer, arr.byteOffset, arr.byteLength); return b; };
+    const x = rnd(topK * K, 97), idx = new Uint32Array([1, 3]);
+    const xb = mkBuf(new Float32Array(x)), ib = mkBuf(idx), pb = mkBuf(p3All), sb = mkBuf(s3All);
+    const yb = E.createBuffer(topK * rows * 4, ST(), 'i3y');
+    await idxGemv3(xb, { pack: pb, scales: sb }, ib, yb, topK, rows, K, K);   // per-k input stride K
+    await E.device().queue.onSubmittedWorkDone();
+    const got = await E.readF32(yb, topK * rows);
+    let maxErr = 0;
+    for (let k = 0; k < topK; k++) for (let n = 0; n < rows; n++) {
+      let ref = 0; for (let i = 0; i < K; i++) ref += deq[idx[k]][n * K + i] * x[k * K + i];
+      const err = Math.abs(ref - got[k * rows + n]); if (err > maxErr) maxErr = err;
+    }
+    [xb, ib, pb, sb, yb].forEach(b => b.destroy());
+    return { maxErr, pass: maxErr < 1e-3 };
+  }
+
   // ---- expert LRU: fixed pool of GPU slots; disk-resident experts fetched on miss ----------
   // A slot holds one expert (w1/w3/w2 pack+scales). Per-token the router picks 4/layer → 88
   // distinct experts/forward; the LRU (Map insertion-order = recency) keeps the hot working set
@@ -870,17 +969,18 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     });
     _elru = new Map(); _elruFree = _slotPool.slice(); _estat = { hit: 0, miss: 0 };
   }
-  async function _readInto(name, packBuf, scBuf) {
-    const rec = _expertCatalog[name]; if (!rec) throw new Error('expert not in catalog: ' + name);
-    let ab;
+  async function _readExpertBlob(name) {   // one expert entry = concat(int4 pack, f16 scales)
     if (_fsMode) {
       if (!_fsExpertDir) throw new Error('expert folder missing');
-      ab = await _fsRead(_fsExpertDir, name);
-    } else {
-      const resp = await _qcache.match(_qcUrl(_variant, 'e/' + name));
-      if (!resp) throw new Error('expert entry missing on disk: ' + name);
-      ab = await resp.arrayBuffer();
+      return await _fsRead(_fsExpertDir, name);
     }
+    const resp = await _qcache.match(_qcUrl(_variant, 'e/' + name));
+    if (!resp) throw new Error('expert entry missing on disk: ' + name);
+    return await resp.arrayBuffer();
+  }
+  async function _readInto(name, packBuf, scBuf) {
+    const rec = _expertCatalog[name]; if (!rec) throw new Error('expert not in catalog: ' + name);
+    const ab = await _readExpertBlob(name);
     const packLen = rec.N * rec.K / 2;
     E.device().queue.writeBuffer(packBuf, 0, ab, 0, packLen);
     E.device().queue.writeBuffer(scBuf, 0, ab, packLen, ab.byteLength - packLen);
@@ -922,6 +1022,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     // EXPERT STREAMING for MoE: experts live on disk, only the ~1.3GB non-expert weights stay
     // GPU-resident (fits the 15GB iGPU). __noStreamExperts forces the old all-resident path.
     _streamExperts = !!m.cfg.moe && !globalThis.__noStreamExperts;
+    _int3Mode = !!m.cfg.moe && !!globalThis.__int3Experts;   // experiment: int3 experts, all-resident
     await E.init();
     _qcache = await caches.open(QC_NAME).catch(() => null);   // on-demand expert reads
     await _cleanOldCache();   // drop prior-version lfm25 entries so v(old)+v(new) can't blow quota
@@ -941,7 +1042,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       await _streamWeights(m.root + 'model.safetensors', onProgress, sinkOk ? sink : null);
       if (sinkOk) { const committed = await sink.finish(); try { console.log('[lfm25] quant cache ' + (committed ? 'written' : 'NOT written (quota?)')); } catch (_) {} }
     }
-    if (_streamExperts) {
+    if (_int3Mode) {
+      // int3 all-resident: requant the cached int4 experts → resident int3 pools, then leave
+      // streaming OFF so generate takes the chained/pipelined no-readback decode path.
+      await packMoE3(onProgress);
+      _streamExperts = false;
+      try { console.log('[lfm25] int3 experts resident: ' + Object.keys(_expertCatalog).length + ' requantized'); } catch (_) {}
+    } else if (_streamExperts) {
       _ensureSlotPool();
       await _primeBias();   // expert_bias to CPU for cache-aware routing's top-K selection
       try { console.log('[lfm25] expert streaming: ' + Object.keys(_expertCatalog).length + ' experts on disk, ' + _maxSlots + ' GPU slots'); } catch (_) {}
@@ -1480,6 +1587,77 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const pipe = E.getPipeline('lfm25.idxGemv.' + NR + '.' + WG, idxGemvWgsl(NR, WG));
     return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, idxBuf, yBuf, d], [Math.ceil(N / NR), topK, 1]);
   }
+  // int3 variant: weights BITPLANE-packed (group of 32 = 3 u32s; u32[b] holds bit b of all 32
+  // stored values, stored = q+4, q in [-4,3]). One thread processes a whole 32-weight group per
+  // iteration: load the group's 8 x-vec4s once, reuse across the NR rows.
+  function idxGemv3Wgsl(NR, GEMV_WG) { return `
+enable f16;
+enable subgroups;
+struct D { N:u32, Kc:u32, inStride:u32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       x   : array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read>       W   : array<u32>;
+@group(0) @binding(2) var<storage, read>       sc  : array<f16>;
+@group(0) @binding(3) var<storage, read>       idx : array<u32>;
+@group(0) @binding(4) var<storage, read_write> y   : array<f32>;
+@group(0) @binding(5) var<uniform>             d   : D;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let k = wg.y;
+  let e = idx[k];
+  let nBase = wg.x * ${NR}u;
+  let gpr = d.Kc / ${QGROUP}u;
+  let xb = (k * d.inStride) / 4u;
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
+  var g = lid.x;
+  loop {
+    if (g >= gpr) { break; }
+    var xv : array<vec4<f32>, 8>;
+    for (var i:u32=0u; i<8u; i=i+1u) { xv[i] = x[xb + g*8u + i]; }
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
+      let n = nBase + r; if (n >= d.N) { continue; }
+      let row = e*d.N + n;
+      let base = (row*gpr + g)*3u;
+      let b0 = W[base]; let b1 = W[base+1u]; let b2 = W[base+2u];
+      let s = f32(sc[row*gpr + g]);
+      var sum = 0.0;
+      for (var i:u32=0u; i<8u; i=i+1u) {
+        let j = i*4u;
+        let q = vec4<f32>(
+          f32(((b0>>(j   ))&1u) | (((b1>>(j   ))&1u)<<1u) | (((b2>>(j   ))&1u)<<2u)),
+          f32(((b0>>(j+1u))&1u) | (((b1>>(j+1u))&1u)<<1u) | (((b2>>(j+1u))&1u)<<2u)),
+          f32(((b0>>(j+2u))&1u) | (((b1>>(j+2u))&1u)<<1u) | (((b2>>(j+2u))&1u)<<2u)),
+          f32(((b0>>(j+3u))&1u) | (((b1>>(j+3u))&1u)<<1u) | (((b2>>(j+3u))&1u)<<2u))
+        ) - vec4<f32>(4.0);
+        sum = sum + dot(q, xv[i]);
+      }
+      acc[r] = acc[r] + s*sum;
+    }
+    g = g + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
+    let ss = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${NR}u) {
+    let n = nBase + lid.x;
+    if (n < d.N) {
+      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
+      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
+      y[k*d.N + n] = t;
+    }
+  }
+}`; }
+  function idxGemv3(xBuf, rec, idxBuf, yBuf, topK, N, Kc, inStride) {
+    const NR = _NR(), WG = _WG();
+    const d = uniform(new Uint32Array([N, Kc, inStride, 0]));
+    const pipe = E.getPipeline('lfm25.idxGemv3.' + NR + '.' + WG, idxGemv3Wgsl(NR, WG));
+    return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, idxBuf, yBuf, d], [Math.ceil(N / NR), topK, 1]);
+  }
   // combine: x[h] += Σ_k wt[k] * o[k*H + h]   (weighted expert sum into the residual)
   const MOECOMBINE_WGSL = `
 struct D { H:u32, K:u32, _a:u32, _b:u32 };
@@ -1640,7 +1818,16 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const nE = C.nExperts, K = C.topK, eI = C.expertI;
         await mv(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, 1, nE, H);   // router logits
         if (!_streamExperts) await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, 1, nE, K);
-        if (_streamExperts) {
+        if (_int3Mode && _weights['moe3.' + l + '.w1']) {
+          // INT3 ALL-RESIDENT: indexed dispatch straight off the int3 pools — no readback, no
+          // disk, whole forward stays in one batch (so chained/pipelined decode engages).
+          const m1 = W('moe3.' + l + '.w1'), m3 = W('moe3.' + l + '.w3'), m2 = W('moe3.' + l + '.w2');
+          await idxGemv3(s.normed, m1, s.ridx, s.moeGate, K, eI, H, 0);       // [K, eI]
+          await idxGemv3(s.normed, m3, s.ridx, s.moeUp, K, eI, H, 0);         // [K, eI]
+          await swiglu(s.moeGate, s.moeUp, s.moeAct, K * eI);
+          await idxGemv3(s.moeAct, m2, s.ridx, s.moeOut, K, H, eI, eI);       // [K, H], per-k input stride eI
+          await moeCombine(s.x, s.moeOut, s.rwt, H, K);                       // x += Σ_k wt[k]·out[k]
+        } else if (_streamExperts) {
           // STREAMING + CACHE-AWARE ROUTING: read back the 32 RAW router logits (one round-trip/layer
           // via a persistent staging buffer) and do the top-K selection on the CPU with a residency
           // bonus λ, so borderline picks prefer experts already in the LRU → fewer disk misses. The
@@ -1827,7 +2014,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { total_ms: +(total / 1000).toFixed(1), n_dispatch: prof.length, rows };
   }
 
-  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, _benchDecode };
+  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, selfTestInt3, _benchDecode };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
