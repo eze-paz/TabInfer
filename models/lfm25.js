@@ -1322,9 +1322,118 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // 68.9ms — the int4→int8 repack offsets dot4I8Packed here; DP4A kept opt-in via __useDp4 for
   // devices where it wins). prefill T>1 → batched matvecQ.
   function mv(xBuf, rec, yBuf, T, N, K, acc) {
-    if (T !== 1) return matvecQ(xBuf, rec, yBuf, T, N, K, acc);
+    if (T !== 1) return (globalThis.__noDp4Gemm ? matvecQ : gemmDP4A)(xBuf, rec, yBuf, T, N, K, acc);
     if (globalThis.__useDp4) { quantAct(xBuf, K); return gemvDP4(rec, yBuf, N, K, acc); }
     return gemvQ8(xBuf, rec, yBuf, N, K, acc);
+  }
+
+  // ---- DP4A int8 GEMM for T>1 prefill (ported from the qwen3 engine, commit d8db4ed) --------
+  // The T≤32 matvecQ was measured at 490ms per 32-token chunk (15ms/tok) on the 8B's dense
+  // projections. This is the qwen prefill recipe: activations int8-quantized per group on the
+  // GPU, then a 64×64-block tiled GEMM whose inner product is dot4I8Packed — gen-12lp's native
+  // matrix path. Accumulators are CODEGEN-UNROLLED SCALARS: WGSL lowers indexed array<>
+  // accumulators to scratch memory (10× collapse — hit twice now, qwen v1 and lfm25's
+  // abandoned expert-major gemm3e).
+  const GEMMQ_BM = 64, GEMMQ_BN = 64, GEMMQ_TM = 4, GEMMQ_TN = 4;
+  const QUANTQ8T_WGSL = `
+struct Q { K:u32, gpr:u32, ng:u32, _c:u32 };   // ng = T*gpr total (token,group) pairs
+@group(0) @binding(0) var<storage, read>       x  : array<f32>;     // [T,K]
+@group(0) @binding(1) var<storage, read_write> xq : array<u32>;     // [T,K/4] packed int8
+@group(0) @binding(2) var<storage, read_write> xs : array<f32>;     // [T,gpr] group scales
+@group(0) @binding(3) var<uniform>             q  : Q;
+var<workgroup> msh : array<f32, ${QGROUP}>;
+var<workgroup> qsh : array<i32, ${QGROUP}>;
+@compute @workgroup_size(${QGROUP},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let gg = wg.x + wg.y*nwg.x; if (gg >= q.ng) { return; }
+  let t = gg / q.gpr; let g = gg % q.gpr;
+  let lid = lidv.x; let val = x[t*q.K + g*${QGROUP}u + lid];
+  msh[lid] = abs(val); workgroupBarrier();
+  var st = ${QGROUP / 2}u; loop { if(st==0u){break;} if(lid<st){ msh[lid]=max(msh[lid],msh[lid+st]); } workgroupBarrier(); st=st/2u; }
+  let scale = msh[0] / 127.0; let inv = select(0.0, 1.0/scale, scale > 0.0);
+  if (lid==0u) { xs[gg] = scale; }
+  qsh[lid] = clamp(i32(round(val*inv)), -127, 127); workgroupBarrier();
+  if (lid < ${QGROUP / 4}u) {
+    xq[gg*${QGROUP / 4}u + lid] = pack4xI8(vec4<i32>(qsh[lid*4u], qsh[lid*4u+1u], qsh[lid*4u+2u], qsh[lid*4u+3u]));
+  }
+}`;
+  function gemmdp4Wgsl() {
+    const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = QGROUP, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
+    const NTH = (BM / TM) * (BN / TN), RN = BN / TN, TILEA = BM * BK4, TILEB = BN * BK4;
+    let s = `
+enable f16;
+struct D { T:u32, N:u32, K:u32, acc:u32 };
+@group(0) @binding(0) var<storage, read>       xq : array<u32>;   // [T,K/4] packed int8 activations
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;   // int4 packed (q+8), K/8 per row
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;   // [N, K/${QGROUP}]
+@group(0) @binding(3) var<storage, read>       xs : array<f32>;   // [T, K/${QGROUP}]
+@group(0) @binding(4) var<storage, read_write> Y  : array<f32>;   // [T,N]
+@group(0) @binding(5) var<uniform>             d  : D;
+var<workgroup> As : array<u32, ${TILEA}>;   // [BM][BK4] packed int8 activations
+var<workgroup> Bs : array<u32, ${TILEB}>;   // [BN][BK4] packed int8 weights (int4→int8)
+@compute @workgroup_size(${NTH}, 1, 1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
+  let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
+  let mBase = wg.y*${BM}u; let nBase = wg.x*${BN}u;
+  let WPR = d.K/8u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u; let nTiles = d.K/${BK}u;
+`;
+    for (let r = 0; r < TM * TN; r++) s += `  var f${r}:f32=0.0;\n`;
+    s += `  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
+    let k0 = kt*${BK}u;
+    for (var r:u32=0u; r<${TILEA / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let lt = idx/${BK4}u; let kk4 = idx%${BK4}u; let gt = mBase+lt;
+      As[idx] = select(0u, xq[gt*K4 + k0/4u + kk4], gt<d.T);
+    }
+    for (var r:u32=0u; r<${TILEB / NTH}u; r=r+1u) {
+      let idx = lx + r*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
+      var packed = 0u;
+      if (gn < d.N) {
+        let kk = k0 + kk4*4u; let word = W[gn*WPR + (kk>>3u)]; let b = (kk & 7u);
+        let n0 = i32((word >> (4u*(b+0u))) & 0xFu) - 8;
+        let n1 = i32((word >> (4u*(b+1u))) & 0xFu) - 8;
+        let n2 = i32((word >> (4u*(b+2u))) & 0xFu) - 8;
+        let n3 = i32((word >> (4u*(b+3u))) & 0xFu) - 8;
+        packed = pack4xI8(vec4<i32>(n0,n1,n2,n3));
+      }
+      Bs[idx] = packed;
+    }
+    workgroupBarrier();
+`;
+    for (let r = 0; r < TM * TN; r++) s += `    var i${r}:i32=0;\n`;
+    s += `    for (var cc:u32=0u; cc<${BK4}u; cc=cc+1u) {
+`;
+    for (let i = 0; i < TM; i++) s += `      let a${i} = As[(tM*${TM}u+${i}u)*${BK4}u + cc];\n`;
+    for (let j = 0; j < TN; j++) s += `      let b${j} = Bs[(tN*${TN}u+${j}u)*${BK4}u + cc];\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `      i${i * TN + j} = i${i * TN + j} + dot4I8Packed(a${i}, b${j});\n`;
+    s += `    }
+`;
+    for (let i = 0; i < TM; i++) s += `    let xs${i} = select(0.0, xs[(mBase+tM*${TM}u+${i}u)*gpr + kt], (mBase+tM*${TM}u+${i}u)<d.T);\n`;
+    for (let j = 0; j < TN; j++) s += `    let ws${j} = select(0.0, f32(sc[(nBase+tN*${TN}u+${j}u)*gpr + kt]), (nBase+tN*${TN}u+${j}u)<d.N);\n`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `    f${i * TN + j} = f${i * TN + j} + f32(i${i * TN + j}) * xs${i} * ws${j};\n`;
+    s += `    workgroupBarrier();
+  }
+`;
+    for (let i = 0; i < TM; i++) for (let j = 0; j < TN; j++) s += `  { let gm=mBase+tM*${TM}u+${i}u; let gn=nBase+tN*${TN}u+${j}u; if (gm<d.T && gn<d.N) { let idx=gm*d.N+gn; Y[idx]=select(0.0,Y[idx],d.acc!=0u)+f${i * TN + j}; } }\n`;
+    s += `}`;
+    return s;
+  }
+  let _dp4g = null;   // scratch {xq,xs,cap} for the [T,K] int8 activation quant
+  function ensureDp4G(T, K) {
+    const need = T * K;
+    if (_dp4g && _dp4g.cap >= need) return;
+    if (_dp4g) { try { _dp4g.xq.destroy(); _dp4g.xs.destroy(); } catch (_) {} }
+    _dp4g = { cap: need, xq: E.createBuffer(need, ST(), 'gxq'), xs: E.createBuffer((need / QGROUP) * 4, ST(), 'gxs') };
+  }
+  function gemmDP4A(xBuf, wrec, yBuf, T, N, K, acc) {
+    ensureDp4G(MATVEC_MAXT, Math.max(K, 8192));   // sized once for the largest dense K (ffI)
+    const gpr = K / QGROUP, ng = T * gpr;
+    const qp = E.getPipeline('lfm25.quantq8t', QUANTQ8T_WGSL);
+    const qd = uniform(new Uint32Array([K, gpr, ng, 0]));
+    const qgx = Math.min(ng, 65535), qgy = Math.ceil(ng / qgx);
+    E.dispatch(qp, [xBuf, _dp4g.xq, _dp4g.xs, qd], [qgx, qgy, 1]);
+    const pipe = E.getPipeline('lfm25.gemmDP4v2', gemmdp4Wgsl());
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
+    return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
 
   const RMSNORM_WGSL = `
@@ -1610,10 +1719,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // int3 variant: weights BITPLANE-packed (group of 32 = 3 u32s; u32[b] holds bit b of all 32
   // stored values, stored = q+4, q in [-4,3]). One thread processes a whole 32-weight group per
   // iteration: load the group's 8 x-vec4s once, reuse across the NR rows.
+  // PAIR-INDEXED for batched prefill: wg.y ranges over T*K (token,k) pairs; the input row is
+  // (pair / xdiv) * inStride — xdiv=K maps pairs to their token's activation row (w1/w3), xdiv=1
+  // maps each pair to its own row (w2 reading [T*K, eI]). Decode is just T=1 of the same math.
   function idxGemv3Wgsl(NR, GEMV_WG) { return `
 enable f16;
 enable subgroups;
-struct D { N:u32, Kc:u32, inStride:u32, _p:u32 };
+struct D { N:u32, Kc:u32, inStride:u32, xdiv:u32 };
 @group(0) @binding(0) var<storage, read>       x   : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       W   : array<u32>;
 @group(0) @binding(2) var<storage, read>       sc  : array<f16>;
@@ -1624,11 +1736,11 @@ var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
         @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
-  let k = wg.y;
+  let k = wg.y;                              // (token,k) pair index — T*K of them (decode: T=1)
   let e = idx[k];
   let nBase = wg.x * ${NR}u;
   let gpr = d.Kc / ${QGROUP}u;
-  let xb = (k * d.inStride) / 4u;
+  let xb = ((k / d.xdiv) * d.inStride) / 4u;
   var acc : array<f32, ${NR}>;
   for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
   var g = lid.x;
@@ -1672,29 +1784,30 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
   }
 }`; }
-  function idxGemv3(xBuf, rec, idxBuf, yBuf, topK, N, Kc, inStride) {
+  function idxGemv3(xBuf, rec, idxBuf, yBuf, pairs, N, Kc, inStride, xdiv) {
     const NR = _NR(), WG = _WG();
-    const d = uniform(new Uint32Array([N, Kc, inStride, 0]));
+    const d = uniform(new Uint32Array([N, Kc, inStride, xdiv || 1]));
     const pipe = E.getPipeline('lfm25.idxGemv3.' + NR + '.' + WG, idxGemv3Wgsl(NR, WG));
-    return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, idxBuf, yBuf, d], [Math.ceil(N / NR), topK, 1]);
+    return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, idxBuf, yBuf, d], [Math.ceil(N / NR), pairs, 1]);
   }
-  // combine: x[h] += Σ_k wt[k] * o[k*H + h]   (weighted expert sum into the residual)
+  // combine: x[t*H+h] += Σ_k wt[t*K+k] * o[(t*K+k)*H + h]   (per-token weighted expert sum)
   const MOECOMBINE_WGSL = `
-struct D { H:u32, K:u32, _a:u32, _b:u32 };
+struct D { H:u32, K:u32, T:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read_write> x  : array<f32>;
 @group(0) @binding(1) var<storage, read>       o  : array<f32>;
 @group(0) @binding(2) var<storage, read>       wt : array<f32>;
 @group(0) @binding(3) var<uniform>             d  : D;
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
-  let h = gid.y*(nwg.x*64u)+gid.x; if (h >= d.H) { return; }
+  let i = gid.y*(nwg.x*64u)+gid.x; if (i >= d.T*d.H) { return; }
+  let t = i / d.H; let h = i % d.H;
   var s = 0.0;
-  for (var k:u32=0u; k<d.K; k=k+1u) { s = s + wt[k]*o[k*d.H + h]; }
-  x[h] = x[h] + s;
+  for (var k:u32=0u; k<d.K; k=k+1u) { s = s + wt[t*d.K+k]*o[(t*d.K+k)*d.H + h]; }
+  x[i] = x[i] + s;
 }`;
-  function moeCombine(xBuf, oBuf, wtBuf, H, K) {
-    const d = uniform(new Uint32Array([H, K, 0, 0]));
-    const c = Math.ceil(H / 64), gx = Math.min(c, 65535), gy = Math.ceil(c / gx);
+  function moeCombine(xBuf, oBuf, wtBuf, H, K, T) {
+    const d = uniform(new Uint32Array([H, K, T || 1, 0]));
+    const c = Math.ceil((T || 1) * H / 64), gx = Math.min(c, 65535), gy = Math.ceil(c / gx);
     return E.dispatch(E.getPipeline('lfm25.moeCombine', MOECOMBINE_WGSL), [xBuf, oBuf, wtBuf, d], [gx, gy, 1]);
   }
 
@@ -1767,9 +1880,11 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
       last: mk(H, 'last'), logits: mk(C.vocab, 'lg'), tokHist: E.createBuffer(MAX_SEQ * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'th'),
       // MoE scratch (harmless on dense models): expert output [H], router logits [nE], top-k idx/wt,
       // and the GPU-resident indexed-dispatch buffers [K,eI]/[K,H]
-      eout: mk(H, 'eo'), rlogits: mk(Math.max(C.nExperts || 1, 1), 'rl'), ridx: mk(Math.max(C.topK || 1, 1), 'ri'), rwt: mk(Math.max(C.topK || 1, 1), 'rw'),
-      moeGate: mk(Math.max((C.topK || 1) * (C.expertI || 1), 1), 'mg'), moeUp: mk(Math.max((C.topK || 1) * (C.expertI || 1), 1), 'mu'),
-      moeAct: mk(Math.max((C.topK || 1) * (C.expertI || 1), 1), 'ma'), moeOut: mk(Math.max((C.topK || 1) * H, 1), 'mo'),
+      // MoE scratch sized for T-batched prefill chunks (T*K pairs); ~1MB each at T=32, K=4
+      eout: mk(H, 'eo'), rlogits: mk(Math.max(T * (C.nExperts || 1), 1), 'rl'), ridx: mk(Math.max(T * (C.topK || 1), 1), 'ri'), rwt: mk(Math.max(T * (C.topK || 1), 1), 'rw'),
+      moeGate: mk(Math.max(T * (C.topK || 1) * (C.expertI || 1), 1), 'mg'), moeUp: mk(Math.max(T * (C.topK || 1) * (C.expertI || 1), 1), 'mu'),
+      moeAct: mk(Math.max(T * (C.topK || 1) * (C.expertI || 1), 1), 'ma'), moeOut: mk(Math.max(T * (C.topK || 1) * H, 1), 'mo'),
+
     };
     _kv = {}; _conv = {};
     for (let l = 0; l < C.numLayers; l++) {
@@ -1838,17 +1953,24 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         // readback is the correctness-first shortcut; the GPU-resident indexed dispatch over
         // packed expert tensors (no readback) is the queued optimization.
         const nE = C.nExperts, K = C.topK, eI = C.expertI;
-        await mv(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, 1, nE, H);   // router logits
-        if (!_streamExperts) await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, 1, nE, K);
+        await mv(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, T, nE, H);   // router logits [T,nE]
+        if (!_streamExperts) await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, T, nE, K);
         if (_int3Mode && _weights['moe3.' + l + '.w1']) {
-          // INT3 ALL-RESIDENT: indexed dispatch straight off the int3 pools — no readback, no
-          // disk, whole forward stays in one batch (so chained/pipelined decode engages).
+          // INT3 ALL-RESIDENT, T-BATCHED: one indexed dispatch covers all T*K (token,expert)
+          // pairs — per-token routing preserved (router emits [T,K] on the GPU), no readback, no
+          // disk. T=32 prefill chunks run through the same three dispatches as T=1 decode, which
+          // is what kills the per-token dispatch overhead that made MoE prefill T=1-bound.
+          // Pair-batched: one dispatch covers all T*K (token,expert) pairs. NOTE an expert-major
+          // "dedup" GEMM (read each active expert once, apply to its pairs) was built + measured
+          // 3× SLOWER despite 4× less traffic — idxGemv3 at P=128 already runs at this GPU's
+          // effective bandwidth wall (~17.5GB/s, L2-assisted) and per-pair cost is flat in P.
           const m1 = W('moe3.' + l + '.w1'), m3 = W('moe3.' + l + '.w3'), m2 = W('moe3.' + l + '.w2');
-          await idxGemv3(s.normed, m1, s.ridx, s.moeGate, K, eI, H, 0);       // [K, eI]
-          await idxGemv3(s.normed, m3, s.ridx, s.moeUp, K, eI, H, 0);         // [K, eI]
-          await swiglu(s.moeGate, s.moeUp, s.moeAct, K * eI);
-          await idxGemv3(s.moeAct, m2, s.ridx, s.moeOut, K, H, eI, eI);       // [K, H], per-k input stride eI
-          await moeCombine(s.x, s.moeOut, s.rwt, H, K);                       // x += Σ_k wt[k]·out[k]
+          const P = T * K;
+          await idxGemv3(s.normed, m1, s.ridx, s.moeGate, P, eI, H, H, K);    // [P, eI]; x row = pair/K
+          await idxGemv3(s.normed, m3, s.ridx, s.moeUp, P, eI, H, H, K);      // [P, eI]
+          await swiglu(s.moeGate, s.moeUp, s.moeAct, P * eI);
+          await idxGemv3(s.moeAct, m2, s.ridx, s.moeOut, P, H, eI, eI, 1);    // [P, H]; x row = pair
+          await moeCombine(s.x, s.moeOut, s.rwt, H, K, T);                    // x[t] += Σ_k wt[t,k]·out[t,k]
         } else if (_streamExperts) {
           // STREAMING + CACHE-AWARE ROUTING: read back the 32 RAW router logits (one round-trip/layer
           // via a persistent staging buffer) and do the top-K selection on the CPU with a residency
@@ -1969,11 +2091,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     // __noMoePack fallback both drain per MoE layer, so they use the per-token CPU-argmax path.
     const chainable = !(C.moe && (globalThis.__noMoePack || _streamExperts));
     let pos = 0;
-    if (chainable && C.moe) {
-      // PIPELINED MoE PREFILL: write the whole prompt into tokHist up front, then run chained
-      // T=1 forwards (embed reads tokHist[pos] on the GPU — no per-token ids upload) in groups
-      // of GEN_BATCH with ONE drain per group instead of per token. Same pooled-uniform safety
-      // pattern as _pipeDecode. The last forward GPU-argmaxes the first new token → tokHist[L].
+    if (chainable && C.moe && !_int3Mode) {
+      // PIPELINED T=1 MoE PREFILL (int4 all-resident debug path): chained forwards in GEN_BATCH
+      // groups, one drain per group. int3 uses the much faster T=32 chunked prefill below.
       _ensureState();
       E.device().queue.writeBuffer(_scr.tokHist, 0, new Uint32Array(ids));
       while (pos < ids.length) {
@@ -1985,7 +2105,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         pos += n;
       }
     } else {
-      const CH = C.moe ? 1 : MATVEC_MAXT;   // MoE runs T=1 (per-token routing); dense chunks at 32
+      // CHUNKED PREFILL: dense always; MoE too in int3 mode (the T-batched pair dispatch keeps
+      // per-token routing exact). Streaming MoE stays T=1 (its readback path is per-token).
+      const CH = (C.moe && !_int3Mode) ? 1 : MATVEC_MAXT;
       for (let off = 0; off < ids.length; off += CH) {   // prefill; last forward GPU-argmaxes → tokHist[L]
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
         const chunk = ids.slice(off, Math.min(off + CH, ids.length));
