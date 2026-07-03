@@ -50,7 +50,13 @@
     <span id="genstat" class="hi"></span>
     <span id="tps" class="ok" style="margin-left:0.6rem;"></span>
   </div>
-  <p style="color:#6e7681;font-size:0.78rem;margin:0.2rem 0;">First run downloads the weights (cached after). Qwen3.5 emits its reasoning in <code>&lt;think&gt;…&lt;/think&gt;</code> before the answer.</p>
+  <div style="margin:0.4rem 0; display:flex; gap:0.4rem; align-items:center; flex-wrap:wrap;">
+    <button id="fsConnect" title="Pick (or reconnect) a folder on your PC to store the quantized model. Survives cache eviction, never re-downloads.">Connect model folder</button>
+    <button id="fsExport" title="Copy the currently-cached quantized model into the connected folder. Load the model once from HF first.">Export model → folder</button>
+    <button id="fsForget" title="Forget the remembered folder (does not delete files).">Forget folder</button>
+    <span id="fsstat" class="hi"></span>
+  </div>
+  <p style="color:#6e7681;font-size:0.78rem;margin:0.2rem 0;">First run downloads the weights (cached after). For a durable local copy: load once, <b>Connect model folder</b>, then <b>Export → folder</b> — subsequent loads read from your disk (no HF, eviction-proof; one permission click per session). Qwen3.5 emits its reasoning in <code>&lt;think&gt;…&lt;/think&gt;</code> before the answer.</p>
   <pre id="out" style="min-height:3rem;">—</pre>
 </div>
 
@@ -71,7 +77,7 @@
 <script src="../modules/webgpu-engine.js?v=46"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
 <script src="../modules/webgpu-qwen3.js?v=125"></script>
-<script src="../modules/webgpu-lfm25.js?v=20"></script>
+<script src="../modules/webgpu-lfm25.js?v=21"></script>
 <script>
   // Verbose engine logs in the console for this harness.
   try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
@@ -214,6 +220,31 @@
   }
   $('gen').addEventListener('click', () => runGen(false));
   $('genStress').addEventListener('click', () => runGen(true));
+
+  // ---- local model folder (File System Access) ----
+  const fsVariant = () => $('model').value === 'lfm25-8b' ? '8B-A1B' : '350M';
+  async function fsRefresh() {
+    const L = window.SandpieLfm25; if (!L || !L.folderStatus) return;
+    try { const s = await L.folderStatus();
+      $('fsstat').textContent = s.connected ? ('folder: ' + s.name + ' ✓') : s.remembered ? ('folder: ' + s.name + ' (click Connect to re-grant)') : 'no folder connected';
+    } catch (_) {}
+  }
+  $('fsConnect').addEventListener('click', async () => {
+    const L = window.SandpieLfm25;
+    $('fsstat').textContent = 'opening picker…';
+    try { const r = await L.connectModelFolder(); $('fsstat').textContent = 'folder: ' + r.name + ' ✓' + (r.reconnected ? ' (reconnected)' : ''); }
+    catch (e) { $('fsstat').textContent = 'error: ' + (e && e.message || e); }
+  });
+  $('fsExport').addEventListener('click', async () => {
+    const L = window.SandpieLfm25, variant = fsVariant();
+    $('fsExport').disabled = true;
+    try { const r = await L.exportToFolder(variant, (p) => { $('fsstat').textContent = 'exporting ' + variant + ' ' + (p.pct || 0) + '%'; });
+      $('fsstat').textContent = 'exported ' + r.variant + ': ' + r.chunks + ' chunks + ' + r.experts + ' experts ✓ — reload to use'; }
+    catch (e) { $('fsstat').textContent = 'export error: ' + (e && e.message || e); console.error(e); }
+    finally { $('fsExport').disabled = false; }
+  });
+  $('fsForget').addEventListener('click', async () => { await window.SandpieLfm25.forgetModelFolder(); $('fsstat').textContent = 'folder forgotten (files not deleted)'; });
+  window.addEventListener('load', () => setTimeout(fsRefresh, 300));
 
   $('run').addEventListener('click', runAll);
   $('runCaps').addEventListener('click', async () => {

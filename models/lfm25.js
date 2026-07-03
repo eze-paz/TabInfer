@@ -482,6 +482,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   let _streamExperts = false;
   let _expertCatalog = {};   // name -> { N, K } for experts on disk
   let _qcache = null;        // open Cache Storage handle for on-demand expert reads
+  // LOCAL FOLDER STORE: an optional user-picked directory on the real filesystem holding the
+  // same quantized artifact (chunks + manifest + per-expert files). Eviction-proof, portable,
+  // and never re-downloaded. When connected + granted, it takes priority over Cache Storage.
+  let _fsRoot = null;        // persisted FileSystemDirectoryHandle (the folder the user picked)
+  let _fsMode = false;       // current model was loaded from the folder → on-demand reads hit disk
+  let _fsExpertDir = null;   // cached <variant>/e/ handle for on-demand expert reads
 
   async function _uploadTensor(name, info, raw, sink) {
     const numel = info.shape.reduce((a, b) => a * b, 1);
@@ -638,6 +644,110 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return true;
   }
 
+  // ---- local folder store (File System Access API) ---------------------------------
+  // The directory handle is persisted in IndexedDB so it survives reloads; the browser still
+  // requires a user gesture to RE-grant read/write each session unless it persisted the grant.
+  // Layout mirrors the cache: <root>/lfm25-vN/<variant>/{manifest.json, c0..cN, e/<tensor>}.
+  const IDB_DB = 'sandpie-lfm25', IDB_STORE = 'handles', IDB_KEY = 'modelDir';
+  function _idb() {
+    return new Promise((res, rej) => {
+      const r = indexedDB.open(IDB_DB, 1);
+      r.onupgradeneeded = () => { try { r.result.createObjectStore(IDB_STORE); } catch (_) {} };
+      r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+    });
+  }
+  async function _idbSetDir(h) { const db = await _idb(); return new Promise((res, rej) => { const t = db.transaction(IDB_STORE, 'readwrite'); t.objectStore(IDB_STORE).put(h, IDB_KEY); t.oncomplete = () => res(); t.onerror = () => rej(t.error); }); }
+  async function _idbGetDir() { const db = await _idb(); return new Promise((res) => { const t = db.transaction(IDB_STORE, 'readonly'); const rq = t.objectStore(IDB_STORE).get(IDB_KEY); rq.onsuccess = () => res(rq.result || null); rq.onerror = () => res(null); }); }
+  async function _idbDelDir() { const db = await _idb(); return new Promise((res) => { const t = db.transaction(IDB_STORE, 'readwrite'); t.objectStore(IDB_STORE).delete(IDB_KEY); t.oncomplete = () => res(); t.onerror = () => res(); }); }
+  const _perm = async (h, req) => { let p = await h.queryPermission({ mode: 'readwrite' }).catch(() => 'prompt'); if (p !== 'granted' && req) p = await h.requestPermission({ mode: 'readwrite' }).catch(() => 'denied'); return p; };
+  async function _fsVariantDir(variant, create) {
+    if (!_fsRoot) return null;
+    try {
+      const root = await _fsRoot.getDirectoryHandle('lfm25-v' + QC_VER, { create });
+      return await root.getDirectoryHandle(variant, { create });
+    } catch (_) { return null; }
+  }
+  const _fsRead = async (dir, name) => (await (await dir.getFileHandle(name)).getFile()).arrayBuffer();
+  const _fsWrite = async (dir, name, blob) => { const w = await (await dir.getFileHandle(name, { create: true })).createWritable(); await w.write(blob); await w.close(); };
+
+  // Connect (or reconnect) a model folder — MUST be called from a user gesture. Reuses the
+  // remembered handle if one exists (only needs a permission re-grant), else opens the picker.
+  async function connectModelFolder() {
+    if (!globalThis.showDirectoryPicker) throw new Error('File System Access API needs Chrome/Edge desktop');
+    let h = _fsRoot || await _idbGetDir().catch(() => null);
+    if (h) { if (await _perm(h, true) === 'granted') { _fsRoot = h; await _idbSetDir(h).catch(() => {}); return { ok: true, name: h.name, reconnected: true }; } }
+    h = await globalThis.showDirectoryPicker({ id: 'sandpie-lfm25', mode: 'readwrite' });
+    if (await _perm(h, true) !== 'granted') throw new Error('folder permission denied');
+    _fsRoot = h; await _idbSetDir(h);
+    return { ok: true, name: h.name, reconnected: false };
+  }
+  async function folderStatus() {
+    const h = _fsRoot || await _idbGetDir().catch(() => null);
+    if (!h) return { connected: false };
+    return { connected: (await _perm(h, false)) === 'granted', name: h.name, remembered: true };
+  }
+  async function forgetModelFolder() { _fsRoot = null; _fsMode = false; _fsExpertDir = null; await _idbDelDir().catch(() => {}); return { ok: true }; }
+
+  // Copy the cached quantized artifact for `variant` from Cache Storage into the folder. The
+  // model must have been loaded once (cache populated). Manifest is written LAST = commit point.
+  async function exportToFolder(variant, onProgress) {
+    if (!_fsRoot || await _perm(_fsRoot, false) !== 'granted') throw new Error('connect a model folder first');
+    const cache = await caches.open(QC_NAME);
+    const mResp = await cache.match(_qcUrl(variant, 'manifest'));
+    if (!mResp) throw new Error('no cached quantized ' + variant + ' — load it once (from HF) first');
+    const m = await mResp.json();
+    const dir = await _fsVariantDir(variant, true);
+    if (!dir) throw new Error('could not create folder for ' + variant);
+    const experts = m.expertTensors || [];
+    const total = m.nChunks + experts.length; let done = 0;
+    for (let ci = 0; ci < m.nChunks; ci++) {
+      const r = await cache.match(_qcUrl(variant, 'c' + ci)); if (!r) throw new Error('cache chunk ' + ci + ' missing');
+      await _fsWrite(dir, 'c' + ci, await r.blob());
+      onProgress && onProgress({ phase: 'export', pct: Math.round((++done) / total * 100) });
+    }
+    if (experts.length) {
+      const edir = await dir.getDirectoryHandle('e', { create: true });
+      for (const et of experts) {
+        const r = await cache.match(_qcUrl(variant, 'e/' + et.name)); if (!r) throw new Error('cache expert ' + et.name + ' missing');
+        await _fsWrite(edir, et.name, await r.blob());
+        onProgress && onProgress({ phase: 'export', pct: Math.round((++done) / total * 100) });
+      }
+    }
+    await _fsWrite(dir, 'manifest.json', new Blob([JSON.stringify(m)], { type: 'application/json' }));
+    return { ok: true, variant, chunks: m.nChunks, experts: experts.length };
+  }
+
+  // Read the quantized artifact from the folder (mirror of _readQuantCache). Returns false on
+  // any miss/mismatch so the caller falls back to Cache Storage, then download.
+  async function _readFsCache(variant, onProgress) {
+    const dir = await _fsVariantDir(variant, false);
+    if (!dir) return false;
+    let m; try { m = JSON.parse(new TextDecoder().decode(await _fsRead(dir, 'manifest.json'))); } catch (_) { return false; }
+    if (!m || m.ver !== QC_VER || m.qgroup !== QGROUP || m.chunkSize !== QC_CHUNK) return false;
+    const bySeg = [];
+    for (const s of m.segs) {
+      const rec = _weights[s.name] || (_weights[s.name] = s.kind === 'int4' ? { N: s.N, K: s.K, int4: true, shape: s.shape } : { shape: s.shape, ...(s.kind === 'f32' ? { f32: true } : {}) });
+      const buf = E.createBuffer(s.len, ST(), s.name + '.' + s.part);
+      if (s.part === 'pack') rec.pack = buf; else if (s.part === 'scales') rec.scales = buf; else rec.buf = buf;
+      bySeg.push({ ...s, buf });
+    }
+    for (let ci = 0; ci < m.nChunks; ci++) {
+      let bytes; try { bytes = new Uint8Array(await _fsRead(dir, 'c' + ci)); } catch (_) { return false; }
+      const cStart = ci * QC_CHUNK, cEnd = cStart + bytes.byteLength;
+      for (const s of bySeg) {
+        if (s.off + s.len <= cStart || s.off >= cEnd) continue;
+        const b = Math.max(s.off, cStart), e = Math.min(s.off + s.len, cEnd);
+        E.device().queue.writeBuffer(s.buf, b - s.off, bytes.buffer, b - cStart, e - b);
+      }
+      onProgress && onProgress({ phase: 'folder', pct: Math.round((ci + 1) / m.nChunks * 100) });
+    }
+    _expertCatalog = {};
+    for (const et of (m.expertTensors || [])) _expertCatalog[et.name] = { N: et.N, K: et.K };
+    _fsMode = true;
+    try { _fsExpertDir = await dir.getDirectoryHandle('e', { create: false }); } catch (_) { _fsExpertDir = null; }
+    return true;
+  }
+
   async function _streamWeights(url, onProgress, sink) {
     // header: first 8 bytes = u64 header length, then the JSON header (Range requests)
     const h8 = await (await fetch(url, { headers: { Range: 'bytes=0-7' } })).arrayBuffer();
@@ -733,9 +843,15 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
   async function _readInto(name, packBuf, scBuf) {
     const rec = _expertCatalog[name]; if (!rec) throw new Error('expert not in catalog: ' + name);
-    const resp = await _qcache.match(_qcUrl(_variant, 'e/' + name));
-    if (!resp) throw new Error('expert entry missing on disk: ' + name);
-    const ab = await resp.arrayBuffer();
+    let ab;
+    if (_fsMode) {
+      if (!_fsExpertDir) throw new Error('expert folder missing');
+      ab = await _fsRead(_fsExpertDir, name);
+    } else {
+      const resp = await _qcache.match(_qcUrl(_variant, 'e/' + name));
+      if (!resp) throw new Error('expert entry missing on disk: ' + name);
+      ab = await resp.arrayBuffer();
+    }
     const packLen = rec.N * rec.K / 2;
     E.device().queue.writeBuffer(packBuf, 0, ab, 0, packLen);
     E.device().queue.writeBuffer(scBuf, 0, ab, packLen, ab.byteLength - packLen);
@@ -773,7 +889,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       try { await E.device().queue.onSubmittedWorkDone(); } catch (_) {}
       _freeState(); unload();
     }
-    _variant = variant; _cfg = m.cfg; _weights = {}; _expertCatalog = {};
+    _variant = variant; _cfg = m.cfg; _weights = {}; _expertCatalog = {}; _fsMode = false; _fsExpertDir = null;
     // EXPERT STREAMING for MoE: experts live on disk, only the ~1.3GB non-expert weights stay
     // GPU-resident (fits the 15GB iGPU). __noStreamExperts forces the old all-resident path.
     _streamExperts = !!m.cfg.moe && !globalThis.__noStreamExperts;
@@ -782,9 +898,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     await _cleanOldCache();   // drop prior-version lfm25 entries so v(old)+v(new) can't blow quota
     await TOK.load(m.root);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
-    // FAST PATH: quantized-weights cache (skips download AND re-quantize)
+    // Silently adopt a remembered folder if the browser persisted the grant (no gesture needed);
+    // otherwise the user reconnects it via connectModelFolder() and reloads.
+    if (!_fsRoot) { try { const h = await _idbGetDir(); if (h && (await _perm(h, false)) === 'granted') _fsRoot = h; } catch (_) {} }
+    // FASTEST PATH: local folder on real disk (eviction-proof) → then Cache Storage → then download.
     let hit = false;
-    try { hit = await _readQuantCache(variant, onProgress); } catch (e) { try { console.warn('[lfm25] cache read failed — falling back to download', e); } catch (_) {} _weights = {}; _expertCatalog = {}; hit = false; }
+    if (_fsRoot) { try { hit = await _readFsCache(variant, onProgress); if (hit) console.log('[lfm25] loaded from local folder'); } catch (e) { try { console.warn('[lfm25] folder read failed — trying cache', e); } catch (_) {} _weights = {}; _expertCatalog = {}; _fsMode = false; hit = false; } }
+    if (!hit) try { hit = await _readQuantCache(variant, onProgress); } catch (e) { try { console.warn('[lfm25] cache read failed — falling back to download', e); } catch (_) {} _weights = {}; _expertCatalog = {}; hit = false; }
     if (!hit) {
       _weights = {}; _expertCatalog = {};
       const sink = _makeSink(variant);
@@ -1666,7 +1786,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { total_ms: +(total / 1000).toFixed(1), n_dispatch: prof.length, rows };
   }
 
-  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, _benchDecode };
+  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, _benchDecode };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
