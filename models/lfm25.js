@@ -474,11 +474,28 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Quant plan by tensor name (lfm2 + lfm2_moe families).
   const _isInt4 = (name) => /(_proj|\.w[123]|feed_forward\.gate)\.weight$/.test(name);   // router gate int4 too (reuses matvecQ)
   const _isF32 = (name) => /expert_bias/.test(name);
+  const _isExpert = (name) => /\.experts\.\d+\./.test(name);
+  // EXPERT STREAMING: the 8B has ~3.9GB of experts (only 12.5% touched/token) but they can't
+  // all fit resident on a 15GB shared-memory iGPU. So experts live ON DISK (Cache Storage, one
+  // entry per expert tensor) and only the ~4 the router picks per layer are fetched into a small
+  // per-token LRU of GPU slots. Non-expert weights (~0.9GB) stay resident. Enabled for MoE.
+  let _streamExperts = false;
+  let _expertCatalog = {};   // name -> { N, K } for experts on disk
+  let _qcache = null;        // open Cache Storage handle for on-demand expert reads
 
   async function _uploadTensor(name, info, raw, sink) {
     const numel = info.shape.reduce((a, b) => a * b, 1);
     const u16 = new Uint16Array(raw.buffer, raw.byteOffset, numel);
     const put = (buf, arr) => E.device().queue.writeBuffer(buf, 0, arr.buffer === undefined ? arr : new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength));
+    // Streaming: an expert tensor never touches the GPU at load — quantize and write it to its
+    // own Cache Storage entry; ensureExpert() fetches it on demand during decode.
+    if (_streamExperts && _isExpert(name)) {
+      const K = info.shape[info.shape.length - 1], rows = numel / K;
+      const { pack, scales } = _quantInt4(u16, rows, K);
+      if (sink) await sink.addExpert(name, pack, scales, { N: rows, K });
+      _expertCatalog[name] = { N: rows, K };
+      return;
+    }
     if (_isInt4(name) && info.shape.length >= 2 && (info.shape[info.shape.length - 1] % QGROUP) === 0) {
       const K = info.shape[info.shape.length - 1], rows = numel / K;
       const { pack, scales } = _quantInt4(u16, rows, K);
@@ -522,12 +539,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // straight into them — no download, no re-quantize, peak host RAM = one chunk.
   // Namespaced under /lfm25/ so it coexists with the qwen3 cache in the same Cache bucket.
   const QC_NAME = 'sandpie-webgpu-quant';
-  const QC_VER = 1;
+  const QC_VER = 2;   // v2: experts stored as individual cache entries (streaming), not in chunks
   const QC_CHUNK = 64 * 1024 * 1024;
   const _qcUrl = (variant, part) => 'https://sandpie.quant/lfm25/v' + QC_VER + '/' + variant + '/' + part;
   function _makeSink(variant) {
     let cache = null, buf = new Uint8Array(QC_CHUNK), used = 0, chunkIdx = 0, globalOff = 0, dead = false;
-    const segs = [];
+    const segs = [], expertTensors = [];
     const flush = async () => {
       if (!used) return;
       await cache.put(_qcUrl(variant, 'c' + chunkIdx), new Response(buf.subarray(0, used)));
@@ -536,6 +553,18 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return {
       async open() {
         try { cache = await caches.open(QC_NAME); await cache.delete(_qcUrl(variant, 'manifest')); return true; } catch (_) { dead = true; return false; }
+      },
+      // one Cache Storage entry per expert tensor = concat(pack, scales) — read on demand
+      async addExpert(name, pack, scales, meta) {
+        if (dead) return;
+        try {
+          const p = new Uint8Array(pack.buffer, pack.byteOffset, pack.byteLength);
+          const s = new Uint8Array(scales.buffer, scales.byteOffset, scales.byteLength);
+          const body = new Uint8Array(p.byteLength + s.byteLength);
+          body.set(p, 0); body.set(s, p.byteLength);
+          await cache.put(_qcUrl(variant, 'e/' + name), new Response(body));
+          expertTensors.push({ name, packLen: p.byteLength, scLen: s.byteLength, N: meta.N, K: meta.K });
+        } catch (e) { dead = true; try { console.warn('[lfm25] expert cache write failed', e); } catch (_) {} }
       },
       async add(name, part, arr, meta) {
         if (dead) return;
@@ -558,12 +587,24 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         if (dead) return false;
         try {
           await flush();
-          const manifest = { ver: QC_VER, qgroup: QGROUP, chunkSize: QC_CHUNK, nChunks: chunkIdx, totalBytes: globalOff, segs };
+          const manifest = { ver: QC_VER, qgroup: QGROUP, chunkSize: QC_CHUNK, nChunks: chunkIdx, totalBytes: globalOff, segs, expertTensors };
           await cache.put(_qcUrl(variant, 'manifest'), new Response(JSON.stringify(manifest), { headers: { 'content-type': 'application/json' } }));
           return true;
         } catch (_) { return false; }
       },
     };
+  }
+  // Delete lfm25 cache entries from a PRIOR QC_VER (format change) so the old + new copies
+  // don't coexist and exceed quota (v1 8B + v2 8B ≈ 10.4GB).
+  async function _cleanOldCache() {
+    try {
+      if (!_qcache) return;
+      const cur = '/lfm25/v' + QC_VER + '/';
+      const keys = await _qcache.keys();
+      let n = 0;
+      for (const req of keys) { if (req.url.indexOf('/lfm25/') >= 0 && req.url.indexOf(cur) < 0) { await _qcache.delete(req); n++; } }
+      if (n) try { console.log('[lfm25] cleaned ' + n + ' stale-version cache entries'); } catch (_) {}
+    } catch (_) {}
   }
   async function _readQuantCache(variant, onProgress) {
     let cache; try { cache = await caches.open(QC_NAME); } catch (_) { return false; }
@@ -591,6 +632,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       }
       onProgress && onProgress({ phase: 'cache', pct: Math.round((ci + 1) / m.nChunks * 100) });
     }
+    // experts stay on disk — record the catalog for on-demand ensureExpert() fetches
+    _expertCatalog = {};
+    for (const et of (m.expertTensors || [])) _expertCatalog[et.name] = { N: et.N, K: et.K };
     return true;
   }
 
@@ -667,6 +711,56 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
   }
 
+  // ---- expert LRU: fixed pool of GPU slots; disk-resident experts fetched on miss ----------
+  // A slot holds one expert (w1/w3/w2 pack+scales). Per-token the router picks 4/layer → 88
+  // distinct experts/forward; the LRU (Map insertion-order = recency) keeps the hot working set
+  // resident so skewed routing mostly hits. Misses read one Cache Storage entry (~5.5MB) → slot.
+  let _elru = null, _elruFree = [], _slotPool = [], _maxSlots = 256, _estat = { hit: 0, miss: 0 };
+  function _ensureSlotPool() {
+    if (_elru) return;
+    const C = _cfg, eI = C.expertI, H = C.hidden;
+    const packBytes = eI * H / 2, scBytes = eI * (H / QGROUP) * 2;   // w1/w3/w2 uniform (eI*H == H*eI)
+    // 512 slots ≈ 3.2GB (+ ~0.9GB non-expert = ~4.4GB resident); measured 92.6% LRU hit / 1.62
+    // tok/s on the 15GB test box (2.2GB headroom). Lower __expertSlots if free RAM is tighter.
+    _maxSlots = Math.max(96, (globalThis.__expertSlots | 0) || 512);
+    _slotPool = [];
+    for (let i = 0; i < _maxSlots; i++) _slotPool.push({
+      w1p: E.createBuffer(packBytes, ST(), 'sw1p'), w1s: E.createBuffer(scBytes, ST(), 'sw1s'),
+      w3p: E.createBuffer(packBytes, ST(), 'sw3p'), w3s: E.createBuffer(scBytes, ST(), 'sw3s'),
+      w2p: E.createBuffer(packBytes, ST(), 'sw2p'), w2s: E.createBuffer(scBytes, ST(), 'sw2s'),
+    });
+    _elru = new Map(); _elruFree = _slotPool.slice(); _estat = { hit: 0, miss: 0 };
+  }
+  async function _readInto(name, packBuf, scBuf) {
+    const rec = _expertCatalog[name]; if (!rec) throw new Error('expert not in catalog: ' + name);
+    const resp = await _qcache.match(_qcUrl(_variant, 'e/' + name));
+    if (!resp) throw new Error('expert entry missing on disk: ' + name);
+    const ab = await resp.arrayBuffer();
+    const packLen = rec.N * rec.K / 2;
+    E.device().queue.writeBuffer(packBuf, 0, ab, 0, packLen);
+    E.device().queue.writeBuffer(scBuf, 0, ab, packLen, ab.byteLength - packLen);
+  }
+  // Ensure the K experts of one layer are resident; return their slots. Slot assignment is
+  // SYNCHRONOUS (no async race on the LRU), then all miss reads run CONCURRENTLY (Cache Storage
+  // serves parallel reads far faster than the old serial 12-reads-per-layer).
+  async function ensureExpertBatch(l, es) {
+    const slots = new Array(es.length), reads = [];
+    for (let i = 0; i < es.length; i++) {
+      const e = es[i], key = l + '.' + e;
+      const hit = _elru.get(key);
+      if (hit) { _elru.delete(key); _elru.set(key, hit); _estat.hit++; slots[i] = hit; continue; }
+      _estat.miss++;
+      let slot;
+      if (_elruFree.length) slot = _elruFree.pop();
+      else { const ok = _elru.keys().next().value; slot = _elru.get(ok); _elru.delete(ok); }   // evict LRU (oldest, never this batch's fresh ones)
+      _elru.set(key, slot); slots[i] = slot;   // reserve now so a later miss in this batch can't evict it
+      const base = 'model.layers.' + l + '.feed_forward.experts.' + e + '.';
+      reads.push(_readInto(base + 'w1.weight', slot.w1p, slot.w1s), _readInto(base + 'w3.weight', slot.w3p, slot.w3s), _readInto(base + 'w2.weight', slot.w2p, slot.w2s));
+    }
+    if (reads.length) await Promise.all(reads);
+    return slots;
+  }
+
   async function loadModel({ variant = '350M', onProgress } = {}) {
     if (_loaded && _variant === variant) return;
     const m = MODELS[variant]; if (!m) throw new Error('unknown LFM2.5 variant ' + variant);
@@ -679,22 +773,32 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       try { await E.device().queue.onSubmittedWorkDone(); } catch (_) {}
       _freeState(); unload();
     }
-    _variant = variant; _cfg = m.cfg; _weights = {};
+    _variant = variant; _cfg = m.cfg; _weights = {}; _expertCatalog = {};
+    // EXPERT STREAMING for MoE: experts live on disk, only the ~1.3GB non-expert weights stay
+    // GPU-resident (fits the 15GB iGPU). __noStreamExperts forces the old all-resident path.
+    _streamExperts = !!m.cfg.moe && !globalThis.__noStreamExperts;
     await E.init();
+    _qcache = await caches.open(QC_NAME).catch(() => null);   // on-demand expert reads
+    await _cleanOldCache();   // drop prior-version lfm25 entries so v(old)+v(new) can't blow quota
     await TOK.load(m.root);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
     // FAST PATH: quantized-weights cache (skips download AND re-quantize)
     let hit = false;
-    try { hit = await _readQuantCache(variant, onProgress); } catch (e) { try { console.warn('[lfm25] cache read failed — falling back to download', e); } catch (_) {} _weights = {}; hit = false; }
+    try { hit = await _readQuantCache(variant, onProgress); } catch (e) { try { console.warn('[lfm25] cache read failed — falling back to download', e); } catch (_) {} _weights = {}; _expertCatalog = {}; hit = false; }
     if (!hit) {
-      _weights = {};
+      _weights = {}; _expertCatalog = {};
       const sink = _makeSink(variant);
       const sinkOk = await sink.open();
       await _streamWeights(m.root + 'model.safetensors', onProgress, sinkOk ? sink : null);
       if (sinkOk) { const committed = await sink.finish(); try { console.log('[lfm25] quant cache ' + (committed ? 'written' : 'NOT written (quota?)')); } catch (_) {} }
     }
-    // GPU-resident MoE: pack experts (from cache OR fresh — both leave per-expert buffers in _weights).
-    if (_cfg.moe && !globalThis.__noMoePack) { await packMoE(onProgress); try { console.log('[lfm25] experts packed for GPU-resident dispatch'); } catch (_) {} }
+    if (_streamExperts) {
+      _ensureSlotPool();
+      try { console.log('[lfm25] expert streaming: ' + Object.keys(_expertCatalog).length + ' experts on disk, ' + _maxSlots + ' GPU slots'); } catch (_) {}
+    } else if (_cfg.moe && !globalThis.__noMoePack) {
+      // all-resident GPU-packed path (only used with __noStreamExperts)
+      await packMoE(onProgress); try { console.log('[lfm25] experts packed for GPU-resident dispatch'); } catch (_) {}
+    }
     _loaded = true;
   }
   function unload() {
@@ -1329,7 +1433,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     if (_idsBuf) try { _idsBuf.destroy(); } catch (_) {}
     try { if (_amaxV) _amaxV.destroy(); if (_amaxI) _amaxI.destroy(); } catch (_) {}
     try { if (_dp4) { _dp4.xq.destroy(); _dp4.xs.destroy(); } } catch (_) {}
+    try { for (const sl of _slotPool) for (const b of Object.values(sl)) { if (b && b.destroy) b.destroy(); } } catch (_) {}
     _scr = null; _kv = null; _conv = null; _idsBuf = null; _amaxV = null; _amaxI = null; _dp4 = null;
+    _slotPool = []; _elru = null; _elruFree = []; _expertCatalog = {};
   }
 
   // One forward over T tokens at absolute positions [posBase, posBase+T).
@@ -1384,7 +1490,25 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         const nE = C.nExperts, K = C.topK, eI = C.expertI;
         await mv(s.normed, W(p + 'feed_forward.gate.weight'), s.rlogits, 1, nE, H);   // router logits
         await router(s.rlogits, W(p + 'feed_forward.expert_bias').buf, s.ridx, s.rwt, 1, nE, K);
-        if (_weights['moe.' + l + '.w1']) {
+        if (_streamExperts) {
+          // STREAMING: read the routing back, ensure the 4 chosen experts are resident (fetch
+          // from disk on LRU miss), then run them from their GPU slots. Drains per layer (the
+          // fetch needs the routing on the CPU) — the memory-for-latency tradeoff that lets the
+          // 8B fit. Slots overwritten here are safe: the endBatch below drained prior layers.
+          await E.endBatch();
+          const idx = new Uint32Array((await E.readF32(s.ridx, K)).buffer);
+          const wt = await E.readF32(s.rwt, K);
+          const slots = await ensureExpertBatch(l, idx);   // sync slot assign + concurrent miss reads
+          E.beginBatch();
+          for (let k = 0; k < K; k++) {
+            const sl = slots[k];
+            await mv(s.normed, { pack: sl.w1p, scales: sl.w1s }, s.gate, 1, eI, H);
+            await mv(s.normed, { pack: sl.w3p, scales: sl.w3s }, s.up, 1, eI, H);
+            await swiglu(s.gate, s.up, s.swi, eI);
+            await mv(s.swi, { pack: sl.w2p, scales: sl.w2s }, s.eout, 1, H, eI);
+            await axpy(s.x, s.eout, H, wt[k]);
+          }
+        } else if (_weights['moe.' + l + '.w1']) {
           // GPU-RESIDENT indexed dispatch — no readback, whole block stays batched.
           const w1 = W('moe.' + l + '.w1'), w3 = W('moe.' + l + '.w3'), w2 = W('moe.' + l + '.w2');
           await idxGemv(s.normed, w1, s.ridx, s.moeGate, K, eI, H, 0);        // [K, eI]
@@ -1472,9 +1596,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     const C = _cfg;
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
     if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long for bring-up MAX_SEQ');
-    // chained decode needs the GPU-resident path (no mid-forward readback); the __noMoePack
-    // fallback can't chain, so it uses per-token CPU argmax.
-    const chainable = !(C.moe && globalThis.__noMoePack);
+    _estat = { hit: 0, miss: 0 };   // expert LRU stats for this generation
+    // chained decode needs a single-submit forward (no mid-forward readback). Streaming and the
+    // __noMoePack fallback both drain per MoE layer, so they use the per-token CPU-argmax path.
+    const chainable = !(C.moe && (globalThis.__noMoePack || _streamExperts));
     let pos = 0;
     const CH = C.moe ? 1 : MATVEC_MAXT;   // MoE runs T=1 (per-token routing); dense chunks at 32
     for (let off = 0; off < ids.length; off += CH) {   // prefill; last forward GPU-argmaxes → tokHist[L]
@@ -1541,7 +1666,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { total_ms: +(total / 1000).toFixed(1), n_dispatch: prof.length, rows };
   }
 
-  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, _benchDecode };
+  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, _benchDecode };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
