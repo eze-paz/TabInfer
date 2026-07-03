@@ -2305,7 +2305,8 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
     if (!_loaded) throw new Error('loadModel first');
     const C = _cfg;
-    const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
+    // prompt may be a full message array (system/user/assistant/…) or a bare user string.
+    const ids = Array.isArray(prompt) ? TOK.encodeChat(prompt) : TOK.encodeChat([{ role: 'user', content: prompt }]);
     if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long: ' + ids.length + ' tokens + ' + maxTokens + ' max new > context ' + MAX_SEQ + ' (raise globalThis.__lfmMaxSeq and reload)');
     _estat = { hit: 0, miss: 0 };   // expert LRU stats for this generation
     _pstat = { syncMs: 0, diskMs: 0, layers: 0, covLayers: 0 };   // streaming timing + coverage for this generation
@@ -2397,7 +2398,155 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return { total_ms: +(total / 1000).toFixed(1), n_dispatch: prof.length, rows };
   }
 
-  return { CONFIG, MODELS, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, selfTestInt3, selfTestMoeGemm, _benchDecode };
+  // ============================================================
+  // App integration: the engine-facing surface conversations.js/providers.js use, mirroring
+  // webgpu-qwen3's (DEFAULT_MODELS, DEFAULT_N_CTX, setToolRunner, runConversation, unload).
+  // The main-thread shim (webgpu-host.js) forwards to a Worker (webgpu-worker.js) that runs
+  // THIS engine off the main thread — so the GPU decode loop can't be starved by page compositing.
+  // ============================================================
+  const DEFAULT_MODELS = [
+    { id: 'lfm25-8b', modelId: '8B-A1B', label: 'LFM2.5-8B-A1B MoE (int3, ~4.3GB — ~15 tok/s)' },
+  ];
+  const DEFAULT_N_CTX = 8192;
+  const isVariant = (v) => v && Object.prototype.hasOwnProperty.call(MODELS, v);
+
+  let _toolRunner = null;
+  function setToolRunner(fn) { _toolRunner = (typeof fn === 'function') ? fn : null; }
+
+  // Hermes tool block — the same format webgpu-qwen3 uses; LFM2.5 is a capable instruct model
+  // and follows it via the system prompt. (Its native Pythonic call format is a later refinement.)
+  function toolPreamble(tools) {
+    const fns = (tools || []).filter(t => t && t.type === 'function' && t.function);
+    if (!fns.length) return '';
+    const sigs = fns.map(t => JSON.stringify({ type: 'function', function: t.function })).join('\n');
+    return ['# Tools', '', 'You may call one or more functions to assist with the user query.', '',
+      'You are provided with function signatures within <tools></tools> XML tags:', '<tools>', sigs, '</tools>', '',
+      'For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:',
+      '<tool_call>', '{"name": <function-name>, "arguments": <args-json-object>}', '</tool_call>'].join('\n');
+  }
+  // Streaming splitter: <think>…</think> → reasoning, <tool_call>…</tool_call> → buffered payload,
+  // else content. 12-char guard tail so a tag split across token pieces is still caught.
+  function makeRoundParser(onReason, onContent) {
+    let buf = '', state = 'normal', cur = '';
+    const acc = { content: '', reasoning: '', toolCalls: [] };
+    const NEEDLES = { normal: ['<think>', '<tool_call>'], think: ['</think>'], tool: ['</tool_call>'] };
+    const out = (text) => { if (!text) return; if (state === 'think') { acc.reasoning += text; onReason(text); } else if (state === 'tool') { cur += text; } else { acc.content += text; onContent(text); } };
+    const step = () => {
+      for (;;) {
+        let bi = -1, bn = null;
+        for (const n of NEEDLES[state]) { const idx = buf.indexOf(n); if (idx !== -1 && (bi === -1 || idx < bi)) { bi = idx; bn = n; } }
+        if (bi === -1) break;
+        out(buf.slice(0, bi)); buf = buf.slice(bi + bn.length);
+        if (bn === '<think>') state = 'think'; else if (bn === '</think>') state = 'normal';
+        else if (bn === '<tool_call>') { state = 'tool'; cur = ''; } else if (bn === '</tool_call>') { state = 'normal'; if (cur.trim()) acc.toolCalls.push(cur.trim()); cur = ''; }
+      }
+      if (buf.length > 12) { out(buf.slice(0, buf.length - 12)); buf = buf.slice(buf.length - 12); }
+    };
+    return { push(t) { buf += t; step(); }, flush() { out(buf); buf = ''; if (state === 'tool' && cur.trim()) acc.toolCalls.push(cur.trim()); },
+      get content() { return acc.content; }, get reasoning() { return acc.reasoning; }, get toolCalls() { return acc.toolCalls; }, get state() { return state; } };
+  }
+  const tcText = (tcs) => (tcs || []).map(tc => '<tool_call>\n{"name": "' + ((tc.function && tc.function.name) || '') + '", "arguments": ' + ((tc.function && tc.function.arguments) || '{}') + '}\n</tool_call>').join('\n');
+  const normMsg = (m) => {
+    let c = m.content;
+    if (Array.isArray(c)) c = c.filter(p => p && p.type === 'text').map(p => p.text || '').join('\n');
+    c = (c == null) ? '' : String(c);
+    if (m.role === 'tool') return { role: 'user', content: '<tool_response>\n' + c + '\n</tool_response>' };
+    if (m.role === 'assistant' && Array.isArray(m.tool_calls) && m.tool_calls.length) c = c ? (c + '\n' + tcText(m.tool_calls)) : tcText(m.tool_calls);
+    return { role: m.role, content: c };
+  };
+
+  async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
+    const want = (provider && (provider.endpoint || provider.modelId)) || '';
+    const variant = isVariant(want) ? want : '8B-A1B';
+    try {
+      emit({ type: 'info', message: 'Loading LFM2.5-' + variant + ' (WebGPU)… first run downloads + quantizes; cached after.' });
+      let lastPct = -1;
+      await loadModel({ variant, onProgress: (p) => {
+        if (!p) return;
+        if (p.phase === 'download') { const pct = p.pct | 0; if (pct === lastPct) return; lastPct = pct; emit({ type: 'info', message: 'Downloading weights… ' + pct + '%' }); }
+        else if (p.phase === 'int3') emit({ type: 'info', message: 'Quantizing experts to int3… ' + (p.pct || 0) + '% (one-time; cached)' });
+        else if (p.phase === 'cache' || p.phase === 'folder') emit({ type: 'info', message: 'Loading from cache… ' + (p.pct || 0) + '%' });
+        else if (p.phase === 'tokenizer') emit({ type: 'info', message: 'Loading tokenizer…' });
+      } });
+    } catch (e) {
+      emit({ type: 'info', message: null });
+      if (e && e.name === 'AbortError') throw e;
+      emit({ type: 'error', message: 'LFM2.5: ' + ((e && e.message) || e) }); emit({ type: 'agent_done' }); return;
+    }
+    const ctxCap = MAX_SEQ;
+    let sys = (systemPrompt && typeof systemPrompt === 'object') ? (systemPrompt.content || '') : (systemPrompt || '');
+    const toolList = (Array.isArray(tools) ? tools : []).filter(t => t && t.type === 'function');
+    const pre = toolPreamble(toolList);
+    if (pre) sys = sys ? (sys + '\n\n' + pre) : pre;
+    const work = [];
+    if (sys) work.push({ role: 'system', content: sys });
+    for (const m of (messages || [])) { if (m && m.role) work.push(normMsg(m)); }
+
+    const MAX_ROUNDS = toolList.length ? 8 : 1;
+    try {
+      for (let round = 0; round < MAX_ROUNDS; round++) {
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        emit({ type: 'round_start' });
+        let firstTok = false;
+        const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
+        const parser = makeRoundParser(
+          (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },
+          (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },
+        );
+        // Budget: leave room under the context window for the encoded prompt. Clean incremental
+        // decode in the callback (re-decode the running id list → emit only the new suffix) so
+        // multibyte UTF-8 that spans tokens renders correctly and the parser sees clean deltas.
+        const encLen = TOK.encodeChat(work).length;
+        let budget = (provider && (provider.maxTokens | 0)) || 0;
+        const room = Math.max(16, ctxCap - encLen - 8);
+        budget = budget ? Math.min(budget, room) : room;
+        const outIds = []; let prevLen = 0;
+        await generate(work, { maxTokens: budget, signal, onToken: (_txt, id) => {
+          outIds.push(id); const full = TOK.decode(outIds); const d = full.slice(prevLen); prevLen = full.length; parser.push(d);
+        } });
+        parser.flush();
+        if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+        emit({ type: 'info', message: null });
+
+        let content = parser.content.replace(/^\s+/, '');
+        const toolCalls = [];
+        parser.toolCalls.forEach((raw, k) => { try { const o = JSON.parse(raw); if (o && o.name) toolCalls.push({ id: 'call_' + round + '_' + k, type: 'function', function: { name: o.name, arguments: JSON.stringify(o.arguments || {}) } }); } catch (_) {} });
+        if (!content && !toolCalls.length) {
+          content = (parser.state === 'think' || parser.reasoning.length > 0)
+            ? '⚠️ I ran out of room to answer near the model\'s context limit (' + ctxCap + ' tokens). Start a new chat or remove a large earlier message.'
+            : '⚠️ The model produced no output. Try resending, or start a new chat if the history is very long.';
+          emit({ type: 'delta', delta: { content } });
+        }
+        if (toolCalls.length) emit({ type: 'delta', delta: { tool_calls: toolCalls.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } })) } });
+        emit({ type: 'round_end', content });
+        const asst = { role: 'assistant', content };
+        if (toolCalls.length) asst.tool_calls = toolCalls;
+        emit({ type: 'message_added', message: asst });
+        work.push(normMsg(asst));
+        if (!toolCalls.length) break;
+        if (!_toolRunner) { emit({ type: 'info', message: null }); break; }
+        for (const tc of toolCalls) {
+          if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+          emit({ type: 'tool_started', tc });
+          let args = {}; try { args = JSON.parse(tc.function.arguments || '{}'); } catch (_) {}
+          let out;
+          try { out = await _toolRunner(tc.function.name, args, convId, signal); }
+          catch (e) { if (e && e.name === 'AbortError') throw e; out = { result: 'Error: ' + ((e && e.message) || e) }; }
+          const toolResult = (out && out.result != null) ? out.result : '';
+          emit({ type: 'tool_result', id: tc.id, result: toolResult, artifacts: out && out.artifacts });
+          work.push(normMsg({ role: 'tool', tool_call_id: tc.id, content: toolResult }));
+          emit({ type: 'message_added', message: { role: 'tool', tool_call_id: tc.id, content: toolResult } });
+        }
+      }
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      emit({ type: 'info', message: null });
+      emit({ type: 'error', message: 'LFM2.5: ' + ((e && e.message) || e) });
+    }
+    emit({ type: 'agent_done' });
+  }
+
+  return { CONFIG, MODELS, DEFAULT_MODELS, DEFAULT_N_CTX, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, runConversation, setToolRunner, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, selfTestInt3, selfTestMoeGemm, _benchDecode };
 })();
 
 if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;

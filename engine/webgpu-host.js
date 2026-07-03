@@ -15,10 +15,13 @@
   // automatically by Chrome on engaged/installed origins; harmless if denied.
   try { navigator.storage && navigator.storage.persist && navigator.storage.persist().then(function (granted) { try { console.log('[sandpie] persistent storage: ' + (granted ? 'granted' : 'denied (caches may be evicted)')); } catch (_) {} }, function () {}); } catch (_) {}
 
-  // KEEP IN SYNC with DEFAULT_MODELS in webgpu-qwen3.js (the worker's real engine).
+  // KEEP IN SYNC with DEFAULT_MODELS in the worker's engines (webgpu-qwen3.js + webgpu-lfm25.js).
+  // The worker routes each run to the right engine by modelId, so all WebGPU models can live in
+  // this one list. modelId must match a key the target engine recognizes (Qwen CONFIGS / LFM MODELS).
   const DEFAULT_MODELS = [
     { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (~1.1GB download)' },
     { id: 'qwen3-1.7b', modelId: '1.7B', label: 'Qwen3-1.7B dense (~3.9GB download)' },
+    { id: 'lfm25-8b', modelId: '8B-A1B', label: 'LFM2.5-8B-A1B MoE (int3, ~4.3GB — ~15 tok/s decode, 125 prefill)' },
   ];
   const DEFAULT_N_CTX = 4096;
 
@@ -72,7 +75,7 @@
 
   function worker() {
     if (_worker) return _worker;
-    _worker = new Worker('modules/webgpu-worker.js?v=30');
+    _worker = new Worker('modules/webgpu-worker.js?v=31');
     _worker.onmessage = (e) => {
       const m = e.data || {};
       if (m.t === 'fatal') { console.error('[webgpu-host]', m.message); return; }
