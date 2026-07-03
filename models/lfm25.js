@@ -670,6 +670,15 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   async function loadModel({ variant = '350M', onProgress } = {}) {
     if (_loaded && _variant === variant) return;
     const m = MODELS[variant]; if (!m) throw new Error('unknown LFM2.5 variant ' + variant);
+    // CRITICAL: free the PREVIOUS model's GPU buffers before loading a new variant. Without
+    // this, switching 350M→8B leaked ~all of the 350M's weights + scratch/KV/conv buffers
+    // (reassigning _weights={} orphaned them without .destroy()), so the 8B's ~5.2GB piled on
+    // top → GPU OOM → whole GPU process crash (browser blanks) → device lost. Drain first so
+    // no in-flight work references the buffers we're about to destroy.
+    if (_loaded || _weights || _scr) {
+      try { await E.device().queue.onSubmittedWorkDone(); } catch (_) {}
+      _freeState(); unload();
+    }
     _variant = variant; _cfg = m.cfg; _weights = {};
     await E.init();
     await TOK.load(m.root);
