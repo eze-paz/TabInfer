@@ -1870,7 +1870,6 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
   // the whole MoE block stays batched. GEMVQ_NR rows/workgroup, subgroupAdd reduction.
   function idxGemvWgsl(NR, GEMV_WG) { return `
 enable f16;
-enable subgroups;
 struct D { N:u32, Kc:u32, inStride:u32, _p:u32 };
 @group(0) @binding(0) var<storage, read>       x   : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       W   : array<u32>;
@@ -1880,8 +1879,7 @@ struct D { N:u32, Kc:u32, inStride:u32, _p:u32 };
 @group(0) @binding(5) var<uniform>             d   : D;
 var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let k = wg.y;                              // selected-expert slot
   let e = idx[k];
   let nBase = wg.x * ${NR}u;                 // first output row (within the expert's N rows)
@@ -1905,19 +1903,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${NR}u; r=r+1u) {
-    let ss = subgroupAdd(acc[r]);
-    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
-  }
-  workgroupBarrier();
+${wgReduceWGSL(NR, GEMV_WG)}
   if (lid.x < ${NR}u) {
     let n = nBase + lid.x;
-    if (n < d.N) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
-      y[k*d.N + n] = t;
-    }
+    if (n < d.N) { y[k*d.N + n] = part[lid.x*${GEMV_WG}u + 0u]; }
   }
 }`; }
   function idxGemv(xBuf, rec, idxBuf, yBuf, topK, N, Kc, inStride) {

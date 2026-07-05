@@ -75,7 +75,7 @@
 
   function worker() {
     if (_worker) return _worker;
-    _worker = new Worker('modules/webgpu-worker.js?v=32');
+    _worker = new Worker('modules/webgpu-worker.js?v=33');
     _worker.onmessage = (e) => {
       const m = e.data || {};
       if (m.t === 'fatal') { console.error('[webgpu-host]', m.message); return; }
