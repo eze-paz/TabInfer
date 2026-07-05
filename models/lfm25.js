@@ -1157,6 +1157,21 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   let PREFILL_T = 256;     // int3 prefill chunk — big enough for ~PREFILL_T/nE tokens/expert so the
                            // per-expert GEMM's shared-mem weight tile amortizes across the batch.
                            // Set from globalThis.__lfmPrefillT at loadModel.
+  // Subgroup-FREE workgroup reduction: sum acc[0..CNT) across all WG threads, leaving row r's
+  // full sum in part[r*WG + 0]. Replaces the subgroupAdd epilogue, which returns WRONG sums on
+  // some GPUs (measured: Adreno 7xx, subgroup width 128) when the workgroup is a PARTIAL subgroup
+  // (WG < hardware subgroup width — e.g. our WG=32). A plain shared-memory tree reduce is correct
+  // on every GPU regardless of subgroup width or the `subgroups` feature. Needs WG a power of two
+  // and `var<workgroup> part: array<f32, CNT*WG>` declared. lid must be the local id.
+  function wgReduceWGSL(CNT, WG) {
+    return `
+  for (var _r:u32=0u; _r<${CNT}u; _r=_r+1u) { part[_r*${WG}u + lid.x] = acc[_r]; }
+  workgroupBarrier();
+  for (var _st:u32=${WG >> 1}u; _st>0u; _st=_st>>1u) {
+    if (lid.x < _st) { for (var _r:u32=0u; _r<${CNT}u; _r=_r+1u) { part[_r*${WG}u + lid.x] = part[_r*${WG}u + lid.x] + part[_r*${WG}u + lid.x + _st]; } }
+    workgroupBarrier();
+  }`;
+  }
   const MATVECQ_WGSL = `
 enable f16;
 enable subgroups;
@@ -1221,7 +1236,6 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const _WG = () => Math.max(32, (globalThis.__gemvWG | 0) || _gemvWG);
   function gemvQ8Wgsl(NR, GEMV_WG) { return `
 enable f16;
-enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _p:u32 };
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;
@@ -1231,8 +1245,7 @@ struct D { N:u32, K:u32, acc:u32, _p:u32 };
 var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+        @builtin(num_workgroups) nwg:vec3<u32>) {
   let nBase = (wg.x + wg.y*nwg.x) * ${NR}u;
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
   var acc : array<f32, ${NR}>;
@@ -1252,19 +1265,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${NR}u; r=r+1u) {
-    let ss = subgroupAdd(acc[r]);
-    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
-  }
-  workgroupBarrier();
+${wgReduceWGSL(NR, GEMV_WG)}
   if (lid.x < ${NR}u) {
     let n = nBase + lid.x;
-    if (n < d.N) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
-      y[n] = select(0.0, y[n], d.acc != 0u) + t;
-    }
+    if (n < d.N) { y[n] = select(0.0, y[n], d.acc != 0u) + part[lid.x*${GEMV_WG}u + 0u]; }
   }
 }`; }
   function gemvQ8(xBuf, rec, yBuf, N, K, acc) {
@@ -1315,7 +1319,6 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
   function gemvDP4Wgsl(NR, GEMV_WG) { return `
 enable f16;
-enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _p:u32 };
 @group(0) @binding(0) var<storage, read>       xq : array<u32>;
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;
@@ -1326,8 +1329,7 @@ struct D { N:u32, K:u32, acc:u32, _p:u32 };
 var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+        @builtin(num_workgroups) nwg:vec3<u32>) {
   let nBase = (wg.x + wg.y*nwg.x) * ${NR}u;
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
   var acc : array<f32, ${NR}>;
@@ -1347,19 +1349,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${NR}u; r=r+1u) {
-    let ss = subgroupAdd(acc[r]);
-    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
-  }
-  workgroupBarrier();
+${wgReduceWGSL(NR, GEMV_WG)}
   if (lid.x < ${NR}u) {
     let n = nBase + lid.x;
-    if (n < d.N) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
-      y[n] = select(0.0, y[n], d.acc != 0u) + t;
-    }
+    if (n < d.N) { y[n] = select(0.0, y[n], d.acc != 0u) + part[lid.x*${GEMV_WG}u + 0u]; }
   }
 }`; }
   function gemvDP4(rec, yBuf, N, K, acc) {   // caller ran quantAct(input, K) → _dp4
@@ -1941,7 +1934,6 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // maps each pair to its own row (w2 reading [T*K, eI]). Decode is just T=1 of the same math.
   function idxGemv3Wgsl(NR, GEMV_WG) { return `
 enable f16;
-enable subgroups;
 struct D { N:u32, Kc:u32, inStride:u32, xdiv:u32 };
 @group(0) @binding(0) var<storage, read>       x   : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       W   : array<u32>;
@@ -1951,8 +1943,7 @@ struct D { N:u32, Kc:u32, inStride:u32, xdiv:u32 };
 @group(0) @binding(5) var<uniform>             d   : D;
 var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
-fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let k = wg.y;                              // (token,k) pair index — T*K of them (decode: T=1)
   let e = idx[k];
   let nBase = wg.x * ${NR}u;
@@ -1986,19 +1977,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     g = g + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${NR}u; r=r+1u) {
-    let ss = subgroupAdd(acc[r]);
-    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
-  }
-  workgroupBarrier();
+${wgReduceWGSL(NR, GEMV_WG)}
   if (lid.x < ${NR}u) {
     let n = nBase + lid.x;
-    if (n < d.N) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
-      y[k*d.N + n] = t;
-    }
+    if (n < d.N) { y[k*d.N + n] = part[lid.x*${GEMV_WG}u + 0u]; }
   }
 }`; }
   function idxGemv3(xBuf, rec, idxBuf, yBuf, pairs, N, Kc, inStride, xdiv) {

@@ -139,19 +139,42 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(local_invocation_
   // guards; out-of-range weight reads are bounds-checked to 0 and never written).
   const GEMV_WG = 64;
   const GEMV_NR = 4;   // output rows per workgroup
+  // Subgroup-FREE workgroup reduction: sum acc[0..CNT) across the WG threads into part[r*WG+0].
+  // Replaces the subgroupAdd epilogue, which returns WRONG sums on some GPUs (measured: Adreno
+  // 7xx) for the multi-row decode GEMVs — a plain shared-memory tree reduce is correct on every
+  // GPU/subgroup width. Needs WG a power of two and `var<workgroup> part: array<f32, CNT*WG>`.
+  function wgReduceWGSL(CNT, WG, accName) {
+    const a = accName || 'acc';
+    return `
+  for (var _r:u32=0u; _r<${CNT}u; _r=_r+1u) { part[_r*${WG}u + lid.x] = ${a}[_r]; }
+  workgroupBarrier();
+  for (var _st:u32=${WG >> 1}u; _st>0u; _st=_st>>1u) {
+    if (lid.x < _st) { for (var _r:u32=0u; _r<${CNT}u; _r=_r+1u) { part[_r*${WG}u + lid.x] = part[_r*${WG}u + lid.x] + part[_r*${WG}u + lid.x + _st]; } }
+    workgroupBarrier();
+  }`;
+  }
+  // Dual-accumulator variant (gate+up fused): reduces ga→pg and ua→pu together. Sums land in
+  // pg[r*WG+0] / pu[r*WG+0]. Needs `var<workgroup> pg,pu: array<f32, CNT*WG>` declared.
+  function wgReduce2WGSL(CNT, WG) {
+    return `
+  for (var _r:u32=0u; _r<${CNT}u; _r=_r+1u) { pg[_r*${WG}u + lid.x] = ga[_r]; pu[_r*${WG}u + lid.x] = ua[_r]; }
+  workgroupBarrier();
+  for (var _st:u32=${WG >> 1}u; _st>0u; _st=_st>>1u) {
+    if (lid.x < _st) { for (var _r:u32=0u; _r<${CNT}u; _r=_r+1u) { pg[_r*${WG}u + lid.x] = pg[_r*${WG}u + lid.x] + pg[_r*${WG}u + lid.x + _st]; pu[_r*${WG}u + lid.x] = pu[_r*${WG}u + lid.x] + pu[_r*${WG}u + lid.x + _st]; } }
+    workgroupBarrier();
+  }`;
+  }
   const GEMV_WGSL = `
 enable f16;
-enable subgroups;
 struct D { N:u32, K:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       x : array<vec4<f32>>;
 @group(0) @binding(1) var<storage, read>       W : array<vec4<f16>>;
 @group(0) @binding(2) var<storage, read_write> y : array<f32>;
 @group(0) @binding(3) var<uniform>             d : D;
-var<workgroup> part : array<f32, ${GEMV_NR * GEMV_WG}>;   // part[r*WG + subgroupIdx]
+var<workgroup> part : array<f32, ${GEMV_NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+        @builtin(num_workgroups) nwg:vec3<u32>) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GEMV_NR}u;
   if (rowBase >= d.N) { return; }
   let K4 = d.K / 4u;
@@ -166,21 +189,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     c = c + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${GEMV_NR}u; r=r+1u) {
-    let ssum = subgroupAdd(acc[r]);
-    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ssum; }
-  }
-  workgroupBarrier();
-  // NR threads each finalize one row.
+${wgReduceWGSL(GEMV_NR, GEMV_WG)}
   if (lid.x < ${GEMV_NR}u) {
     let row = rowBase + lid.x;
-    if (row < d.N) {
-      let nsg = (${GEMV_WG}u + sgs - 1u) / sgs;
-      var tot : f32 = 0.0;
-      for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[lid.x*${GEMV_WG}u + i]; }
-      y[row] = tot;
-    }
+    if (row < d.N) { y[row] = part[lid.x*${GEMV_WG}u + 0u]; }
   }
 }`;
   function gemv(xBuf, wBuf, yBuf, N, K) {
@@ -263,7 +275,6 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // separately — the kernel text is identical, only the row-block factor varies.
   function gemvQWgsl(NR) { return `
 enable f16;
-enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused residual)
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [K/4]
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles
@@ -273,8 +284,7 @@ struct D { N:u32, K:u32, acc:u32, _b:u32 };   // acc=1 → y[n] += result (fused
 var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+        @builtin(num_workgroups) nwg:vec3<u32>) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
   if (rowBase >= d.N) { return; }
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
@@ -295,19 +305,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${NR}u; r=r+1u) {
-    let ss = subgroupAdd(acc[r]);
-    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
-  }
-  workgroupBarrier();
+${wgReduceWGSL(NR, GEMV_WG)}
   if (lid.x < ${NR}u) {
     let row = rowBase + lid.x;
-    if (row < d.N) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
-      y[row] = select(0.0, y[row], d.acc != 0u) + t;
-    }
+    if (row < d.N) { y[row] = select(0.0, y[row], d.acc != 0u) + part[lid.x*${GEMV_WG}u + 0u]; }
   }
 }`; }
   function gemvQ(xBuf, packBuf, scBuf, yBuf, N, K, acc, NR) {
@@ -351,7 +352,6 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
 }`;
   const GEMVDP4_WGSL = `
 enable f16;
-enable subgroups;
 struct D { N:u32, K:u32, acc:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       xq : array<u32>;          // [K/4] packed int8 activations
 @group(0) @binding(1) var<storage, read>       W  : array<u32>;          // [N*K/8] packed nibbles
@@ -362,8 +362,7 @@ struct D { N:u32, K:u32, acc:u32, _b:u32 };
 var<workgroup> part : array<f32, ${GEMVQ_NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+        @builtin(num_workgroups) nwg:vec3<u32>) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GEMVQ_NR}u;
   if (rowBase >= d.N) { return; }
   let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
@@ -387,19 +386,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${GEMVQ_NR}u; r=r+1u) {
-    let ss = subgroupAdd(acc[r]);
-    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ss; }
-  }
-  workgroupBarrier();
+${wgReduceWGSL(GEMVQ_NR, GEMV_WG)}
   if (lid.x < ${GEMVQ_NR}u) {
     let row = rowBase + lid.x;
-    if (row < d.N) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var t:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ t = t + part[lid.x*${GEMV_WG}u + i]; }
-      y[row] = select(0.0, y[row], d.acc != 0u) + t;
-    }
+    if (row < d.N) { y[row] = select(0.0, y[row], d.acc != 0u) + part[lid.x*${GEMV_WG}u + 0u]; }
   }
 }`;
   let _dp4 = null, _dp4dead = [];   // scratch {xq, xs, cap} for the quantized activation, sized to K
@@ -496,7 +486,6 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>) {
   const GUSQ_NR = 4;
   const GATEUPQ_WGSL = `
 enable f16;
-enable subgroups;
 struct D { I:u32, H:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       x  : array<vec4<f32>>;   // [H/4]
 @group(0) @binding(1) var<storage, read>       gW : array<u32>;
@@ -509,8 +498,7 @@ var<workgroup> pg : array<f32, ${GUSQ_NR * GEMV_WG}>;
 var<workgroup> pu : array<f32, ${GUSQ_NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+        @builtin(num_workgroups) nwg:vec3<u32>) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${GUSQ_NR}u;
   if (rowBase >= d.I) { return; }
   let words = d.H / 8u; let gpr = d.H / ${QGROUP}u;
@@ -534,17 +522,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${GUSQ_NR}u; r=r+1u) {
-    let g = subgroupAdd(ga[r]); let u = subgroupAdd(ua[r]);
-    if (sgi == 0u) { pg[r*${GEMV_WG}u + sgIdx] = g; pu[r*${GEMV_WG}u + sgIdx] = u; }
-  }
-  workgroupBarrier();
+${wgReduce2WGSL(GUSQ_NR, GEMV_WG)}
   if (lid.x < ${GUSQ_NR}u) {
     let row = rowBase + lid.x;
     if (row < d.I) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var g:f32=0.0; var u:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ g=g+pg[lid.x*${GEMV_WG}u+i]; u=u+pu[lid.x*${GEMV_WG}u+i]; }
+      let g = pg[lid.x*${GEMV_WG}u+0u]; let u = pu[lid.x*${GEMV_WG}u+0u];
       let silu = g / (1.0 + exp(-g));
       swi[row] = silu * u;
     }
@@ -555,7 +537,6 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // Parameterized by NR (rows/WG) — same tuning lever as gemvQ.
   function gateupDP4Wgsl(NR) { return `
 enable f16;
-enable subgroups;
 struct D { I:u32, H:u32, _a:u32, _b:u32 };
 @group(0) @binding(0) var<storage, read>       xq : array<u32>;          // [H/4] packed int8 activations
 @group(0) @binding(1) var<storage, read>       gW : array<u32>;
@@ -569,8 +550,7 @@ var<workgroup> pg : array<f32, ${NR * GEMV_WG}>;
 var<workgroup> pu : array<f32, ${NR * GEMV_WG}>;
 @compute @workgroup_size(${GEMV_WG},1,1)
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
-        @builtin(num_workgroups) nwg:vec3<u32>,
-        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+        @builtin(num_workgroups) nwg:vec3<u32>) {
   let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
   if (rowBase >= d.I) { return; }
   let words = d.H / 8u; let gpr = d.H / ${QGROUP}u;
@@ -595,17 +575,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
     w = w + ${GEMV_WG}u;
   }
-  let sgIdx = lid.x / sgs;
-  for (var r:u32=0u; r<${NR}u; r=r+1u) {
-    let g = subgroupAdd(ga[r]); let u = subgroupAdd(ua[r]);
-    if (sgi == 0u) { pg[r*${GEMV_WG}u + sgIdx] = g; pu[r*${GEMV_WG}u + sgIdx] = u; }
-  }
-  workgroupBarrier();
+${wgReduce2WGSL(NR, GEMV_WG)}
   if (lid.x < ${NR}u) {
     let row = rowBase + lid.x;
     if (row < d.I) {
-      let nsg=(${GEMV_WG}u+sgs-1u)/sgs; var g:f32=0.0; var u:f32=0.0;
-      for(var i:u32=0u;i<nsg;i=i+1u){ g=g+pg[lid.x*${GEMV_WG}u+i]; u=u+pu[lid.x*${GEMV_WG}u+i]; }
+      let g = pg[lid.x*${GEMV_WG}u+0u]; let u = pu[lid.x*${GEMV_WG}u+0u];
       let silu = g / (1.0 + exp(-g));
       swi[row] = silu * u;
     }
