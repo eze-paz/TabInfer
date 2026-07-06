@@ -3489,8 +3489,19 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   async function _debugLogits(prompt, variant) {
     await loadModel({ variant: variant || _variant });
     _cachedIds = null; _sysAnchor = null;
+    const C = CONFIG, H = C.hidden;
     const ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello, how are you?' }]);
     const L = ids.length; let tok0;
+    ensureScratch(L);
+    const s = _scr;
+    // (0) WEIGHT SANITY: is the loaded embed weight buffer non-zero? All-zero → the weights never
+    // loaded (silent writeBuffer failure) and every kernel-self-test still passes (synthetic data).
+    let wnz = -1; try { const ew = _weights['model.embed_tokens.weight']; const eb = ew && (ew.buf || ew.pack); if (eb) { const smp = await E.readF32(eb, 1024); wnz = 0; for (let i = 0; i < smp.length; i++) if (smp[i] !== 0) wnz++; } } catch (_) {}
+    // (1) EMBED OUTPUT ONLY: run just embedGather (no layers). Zero here → embed/weights; non-zero
+    // here but zero logits → the layer stack / batched forward is what collapses it.
+    let embnz = -1, embmin = 0, embmax = 0;
+    try { E.beginBatch(); uniformReset(); await embedGather(setIds(ids), _weights['model.embed_tokens.weight'].buf, s.x, L, H, 0); await E.endBatch();
+      const ex = await E.readF32(s.x, H); embnz = 0; embmin = Infinity; embmax = -Infinity; for (const v of ex) { if (v !== 0) embnz++; if (v < embmin) embmin = v; if (v > embmax) embmax = v; } } catch (_) {}
     for (let off = 0; off < L; off += 256) tok0 = await forward(ids.slice(off, Math.min(off + 256, L)), off);
     const lg = await readLogits();
     let mn = Infinity, mx = -Infinity, sum = 0, nan = 0, inf = 0, amax = 0, zero = 0;
@@ -3503,6 +3514,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     for (let i = 0; i < hd.length; i++) { const v = hd[i]; if (v !== v) { hnan++; continue; } hsum += v; if (v < hmn) hmn = v; if (v > hmx) hmx = v; }
     return {
       promptTokens: L, vocab: lg.length, tok0, argmax: amax,
+      embedWeightNonzero: wnz + '/1024',   // -1 = couldn't read; 0 = WEIGHTS ARE ZERO (load failed)
+      embedOut: { nonzero: embnz + '/' + H, min: +embmin.toFixed(3), max: +embmax.toFixed(3) },   // embed alone; 0 = embed/weights bad
       logits: { nan, inf, zero, min: +mn.toFixed(3), max: +mx.toFixed(3), mean: +(sum / Math.max(1, finite)).toFixed(4), sample: [lg[0], lg[1], lg[100], lg[1000]].map(v => +(+v).toFixed(3)) },
       lastHidden: { nan: hnan, min: +hmn.toFixed(3), max: +hmx.toFixed(3), mean: +(hsum / hd.length).toFixed(4) },
     };
