@@ -785,6 +785,61 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     }
   }
 
+  // Boot-time DP4A correctness probe. The int8 DP4A path (gemmDP4A prefill + gemvDP4A
+  // decode) is the DEFAULT forward path, but dot4I8Packed/pack4xI8 are miscompiled on
+  // some mobile GPUs — on one Adreno the GEMM returned all-ZERO, so prefill produced a
+  // zero hidden state → all-zero logits → argmax 0 → the model emitted only "!" (same
+  // class of bug as the Adreno subgroupAdd breakage fixed in 544f52f: a fast forward
+  // path used blind, with no capability gate). This runs the DP4A kernels against the
+  // trusted f16 gemmQ/gemvQ on a tiny input and, on mismatch, sets __noDp4Gemm/__noDp4
+  // so the forward path routes through the proven f32/f16-dequant kernels on THIS device.
+  let _dp4Probed = false;
+  async function probeDp4() {
+    if (_dp4Probed) return; _dp4Probed = true;
+    let bufs = [];
+    try {
+      const T = 16, N = 64, K = 256;
+      const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.17);
+      const Wf = new Float32Array(N * K); for (let i = 0; i < Wf.length; i++) Wf[i] = Math.cos(i * 0.013);
+      const u16 = new Uint16Array(Wf.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < Wf.length; i++) { t[0] = Wf[i]; u16[i] = ti[0] >>> 16; }
+      const { pack, scales } = quantizeInt4Bf16(u16, N, K);
+      const xb = f32buf(x);
+      const pb = E.createBuffer(pack.byteLength, ST(), 'dp4probe.pk'); E.device().queue.writeBuffer(pb, 0, pack);
+      const sb = E.createBuffer(scales.byteLength, ST(), 'dp4probe.sc'); E.device().queue.writeBuffer(sb, 0, scales);
+      const yb = E.createBuffer(T * N * 4, ST(), 'dp4probe.y');
+      const wrec = { pack: pb, scales: sb };
+      bufs = [xb, pb, sb, yb];
+      const rowOf = (arr, r) => Array.from(arr.slice(r * N, r * N + N));
+      // Reference = f16/f32 gemmQ (verified by probeF16Gemm just above).
+      await gemmQ(xb, wrec, yb, T, N, K, false); const ref = Array.from(await E.readF32(yb, T * N));
+      const refMax = Math.max(1e-9, ...ref.map(Math.abs));
+      // Prefill GEMM: gemmDP4A vs gemmQ.
+      if (!globalThis.__noDp4Gemm) {
+        await gemmDP4A(xb, wrec, yb, T, N, K, false); const got = Array.from(await E.readF32(yb, T * N));
+        let e = 0; for (let i = 0; i < T * N; i++) e = Math.max(e, Math.abs(got[i] - ref[i]));
+        const rel = e / refMax;
+        if (rel > 8e-2) { globalThis.__noDp4Gemm = true; console.warn('[qwen3] DP4A prefill GEMM WRONG on this GPU (rel ' + rel.toFixed(3) + ') — routing prefill through gemmQ'); }
+        else console.log('[qwen3] DP4A prefill GEMM verified (rel ' + rel.toExponential(1) + ')');
+      }
+      // Decode GEMV: gemvDP4A vs gemvQ (row 0 of the same weights, single token).
+      if (!globalThis.__noDp4) {
+        await gemvQ(xb, pb, sb, yb, N, K, false); const y0 = rowOf(await E.readF32(yb, N), 0);
+        await gemvDP4A(xb, pb, sb, yb, N, K, false); const g0 = rowOf(await E.readF32(yb, N), 0);
+        const m0 = Math.max(1e-9, ...y0.map(Math.abs));
+        let e = 0; for (let i = 0; i < N; i++) e = Math.max(e, Math.abs(g0[i] - y0[i]));
+        const rel = e / m0;
+        if (rel > 8e-2) { globalThis.__noDp4 = true; console.warn('[qwen3] DP4A decode GEMV WRONG on this GPU (rel ' + rel.toFixed(3) + ') — routing decode through gemvQ'); }
+        else console.log('[qwen3] DP4A decode GEMV verified (rel ' + rel.toExponential(1) + ')');
+      }
+    } catch (e) {
+      globalThis.__noDp4Gemm = true; globalThis.__noDp4 = true;
+      console.warn('[qwen3] DP4A probe failed — routing forward through f16/f32 dequant path:', (e && e.message) || e);
+    } finally {
+      for (const b of bufs) { try { b.destroy(); } catch (_) {} }
+    }
+  }
+
   // ---- DP4A int8 tiled GEMM (prefill) — experimental A/B vs gemmQ ----
   // Same tiling as gemmQ, but instead of dequantizing W→f32 and doing f32 FMA, it
   // keeps both operands int8 and uses dot4I8Packed (4 int8 MACs/instr). The X[T,K]
@@ -2631,7 +2686,13 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       for(let t=0;t<T;t++)for(let n=0;n<N;n++){let a=0;for(let k=0;k<K;k++)a+=x[t*K+k]*Wdq[n*K+k];y[t*N+n]=a;}
       let _ref=0; for(let i=0;i<y.length;i++)_ref=Math.max(_ref,Math.abs(y[i]));
       check('gemmQ', maxAbs(got,y)/(_ref||1), 3e-2);   // RELATIVE — f16 shared tiles round ~0.3%
-      [xb,pb,sb,yb].forEach(b=>b.destroy());
+      // gemmDP4A: the DEFAULT prefill GEMM (dot4I8Packed). Untested here = the gap that
+      // let Adreno return all-zero prefill → all-"!" output. int8 activation quant → rel tol.
+      const yb2=E.createBuffer(T*N*4,ST(),'y2');
+      await gemmDP4A(xb,{pack:pb,scales:sb},yb2,T,N,K);
+      const got2=await E.readF32(yb2,T*N);
+      check('gemmDP4A', maxAbs(got2,y)/(_ref||1), 5e-2);
+      [xb,pb,sb,yb,yb2].forEach(b=>b.destroy());
     }
     // --- gateUpSiluQ (fused int4 gate+up+silu, T=1) vs CPU dequant ---
     {
@@ -3168,6 +3229,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     _ctxCap = (nCtx | 0) > 0 ? Math.max(1024, Math.min(_attnMaxS, nCtx | 0)) : _attnMaxS;
     if (MAX_SEQ > _attnMaxS) MAX_SEQ = _attnMaxS;   // never allocate beyond the decode-attn capacity
     try { await probeF16Gemm(); } catch (_) {}   // pick f16 vs f32 prefill-GEMM dot for this GPU
+    try { await probeDp4(); } catch (_) {}        // verify DP4A forward path; fall back to gemmQ/gemvQ if the GPU miscompiles dot4I8Packed (all-"!" on Adreno)
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
 
@@ -4281,6 +4343,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     if (deep) {
       _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
       _f16Probed = false; _f16Math = null;    // re-probe against the rebuilt device
+      _dp4Probed = false;                     // re-verify the DP4A forward path on the rebuilt device
       try { await E.unload && E.unload(); } catch (_) {}
     }
   }
