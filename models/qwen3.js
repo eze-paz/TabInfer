@@ -3481,6 +3481,33 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Debug: full logits readback (call right after a forward, before the next one).
   async function readLogits() { return E.readF32(_scr.logits, CONFIG.vocab); }
 
+  // DIAGNOSTIC: prefill a short prompt and report logit STATISTICS (not just the token). Tells us
+  // whether the assembled forward produces NaN / Inf / all-equal (degenerate → "!") vs a real
+  // distribution — on a device where every isolated kernel self-test passes but generation is
+  // incoherent (e.g. Adreno). Also dumps per-tensor stats of the FINAL hidden state to localize
+  // where the forward goes bad. Returns a plain object (safe to JSON back over a chat).
+  async function _debugLogits(prompt, variant) {
+    await loadModel({ variant: variant || _variant });
+    _cachedIds = null; _sysAnchor = null;
+    const ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello, how are you?' }]);
+    const L = ids.length; let tok0;
+    for (let off = 0; off < L; off += 256) tok0 = await forward(ids.slice(off, Math.min(off + 256, L)), off);
+    const lg = await readLogits();
+    let mn = Infinity, mx = -Infinity, sum = 0, nan = 0, inf = 0, amax = 0, zero = 0;
+    for (let i = 0; i < lg.length; i++) { const v = lg[i];
+      if (v !== v) { nan++; continue; } if (v === Infinity || v === -Infinity) { inf++; continue; }
+      if (v === 0) zero++; sum += v; if (v < mn) mn = v; if (v > mx) { mx = v; amax = i; } }
+    const finite = lg.length - nan - inf;
+    // last hidden (fed to lm_head) stats — is IT already degenerate?
+    let hmn = Infinity, hmx = -Infinity, hnan = 0, hsum = 0; const hd = await E.readF32(_scr.last, CONFIG.hidden);
+    for (let i = 0; i < hd.length; i++) { const v = hd[i]; if (v !== v) { hnan++; continue; } hsum += v; if (v < hmn) hmn = v; if (v > hmx) hmx = v; }
+    return {
+      promptTokens: L, vocab: lg.length, tok0, argmax: amax,
+      logits: { nan, inf, zero, min: +mn.toFixed(3), max: +mx.toFixed(3), mean: +(sum / Math.max(1, finite)).toFixed(4), sample: [lg[0], lg[1], lg[100], lg[1000]].map(v => +(+v).toFixed(3)) },
+      lastHidden: { nan: hnan, min: +hmn.toFixed(3), max: +hmx.toFixed(3), mean: +(hsum / hd.length).toFixed(4) },
+    };
+  }
+
   // ---- Double-buffered GPU-resident decode -----------------------------------
   // Decode tokens chain through _tokHist on the GPU (argmax@P writes _tokHist[P+1],
   // embed@P+1 reads it), so a batch of GEN_BATCH chained forwards needs no readback
@@ -4569,7 +4596,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels, makeToolGrammar,
-    TOK, loadModel, forward, generate, readLogits, isLoaded: () => _loaded, variant: () => _variant,
+    TOK, loadModel, forward, generate, readLogits, _debugLogits, isLoaded: () => _loaded, variant: () => _variant,
     runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
