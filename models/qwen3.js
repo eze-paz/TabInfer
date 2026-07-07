@@ -3574,11 +3574,28 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // last hidden (fed to lm_head) stats — is IT already degenerate?
     let hmn = Infinity, hmx = -Infinity, hnan = 0, hsum = 0; const hd = await E.readF32(_scr.last, CONFIG.hidden);
     for (let i = 0; i < hd.length; i++) { const v = hd[i]; if (v !== v) { hnan++; continue; } hsum += v; if (v < hmn) hmn = v; if (v > hmx) hmx = v; }
+    // (2) FORCED PURE-F32 RETRY: rerun the SAME prefill with DP4A off AND f16-math off, so
+    // every matmul is the plain f32-dequant kernel (gemmQ/gemvQ, f32 dot). If THIS produces
+    // non-zero logits, the bug is DP4A/f16 numerics on this GPU (fix = force the safe path).
+    // If it's STILL zero, the collapse is structural (batched encoder / dispatch / a non-GEMM
+    // kernel), not the GEMM path — and we look there next.
+    let f32nz = -1, f32max = 0;
+    const savDp4g = globalThis.__noDp4Gemm, savDp4 = globalThis.__noDp4, savF16 = _f16Math;
+    try {
+      globalThis.__noDp4Gemm = true; globalThis.__noDp4 = true; _f16Math = false;
+      _cachedIds = null; _sysAnchor = null;
+      for (let off = 0; off < L; off += 256) await forward(ids.slice(off, Math.min(off + 256, L)), off);
+      const lg2 = await readLogits(); f32nz = 0; for (let i = 0; i < lg2.length; i++) { const v = lg2[i]; if (v === v && v !== 0) f32nz++; if (v === v && Math.abs(v) > f32max) f32max = Math.abs(v); }
+    } catch (e) { f32nz = -2; } finally { globalThis.__noDp4Gemm = savDp4g; globalThis.__noDp4 = savDp4; _f16Math = savF16; }
+    let caps = null; try { caps = E.caps && E.caps(); } catch (_) {}
     return {
       promptTokens: L, vocab: lg.length, tok0, argmax: amax,
+      flags: { noDp4Gemm: !!globalThis.__noDp4Gemm, noDp4: !!globalThis.__noDp4, f16Math: _f16Math, noStreamDecAttn: !!globalThis.__noStreamDecAttn, noKvQ8: !!globalThis.__noKvQ8 },
+      caps: caps ? { adapter: caps.adapter, hasF16: caps.hasF16, hasSubgroups: caps.hasSubgroups, subgroupSize: caps.subgroupSize } : null,
       embedWeightNonzero: wnz + '/1024',   // -1 = couldn't read; 0 = WEIGHTS ARE ZERO (load failed)
       embedOut: { nonzero: embnz + '/' + H, min: +embmin.toFixed(3), max: +embmax.toFixed(3) },   // embed alone; 0 = embed/weights bad
       logits: { nan, inf, zero, min: +mn.toFixed(3), max: +mx.toFixed(3), mean: +(sum / Math.max(1, finite)).toFixed(4), sample: [lg[0], lg[1], lg[100], lg[1000]].map(v => +(+v).toFixed(3)) },
+      forcedF32Logits: { nonzero: f32nz, max: +f32max.toFixed(3) },   // >0 → safe path WORKS (numeric bug); 0 → structural
       lastHidden: { nan: hnan, min: +hmn.toFixed(3), max: +hmx.toFixed(3), mean: +(hsum / hd.length).toFixed(4) },
     };
   }
