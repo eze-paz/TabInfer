@@ -3477,10 +3477,15 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // _stageProbe() to find the FIRST stage that goes all-zero on a device where the whole
   // forward degenerates but every kernel passes conformance. Reads force a flush, so only
   // valid with batching OFF (the probe forces __forceBatch=false).
-  let _dbgTapLog = null;
+  let _dbgTapLog = null, _tapClock = 0;
   async function _tap(name, buf, n) {
     if (!globalThis.__dbgTapOn || !_dbgTapLog) return;
-    try { const a = await E.readF32(buf, n); let nz = 0, mx = 0; for (let i = 0; i < a.length; i++) { if (a[i] !== 0) nz++; if (Math.abs(a[i]) > mx) mx = Math.abs(a[i]); } _dbgTapLog.push({ name, nz, n, max: +mx.toFixed(3) }); } catch (e) { _dbgTapLog.push({ name, err: String(e && e.message || e) }); }
+    try {
+      const a = await E.readF32(buf, n);   // readback drains the GPU → wall-clock gap ≈ this stage's GPU time
+      const now = performance.now(), ms = _tapClock ? +(now - _tapClock).toFixed(1) : 0; _tapClock = now;
+      let nz = 0, mx = 0; for (let i = 0; i < a.length; i++) { if (a[i] !== 0) nz++; if (Math.abs(a[i]) > mx) mx = Math.abs(a[i]); }
+      _dbgTapLog.push({ name, nz, n, max: +mx.toFixed(3), ms });
+    } catch (e) { _dbgTapLog.push({ name, err: String(e && e.message || e) }); }
   }
 
   async function forward(idsArray, posBase, opts) {
@@ -3576,6 +3581,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);              // fused residual: x += down_proj
       if (l === 0) await _tap('l0.down+res(x)', s.x, H);
     }
+    await _tap('layers_1..N', s.x, H);   // closes the gap for layers 1..N-1 (only layer 0 is tapped per-stage)
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
     await _tap('final_norm', s.normed, H);
     const forceTok = opts && opts.forceTok;
@@ -3693,23 +3699,29 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // stage that goes all-zero — pinpoints exactly which kernel degenerates on a device where
   // the whole forward is zero but every kernel passes conformance. Forces batching OFF so the
   // in-forward readbacks are valid. Returns a compact { firstZero, summary, stages }.
-  async function _stageProbe(prompt, variant) {
+  async function _stageProbe(prompt, variant, nTokens) {
     await loadModel({ variant: variant || _variant });
     _cachedIds = null; _sysAnchor = null;
-    const ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello' }]);
-    const L = ids.length;
+    let ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello' }]);
+    const T = Math.max(1, Math.min(nTokens || 256, _ctxCap - 8));           // pad to a realistic prefill width
+    while (ids.length < T) ids = ids.concat(ids);
+    ids = ids.slice(0, T);
+    if (T + 8 > MAX_SEQ) _growCtx(Math.max(1024, Math.min(_ctxCap, Math.ceil((T + 8) / 1024) * 1024)));
     const savForce = globalThis.__forceBatch;
-    globalThis.__forceBatch = false; try { await E.probeBatch && E.probeBatch(); } catch (_) {}   // ensure immediate mode; taps read validly
-    globalThis.__dbgTapOn = true; _dbgTapLog = [];
-    try {
-      for (let off = 0; off < L; off += 256) await forward(ids.slice(off, Math.min(off + 256, L)), off);
-    } catch (e) { _dbgTapLog.push({ name: 'THREW', err: String(e && e.message || e) }); }
+    globalThis.__forceBatch = false; try { await E.probeBatch && E.probeBatch(); } catch (_) {}   // immediate mode so tap readbacks are valid AND time each stage
+    globalThis.__dbgTapOn = true; _dbgTapLog = []; _tapClock = 0;
+    try { await forward(ids, 0); } catch (e) { _dbgTapLog.push({ name: 'THREW', err: String(e && e.message || e) }); }
     globalThis.__dbgTapOn = false;
     const log = _dbgTapLog; _dbgTapLog = null;
     globalThis.__forceBatch = savForce;
     const firstZero = (log.find(t => t.nz === 0) || {}).name || 'none (all stages nonzero)';
-    const summary = log.map(t => t.err ? (t.name + '=ERR') : (t.name + '=' + t.nz + '/' + t.n)).join('  ');
-    return { promptTokens: L, batchOk: (E.batchOk ? E.batchOk() : 'n/a'), firstZero, summary, stages: log };
+    // layer-0 stages repeat over numLayers; embed/final/logits run once. Estimate a full prefill.
+    const L0 = log.filter(t => t.name.startsWith('l0.')).reduce((a, t) => a + (t.ms || 0), 0);
+    const once = log.filter(t => !t.name.startsWith('l0.') && !t.name.startsWith('layers_')).reduce((a, t) => a + (t.ms || 0), 0);
+    const estPrefillMs = Math.round(L0 * CONFIG.numLayers + once);
+    const summary = log.map(t => t.err ? (t.name + '=ERR') : (t.name + '=' + (t.ms || 0) + 'ms')).join('  ');
+    const slowest = log.slice().filter(t => t.ms).sort((a, b) => b.ms - a.ms).slice(0, 3).map(t => t.name + ' ' + t.ms + 'ms');
+    return { probeTokens: T, batchOk: (E.batchOk ? E.batchOk() : 'n/a'), firstZero, slowestStages: slowest, estPrefillMsAt_T: estPrefillMs, msNote: 'per-stage ms at T=' + T + ' (immediate mode; relative costs are what matter)', summary, stages: log };
   }
 
   // ---- Double-buffered GPU-resident decode -----------------------------------
