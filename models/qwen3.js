@@ -3779,6 +3779,42 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
              note: 'immediate-mode flushes inflate absolute ms — use RELATIVE stage costs to target, and generate() for real decode tok/s', summary, stages: log };
   }
 
+  // GPU-TIMESTAMP decode profiler — the accurate one. Times each kernel of ONE REAL batched
+  // decode forward via begin/end timestamps written INTO the compute passes (E.beginProfile),
+  // so there are NO flushes and therefore no submit-boundary contamination (the thing that made
+  // _profileDecode's absolute numbers useless on Adreno). Returns true per-kernel GPU µs,
+  // summed across all layers, sorted — that is the thing to target.
+  //
+  // Zero main-path cost: dispatch() only emits timestampWrites while _prof is non-null, and
+  // _prof is set ONLY between E.beginProfile()/E.endProfile(). Real inference never calls those,
+  // so the forward used for real generation is byte-for-byte the same code path, untouched.
+  // Requires the 'timestamp-query' feature; falls back to _profileDecode() where unavailable.
+  async function _profileDecodeTS(prompt, variant) {
+    await loadModel({ variant: variant || _variant });
+    _cachedIds = null; _sysAnchor = null;
+    const ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello' }]);
+    if (ids.length + 8 > MAX_SEQ) _growCtx(Math.max(1024, Math.min(_ctxCap, Math.ceil((ids.length + 8) / 1024) * 1024)));
+    await forward(ids, 0);                          // warm prefill (untimed) → _tokHist[L]=token0
+    const pos = ids.length;
+    await forward([0], pos, { chain: true });       // one warm decode (untimed) so caches/pipelines are hot
+    try { E.beginProfile(600); }                    // throws if timestamp-query missing
+    catch (e) { return { error: String(e && e.message || e), fallback: 'use Stage probe (flush-based _profileDecode)' }; }
+    await forward([0], pos + 1, { chain: true });   // THE timed decode step — the real batched forward
+    const passes = await E.endProfile();            // [{label, us}] per compute pass
+    // Aggregate per kernel label (each label runs ~numLayers times per forward).
+    const agg = {};
+    for (const p of passes) { const a = agg[p.label] || (agg[p.label] = { label: p.label, us: 0, n: 0 }); a.us += p.us; a.n++; }
+    const rows = Object.values(agg).sort((a, b) => b.us - a.us)
+      .map(a => ({ label: a.label, totalUs: +a.us.toFixed(1), calls: a.n, usEach: +(a.us / a.n).toFixed(2), pct: 0 }));
+    const totalUs = passes.reduce((s, p) => s + p.us, 0) || 1;
+    for (const r of rows) r.pct = +(100 * r.totalUs / totalUs).toFixed(1);
+    const top = rows.slice(0, 6).map(r => r.label + ' ' + r.totalUs + 'µs (' + r.pct + '%, ×' + r.calls + ')').join('   ');
+    // Pure-compute ceiling: if the ONLY cost were these kernels (no submit/readback/CPU-encode
+    // overhead), decode would run this fast. Gap vs generate()'s real tok/s = the overhead budget.
+    return { gpuComputeMs: +(totalUs / 1000).toFixed(2), computeCeilingTps: +(1e6 / totalUs).toFixed(1),
+             dispatches: passes.length, top, rows, note: 'true GPU kernel µs (no flush contamination); computeCeilingTps excludes submit/readback overhead — compare to generate() real tok/s' };
+  }
+
   // ---- Double-buffered GPU-resident decode -----------------------------------
   // Decode tokens chain through _tokHist on the GPU (argmax@P writes _tokHist[P+1],
   // embed@P+1 reads it), so a batch of GEN_BATCH chained forwards needs no readback
@@ -4906,7 +4942,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels, makeToolGrammar,
-    TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, _profileDecode, _lastGenStats: () => _lastGenStats, isLoaded: () => _loaded, variant: () => _variant,
+    TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, _profileDecode, _profileDecodeTS, _lastGenStats: () => _lastGenStats, isLoaded: () => _loaded, variant: () => _variant,
     runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchPrefillGemm, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,

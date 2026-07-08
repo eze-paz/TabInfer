@@ -22,7 +22,7 @@
 </style>
 </head>
 <body>
-<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 144 · qwen3 v139 · engine v53</div>
+<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 145 · qwen3 v140 · engine v53</div>
 <h1>sandpie WebGPU engine — capability + GEMM bench</h1>
 <p class="sub">Open this in the browser you actually run sandpie in. It answers the one question the whole engine project rests on: does <em>this</em> device expose the fast subgroup / subgroup-matrix path?</p>
 
@@ -32,6 +32,7 @@
   <button id="runKernels">Run Qwen3 kernel tests</button>
   <button id="dbgLogits" title="Prefill a short prompt on Qwen3-0.6B and report logit statistics (NaN/Inf/min/max/argmax) — pinpoints whether the assembled forward is degenerate">Debug logits (0.6B)</button>
   <button id="stageProbe" style="background:#8957e5; border-color:#8957e5; color:#fff;" title="Run one prefill and report the FIRST stage of the forward that goes all-zero">▶ Stage probe (find the dead kernel)</button>
+  <button id="tsProfile" style="background:#0969da; border-color:#0969da; color:#fff;" title="GPU-timestamp decode profiler: true per-kernel µs of one real batched decode forward (no flush contamination). Needs timestamp-query.">▶ Profile decode (GPU ts)</button>
   <button id="gemmAB" style="background:#1f883d; border-color:#1f883d; color:#fff;" title="Time the 3 prefill-GEMM paths (int4 DP4A vs f16 vs f32) at the down_proj shape — picks the fastest for this GPU">▶ Prefill GEMM A/B</button>
   <span id="status" class="hi"></span>
 </div>
@@ -42,6 +43,11 @@
 <div id="gemmABout" style="display:none; margin:0.5rem 0; padding:0.8rem 1rem; background:#161b22; border:2px solid #1f883d; border-radius:8px; font-size:1.05rem;">
   <div>FASTEST PREFILL GEMM: <b id="gemmWin" style="color:#3fb950; font-size:1.3rem;">—</b></div>
   <div id="gemmDetail" style="color:#8b949e; font-size:0.8rem; margin-top:0.4rem; word-break:break-word;"></div>
+</div>
+<div id="tsOut" style="display:none; margin:0.5rem 0; padding:0.8rem 1rem; background:#161b22; border:2px solid #0969da; border-radius:8px; font-size:1.05rem;">
+  <div>DECODE compute ceiling: <b id="tsCeiling" style="color:#58a6ff; font-size:1.3rem;">—</b></div>
+  <div id="tsTop" style="color:#c9d1d9; font-size:0.85rem; margin-top:0.4rem; word-break:break-word;"></div>
+  <div id="tsTable" style="margin-top:0.5rem;"></div>
 </div>
 <pre id="dbgOut" style="display:none"></pre>
 
@@ -89,7 +95,7 @@
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
 <script src="../modules/webgpu-engine.js?v=53"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
-<script src="../modules/webgpu-qwen3.js?v=139"></script>
+<script src="../modules/webgpu-qwen3.js?v=140"></script>
 <script src="../modules/webgpu-lfm25.js?v=53"></script>
 <script>
   // Verbose engine logs in the console for this harness.
@@ -196,6 +202,28 @@
       set('status', 'stage probe done', 'ok');
     } catch (e) { $('stageFirst').textContent = 'ERROR'; $('stageSummary').textContent = (e && e.stack || e); console.error(e); }
     finally { $('stageProbe').disabled = false; }
+  });
+
+  $('tsProfile').addEventListener('click', async () => {
+    $('tsProfile').disabled = true;
+    const box = $('tsOut'); box.style.display = 'block';
+    $('tsCeiling').textContent = 'timing…'; $('tsTop').textContent = ''; $('tsTable').innerHTML = '';
+    try {
+      const r = await window.SandpieQwen3._profileDecodeTS($('prompt').value || 'Hello', $('model').value === 'qwen3-1.7b' ? '1.7B' : '0.6B');
+      if (r.error) {
+        $('tsCeiling').textContent = 'unavailable';
+        $('tsTop').textContent = r.error + ' — ' + (r.fallback || 'use Stage probe');
+      } else {
+        $('tsCeiling').innerHTML = r.computeCeilingTps + ' tok/s <span style="color:#8b949e;font-size:0.8rem">(pure GPU compute: ' + r.gpuComputeMs + 'ms/tok, ' + r.dispatches + ' dispatches — excludes submit/readback overhead)</span>';
+        $('tsTop').innerHTML = '<b>top kernels:</b> ' + r.top;
+        let html = '<table><tr><th>kernel</th><th>total µs</th><th>% </th><th>×calls</th><th>µs/call</th></tr>';
+        for (const row of r.rows.slice(0, 14)) html += `<tr><td style="text-align:left">${row.label}</td><td>${row.totalUs}</td><td>${row.pct}</td><td>${row.calls}</td><td>${row.usEach}</td></tr>`;
+        html += '</table>';
+        $('tsTable').innerHTML = html;
+      }
+      set('status', 'ts profile done', 'ok');
+    } catch (e) { $('tsCeiling').textContent = 'ERROR'; $('tsTop').textContent = (e && e.stack || e); console.error(e); }
+    finally { $('tsProfile').disabled = false; }
   });
 
   $('gemmAB').addEventListener('click', async () => {
