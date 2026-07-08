@@ -410,21 +410,24 @@ struct U { mul:u32, _p0:u32, _p1:u32, _p2:u32 };
 fn main(@builtin(global_invocation_id) g:vec3<u32>) { if (g.x < 64u) { o[g.x] = f32((g.x + 1u) * u.mul); } }`;
   async function probeBatch() {
     if (_batchOk !== null) return _batchOk;
-    // DETERMINISTIC mobile-GPU gate. The probe kept FALSE-PASSING on Adreno (a bare batched
-    // dispatch works; the real breakage is subtler and the probe couldn't reliably trip it),
-    // so don't rely on detection: mobile GPUs (Adreno/Mali/ARM/PowerVR/Apple-mobile) that
-    // failed the batched forward get batching OFF outright. Immediate per-op submits are the
-    // exact path all kernel self-tests pass on these devices — correctness over the
-    // submit-bubble savings. Desktop vendors (Intel/NVIDIA/AMD/Apple desktop) keep batching.
-    // Override with globalThis.__forceBatch=true (re-enable) / false (force off).
+    // ALLOWLIST gate (inverted). The batched command encoder silently drops output on
+    // Adreno (all-"!"); a runtime probe kept FALSE-PASSING, and a mobile-vendor DENYlist
+    // failed because Android Chrome redacts the adapter vendor/architecture to "" inside a
+    // Web Worker (where the engine actually runs) — so the deny-regex never matched and
+    // batching stayed on. Invert it: batching is OFF by default and only turned ON when the
+    // GPU is POSITIVELY a known-good desktop vendor (Intel/NVIDIA/AMD/Apple/Microsoft/Mesa).
+    // Empty/unknown adapter info (mobile, worker, privacy-redacted) → OFF → immediate per-op
+    // submits, the path all kernel self-tests pass and verified to generate coherent text.
+    // Override: globalThis.__forceBatch = true (force on) / false (force off).
     try {
       if (globalThis.__forceBatch === true) { _batchOk = true; return true; }
       if (globalThis.__forceBatch === false) { _batchOk = false; console.warn('[webgpu] batching force-disabled (__forceBatch=false)'); return false; }
       const a = (_caps && _caps.adapter) || {};
       const sig = ((a.vendor || '') + ' ' + (a.architecture || '') + ' ' + (a.description || '')).toLowerCase();
-      if (/qualcomm|adreno|mali|\barm\b|powervr|img|apple-[am]|broadcom|vivante/.test(sig)) {
+      const desktopOk = /intel|nvidia|geforce|\brtx\b|\bgtx\b|\bamd\b|radeon|\brdna\b|apple m[0-9]|microsoft|warp|mesa|llvmpipe|swiftshader/.test(sig);
+      if (!desktopOk) {
         _batchOk = false;
-        console.warn('[webgpu] mobile GPU (' + sig.trim() + ') — batching DISABLED (per-op submits) to dodge the batched-encoder bug that gave all-"!" output');
+        console.warn('[webgpu] GPU not a known-good desktop vendor (adapter="' + sig.trim() + '") — batching DISABLED (per-op submits) to dodge the Adreno all-"!" batched-encoder bug');
         return false;
       }
     } catch (_) {}
