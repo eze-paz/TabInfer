@@ -1251,11 +1251,78 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
   let t=idx/p.H; let h=idx%p.H;
   y[idx]=f32(embed[ids[p.idOff + t]*p.H + h]);
 }`;
-  function embedGather(idsBuf, embedBuf, yBuf, T, H, idOff) {
+  // SHARDED embed gather. The embed matrix (vocab×H f16, ~297MB on 0.6B) exceeds the
+  // maxStorageBufferBindingSize (128MB on Adreno) — binding it whole reads ZERO there,
+  // which zeroed the whole forward → all-"!". _shardEmbedIfNeeded() splits it into
+  // EMBED_SHARDS row-chunks each ≤ the bind limit; this kernel binds all shards and
+  // selects the right one per row. (copyBufferToBuffer builds the shards — copy has no
+  // bind-size limit.) Row r lives in shard r/shardRows at local row r%shardRows.
+  const EMBED_SHARDS = 6;
+  const EMBED_SH_WGSL = (() => {
+    let s = `
+enable f16;
+struct P { T:u32, H:u32, idOff:u32, shardRows:u32, nShards:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read> ids : array<u32>;
+`;
+    for (let i = 0; i < EMBED_SHARDS; i++) s += `@group(0) @binding(${i + 1}) var<storage, read> e${i} : array<f16>;\n`;
+    s += `@group(0) @binding(${EMBED_SHARDS + 1}) var<storage, read_write> y : array<f32>;
+@group(0) @binding(${EMBED_SHARDS + 2}) var<uniform> p : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) nwg:vec3<u32>){
+  let idx=gid.y*(nwg.x*64u)+gid.x; let total=p.T*p.H; if(idx>=total){return;}
+  let t=idx/p.H; let h=idx%p.H;
+  let row=ids[p.idOff + t]; let sh=row/p.shardRows; let loc=(row%p.shardRows)*p.H + h;
+  var v:f16 = f16(0.0);
+`;
+    for (let i = 0; i < EMBED_SHARDS; i++) s += `  ${i ? 'else ' : ''}if (sh==${i}u) { v = e${i}[loc]; }\n`;
+    s += `  y[idx]=f32(v);
+}`;
+    return s;
+  })();
+
+  function embedGather(idsBuf, embRec, yBuf, T, H, idOff) {
+    const nWG = Math.ceil((T * H) / 64), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    if (embRec && embRec.shards) {
+      const pipe = E.getPipeline('q3.embedSh', EMBED_SH_WGSL);
+      const p = uniform(new Uint32Array([T, H, idOff || 0, embRec.shardRows, embRec.shards.length, 0, 0, 0]));
+      const binds = [idsBuf];
+      for (let i = 0; i < EMBED_SHARDS; i++) binds.push(embRec.shards[i] || embRec.shards[0]);   // pad unused slots
+      binds.push(yBuf, p);
+      return E.dispatch(pipe, binds, [gx, gy, 1]);
+    }
     const pipe = E.getPipeline('q3.embed', EMBED_WGSL);
     const p = uniform(new Uint32Array([T, H, idOff || 0, 0]));
-    const nWG = Math.ceil((T * H) / 64), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
-    return E.dispatch(pipe, [idsBuf, embedBuf, yBuf, p], [gx, gy, 1]);
+    return E.dispatch(pipe, [idsBuf, (embRec && embRec.buf) ? embRec.buf : embRec, yBuf, p], [gx, gy, 1]);
+  }
+
+  // Split the embed f16 buffer into ≤bind-limit row-shards if it's over the limit. Uses
+  // copyBufferToBuffer (no bind-size limit) so it works whatever load path built the buffer.
+  async function _shardEmbedIfNeeded() {
+    try {
+      const ew = _weights && _weights['model.embed_tokens.weight'];
+      if (!ew || !ew.buf || ew.shards) return;
+      const H = CONFIG.hidden, vocab = (ew.shape && ew.shape[0]) || Math.floor(ew.numel / H);
+      const bytes = ew.numel * 2;
+      let limit = 0; try { limit = E.device().limits.maxStorageBufferBindingSize | 0; } catch (_) {}
+      if (globalThis.__embedShardLimit) limit = globalThis.__embedShardLimit | 0;   // test override (force sharding on desktop)
+      if (!limit || bytes <= limit) return;                                   // fits — keep single buffer
+      const safe = Math.floor(limit * 0.95);
+      let rowsPerShard = Math.max(1, Math.floor(safe / (H * 2)));
+      const nShards = Math.ceil(vocab / rowsPerShard);
+      if (nShards > EMBED_SHARDS) { console.error('[qwen3] embed needs ' + nShards + ' shards > EMBED_SHARDS=' + EMBED_SHARDS + ' — raise it'); return; }
+      const shards = [];
+      for (let sIdx = 0; sIdx < nShards; sIdx++) {
+        const r0 = sIdx * rowsPerShard, r1 = Math.min(vocab, r0 + rowsPerShard);
+        const shBytes = (r1 - r0) * H * 2;
+        const sb = E.createBuffer(shBytes, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'embed.shard' + sIdx);
+        E.copyBuffer(ew.buf, r0 * H * 2, sb, 0, shBytes);                     // copy bypasses the bind-size limit
+        shards.push(sb);
+      }
+      await E.device().queue.onSubmittedWorkDone();
+      try { ew.buf.destroy(); } catch (_) {}
+      ew.buf = null; ew.shards = shards; ew.shardRows = rowsPerShard;
+      console.warn('[qwen3] embed (' + (bytes / 1048576 | 0) + 'MB) > bind limit (' + (limit / 1048576 | 0) + 'MB) — split into ' + nShards + ' shards of ' + rowsPerShard + ' rows');
+    } catch (e) { console.error('[qwen3] embed shard failed:', (e && e.message) || e); }
   }
 
   // ============================================================
@@ -3239,6 +3306,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       onProgress && onProgress({ phase: 'cache', pct: 0 });
       if (await loadQuantCache(variant, onProgress)) {
         onProgress && onProgress({ phase: 'parse', pct: 100 });
+        await _shardEmbedIfNeeded();
         _loaded = true; return;
       }
     } catch (e) { console.warn('[qwen3] quant cache load failed — re-downloading:', (e && e.message) || e); }
@@ -3289,6 +3357,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
 
     if (sink) { try { await sink.finalize(); } catch (e) { console.warn('[qwen3] quant cache write failed (will re-quantize next load):', (e && e.message) || e); } }
     onProgress && onProgress({ phase: 'parse', pct: 100 });
+    await _shardEmbedIfNeeded();
     _loaded = true;
   }
   const _td = new TextDecoder();
@@ -3432,7 +3501,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // were ~half the per-token GPU idle). PREFILL (T>1): keep the 32-op flush (big kernels →
     // a single multi-second submit would trip the OS GPU watchdog / TDR).
     E.beginBatch(T === 1 ? Infinity : undefined);
-    await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
+    await embedGather(embIds, _weights['model.embed_tokens.weight'], s.x, T, H, embOff);
     await _tap('embed', s.x, H);
     const modSkip = (T === 1 && _kvQ8) ? _modSkipSet(C.numLayers) : null;   // decode-only layer skip (experiment)
     for (let l = 0; l < C.numLayers; l++) {
@@ -3578,11 +3647,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     const s = _scr;
     // (0) WEIGHT SANITY: is the loaded embed weight buffer non-zero? All-zero → the weights never
     // loaded (silent writeBuffer failure) and every kernel-self-test still passes (synthetic data).
-    let wnz = -1; try { const ew = _weights['model.embed_tokens.weight']; const eb = ew && (ew.buf || ew.pack); if (eb) { const smp = await E.readF32(eb, 1024); wnz = 0; for (let i = 0; i < smp.length; i++) if (smp[i] !== 0) wnz++; } } catch (_) {}
+    let wnz = -1; try { const ew = _weights['model.embed_tokens.weight']; const eb = ew && (ew.buf || (ew.shards && ew.shards[0]) || ew.pack); if (eb) { const smp = await E.readF32(eb, 1024); wnz = 0; for (let i = 0; i < smp.length; i++) if (smp[i] !== 0) wnz++; } } catch (_) {}
     // (1) EMBED OUTPUT ONLY: run just embedGather (no layers). Zero here → embed/weights; non-zero
     // here but zero logits → the layer stack / batched forward is what collapses it.
     let embnz = -1, embmin = 0, embmax = 0;
-    try { E.beginBatch(); uniformReset(); await embedGather(setIds(ids), _weights['model.embed_tokens.weight'].buf, s.x, L, H, 0); await E.endBatch();
+    try { E.beginBatch(); uniformReset(); await embedGather(setIds(ids), _weights['model.embed_tokens.weight'], s.x, L, H, 0); await E.endBatch();
       const ex = await E.readF32(s.x, H); embnz = 0; embmin = Infinity; embmax = -Infinity; for (const v of ex) { if (v !== 0) embnz++; if (v < embmin) embmin = v; if (v > embmax) embmax = v; } } catch (_) {}
     for (let off = 0; off < L; off += 256) tok0 = await forward(ids.slice(off, Math.min(off + 256, L)), off);
     const lg = await readLogits();
