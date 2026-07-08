@@ -369,7 +369,7 @@ const SandpieWebGPU = (function () {
   // large value (e.g. Infinity) for short, safe batches like a single T=1 DECODE forward
   // (~14ms of GPU work total) to record the whole forward as ONE submit — eliminating the
   // ~15 submit-boundary stalls/token that otherwise idle the iGPU between passes.
-  function beginBatch(flushEvery) { if (_batchOk === false) return; _batchEncoder = device().createCommandEncoder({ label: 'forward' }); _batchCount = 0; _batchFlush = flushEvery || _BATCH_FLUSH; }
+  function beginBatch(flushEvery) { if (_batchOk === false || globalThis.__forceBatch === false) return; _batchEncoder = device().createCommandEncoder({ label: 'forward' }); _batchCount = 0; _batchFlush = flushEvery || _BATCH_FLUSH; }
   function _batchTick() {
     if (!_batchEncoder) return;
     if (++_batchCount >= _batchFlush) {

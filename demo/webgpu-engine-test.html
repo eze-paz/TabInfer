@@ -22,7 +22,7 @@
 </style>
 </head>
 <body>
-<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 135 · qwen3 v132 · engine v51</div>
+<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 137 · qwen3 v133 · engine v52</div>
 <h1>sandpie WebGPU engine — capability + GEMM bench</h1>
 <p class="sub">Open this in the browser you actually run sandpie in. It answers the one question the whole engine project rests on: does <em>this</em> device expose the fast subgroup / subgroup-matrix path?</p>
 
@@ -31,7 +31,12 @@
   <button id="runCaps">Capabilities only</button>
   <button id="runKernels">Run Qwen3 kernel tests</button>
   <button id="dbgLogits" title="Prefill a short prompt on Qwen3-0.6B and report logit statistics (NaN/Inf/min/max/argmax) — pinpoints whether the assembled forward is degenerate">Debug logits (0.6B)</button>
+  <button id="stageProbe" style="background:#8957e5; border-color:#8957e5; color:#fff;" title="Run one prefill and report the FIRST stage of the forward that goes all-zero">▶ Stage probe (find the dead kernel)</button>
   <span id="status" class="hi"></span>
+</div>
+<div id="stageOut" style="display:none; margin:0.5rem 0; padding:0.8rem 1rem; background:#161b22; border:2px solid #8957e5; border-radius:8px; font-size:1.05rem;">
+  <div>FIRST ZERO STAGE: <b id="stageFirst" style="color:#f0883e; font-size:1.3rem;">—</b></div>
+  <div id="stageSummary" style="color:#8b949e; font-size:0.8rem; margin-top:0.4rem; word-break:break-word;"></div>
 </div>
 <pre id="dbgOut" style="display:none"></pre>
 
@@ -77,9 +82,9 @@
 <pre id="bench">—</pre>
 
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
-<script src="../modules/webgpu-engine.js?v=51"></script>
+<script src="../modules/webgpu-engine.js?v=52"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
-<script src="../modules/webgpu-qwen3.js?v=132"></script>
+<script src="../modules/webgpu-qwen3.js?v=133"></script>
 <script src="../modules/webgpu-lfm25.js?v=53"></script>
 <script>
   // Verbose engine logs in the console for this harness.
@@ -167,6 +172,19 @@
       set('status', 'debug logits done', 'ok');
     } catch (e) { o.textContent = 'ERROR: ' + (e && e.stack || e); console.error(e); }
     finally { $('dbgLogits').disabled = false; }
+  });
+
+  $('stageProbe').addEventListener('click', async () => {
+    $('stageProbe').disabled = true;
+    const box = $('stageOut'); box.style.display = 'block';
+    $('stageFirst').textContent = 'running…'; $('stageSummary').textContent = '';
+    try {
+      const r = await window.SandpieQwen3._stageProbe($('prompt').value || 'Hello', '0.6B');
+      $('stageFirst').textContent = r.firstZero + '  (batchOk=' + r.batchOk + ')';
+      $('stageSummary').textContent = r.summary;
+      set('status', 'stage probe done', 'ok');
+    } catch (e) { $('stageFirst').textContent = 'ERROR'; $('stageSummary').textContent = (e && e.stack || e); console.error(e); }
+    finally { $('stageProbe').disabled = false; }
   });
 
   async function runGen(stress) {

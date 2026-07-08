@@ -3403,6 +3403,17 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // chain=true: embed reads the GPU token-history at posBase (no CPU-set ids) so
   //   the loop runs GPU-resident. submitOnly=true: submit the batch but DON'T await
   //   the drain or read back — lets the caller pipeline (encode N+1 while GPU runs N).
+  // Debug stage taps: when globalThis.__dbgTapOn, forward() records the nonzero count of
+  // each intermediate after it's produced (layer 0 only) into _dbgTapLog. Used by
+  // _stageProbe() to find the FIRST stage that goes all-zero on a device where the whole
+  // forward degenerates but every kernel passes conformance. Reads force a flush, so only
+  // valid with batching OFF (the probe forces __forceBatch=false).
+  let _dbgTapLog = null;
+  async function _tap(name, buf, n) {
+    if (!globalThis.__dbgTapOn || !_dbgTapLog) return;
+    try { const a = await E.readF32(buf, n); let nz = 0, mx = 0; for (let i = 0; i < a.length; i++) { if (a[i] !== 0) nz++; if (Math.abs(a[i]) > mx) mx = Math.abs(a[i]); } _dbgTapLog.push({ name, nz, n, max: +mx.toFixed(3) }); } catch (e) { _dbgTapLog.push({ name, err: String(e && e.message || e) }); }
+  }
+
   async function forward(idsArray, posBase, opts) {
     const chain = !!(opts && opts.chain), submitOnly = !!(opts && opts.submitOnly);
     const _t0 = _PERF ? performance.now() : 0;
@@ -3422,6 +3433,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // a single multi-second submit would trip the OS GPU watchdog / TDR).
     E.beginBatch(T === 1 ? Infinity : undefined);
     await embedGather(embIds, W('model.embed_tokens.weight'), s.x, T, H, embOff);
+    await _tap('embed', s.x, H);
     const modSkip = (T === 1 && _kvQ8) ? _modSkipSet(C.numLayers) : null;   // decode-only layer skip (experiment)
     for (let l = 0; l < C.numLayers; l++) {
       const p = 'model.layers.' + l + '.';
@@ -3448,9 +3460,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
       } else {
         await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
+        if (l === 0) await _tap('l0.attn_norm', s.normed, H);
         await linearQ(s.normed, Wq(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
         await linearQ(s.normed, Wq(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
         await linearQ(s.normed, Wq(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+        if (l === 0) { await _tap('l0.q_proj', s.q, nHq * hd); await _tap('l0.k_proj', s.k, nKv * hd); }
       }
       // NOTE: ropeQK must NOT be called in-place — aliasing the same buffer to a
       // read and a read_write binding is undefined behavior in WebGPU (miscompiles
@@ -3473,7 +3487,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
           await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
         }
       }
+      if (l === 0) await _tap('l0.attn_out', s.attn, nHq * hd);
       await linearQ(s.attn, Wq(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // fused residual: x += o_proj
+      if (l === 0) await _tap('l0.o_proj+res(x)', s.x, H);
       // MLP norm → gate/up. Decode fuses the same way: rmsnormQ emits the int8 activation,
       // gateUpSiluDP4_only consumes it (no separate quantize). Prefill (T>1) keeps the
       // rmsnorm + gate/up + swiglu path.
@@ -3486,10 +3502,13 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
         await linearQ(s.normed, Wq(p + 'mlp.up_proj.weight'), s.up, T, I, H);
         await swiglu(s.gate, s.up, s.swi, T * I);
+        if (l === 0) await _tap('l0.swiglu', s.swi, I);
       }
       await linearQ(s.swi, Wq(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);              // fused residual: x += down_proj
+      if (l === 0) await _tap('l0.down+res(x)', s.x, H);
     }
     await rmsnorm(s.x, W('model.norm.weight'), s.normed, T, H, C.rmsEps);
+    await _tap('final_norm', s.normed, H);
     const forceTok = opts && opts.forceTok;
     if (forceTok != null) {
       // GRAMMAR-FORCED token (P4): the next token is fully determined, so logits are
@@ -3501,6 +3520,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       // last token row → its own [H] buffer, then lm_head
       E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
       await linearQ(s.last, Wq('lm_head.weight'), s.logits, 1, C.vocab, H);
+      await _tap('logits', s.logits, 2048);
       if (opts && opts.maskLogits) logitMask(s.logits, C.vocab);   // grammar mask (P4) — caller wrote _gmaskBuf
       if (opts && opts.temp > 0) gumbelNoise(s.logits, C.vocab, opts.temp);   // temperature sampling (after mask: -3e38 stays dominated)
       // GPU-side greedy argmax → write the predicted token straight into the token
@@ -3598,6 +3618,29 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       forcedF32Logits: { nonzero: f32nz, max: +f32max.toFixed(3) },   // >0 → safe path WORKS (numeric bug); 0 → structural
       lastHidden: { nan: hnan, min: +hmn.toFixed(3), max: +hmx.toFixed(3), mean: +(hsum / hd.length).toFixed(4) },
     };
+  }
+
+  // Stage probe: run ONE prefill with per-stage nonzero taps (layer 0) and report the FIRST
+  // stage that goes all-zero — pinpoints exactly which kernel degenerates on a device where
+  // the whole forward is zero but every kernel passes conformance. Forces batching OFF so the
+  // in-forward readbacks are valid. Returns a compact { firstZero, summary, stages }.
+  async function _stageProbe(prompt, variant) {
+    await loadModel({ variant: variant || _variant });
+    _cachedIds = null; _sysAnchor = null;
+    const ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello' }]);
+    const L = ids.length;
+    const savForce = globalThis.__forceBatch;
+    globalThis.__forceBatch = false; try { await E.probeBatch && E.probeBatch(); } catch (_) {}   // ensure immediate mode; taps read validly
+    globalThis.__dbgTapOn = true; _dbgTapLog = [];
+    try {
+      for (let off = 0; off < L; off += 256) await forward(ids.slice(off, Math.min(off + 256, L)), off);
+    } catch (e) { _dbgTapLog.push({ name: 'THREW', err: String(e && e.message || e) }); }
+    globalThis.__dbgTapOn = false;
+    const log = _dbgTapLog; _dbgTapLog = null;
+    globalThis.__forceBatch = savForce;
+    const firstZero = (log.find(t => t.nz === 0) || {}).name || 'none (all stages nonzero)';
+    const summary = log.map(t => t.err ? (t.name + '=ERR') : (t.name + '=' + t.nz + '/' + t.n)).join('  ');
+    return { promptTokens: L, batchOk: (E.batchOk ? E.batchOk() : 'n/a'), firstZero, summary, stages: log };
   }
 
   // ---- Double-buffered GPU-resident decode -----------------------------------
@@ -4689,7 +4732,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels, makeToolGrammar,
-    TOK, loadModel, forward, generate, readLogits, _debugLogits, isLoaded: () => _loaded, variant: () => _variant,
+    TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, isLoaded: () => _loaded, variant: () => _variant,
     runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
