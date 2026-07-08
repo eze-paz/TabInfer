@@ -410,26 +410,14 @@ struct U { mul:u32, _p0:u32, _p1:u32, _p2:u32 };
 fn main(@builtin(global_invocation_id) g:vec3<u32>) { if (g.x < 64u) { o[g.x] = f32((g.x + 1u) * u.mul); } }`;
   async function probeBatch() {
     if (_batchOk !== null) return _batchOk;
-    // ALLOWLIST gate (inverted). The batched command encoder silently drops output on
-    // Adreno (all-"!"); a runtime probe kept FALSE-PASSING, and a mobile-vendor DENYlist
-    // failed because Android Chrome redacts the adapter vendor/architecture to "" inside a
-    // Web Worker (where the engine actually runs) — so the deny-regex never matched and
-    // batching stayed on. Invert it: batching is OFF by default and only turned ON when the
-    // GPU is POSITIVELY a known-good desktop vendor (Intel/NVIDIA/AMD/Apple/Microsoft/Mesa).
-    // Empty/unknown adapter info (mobile, worker, privacy-redacted) → OFF → immediate per-op
-    // submits, the path all kernel self-tests pass and verified to generate coherent text.
-    // Override: globalThis.__forceBatch = true (force on) / false (force off).
+    // The batched command encoder was WRONGLY blamed for the Adreno all-"!" (real cause was
+    // the embed matrix exceeding maxStorageBufferBindingSize — see _shardEmbedIfNeeded). The
+    // earlier mobile-disabling gate is gone: it cost ~10× on mobile (per-op submits) for no
+    // reason. Batching is verified per device by the probe below (in-batch writeBuffer + read);
+    // it passed on Adreno. Override: globalThis.__forceBatch = true (force on) / false (off).
     try {
       if (globalThis.__forceBatch === true) { _batchOk = true; return true; }
       if (globalThis.__forceBatch === false) { _batchOk = false; console.warn('[webgpu] batching force-disabled (__forceBatch=false)'); return false; }
-      const a = (_caps && _caps.adapter) || {};
-      const sig = ((a.vendor || '') + ' ' + (a.architecture || '') + ' ' + (a.description || '')).toLowerCase();
-      const desktopOk = /intel|nvidia|geforce|\brtx\b|\bgtx\b|\bamd\b|radeon|\brdna\b|apple m[0-9]|microsoft|warp|mesa|llvmpipe|swiftshader/.test(sig);
-      if (!desktopOk) {
-        _batchOk = false;
-        console.warn('[webgpu] GPU not a known-good desktop vendor (adapter="' + sig.trim() + '") — batching DISABLED (per-op submits) to dodge the Adreno all-"!" batched-encoder bug');
-        return false;
-      }
     } catch (_) {}
     let buf = null, ubuf = null;
     const MUL = 7, exp = i => (i + 1) * MUL;
