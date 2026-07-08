@@ -22,7 +22,7 @@
 </style>
 </head>
 <body>
-<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 145 · qwen3 v140 · engine v53</div>
+<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 146 · qwen3 v141 · engine v53</div>
 <h1>sandpie WebGPU engine — capability + GEMM bench</h1>
 <p class="sub">Open this in the browser you actually run sandpie in. It answers the one question the whole engine project rests on: does <em>this</em> device expose the fast subgroup / subgroup-matrix path?</p>
 
@@ -33,6 +33,7 @@
   <button id="dbgLogits" title="Prefill a short prompt on Qwen3-0.6B and report logit statistics (NaN/Inf/min/max/argmax) — pinpoints whether the assembled forward is degenerate">Debug logits (0.6B)</button>
   <button id="stageProbe" style="background:#8957e5; border-color:#8957e5; color:#fff;" title="Run one prefill and report the FIRST stage of the forward that goes all-zero">▶ Stage probe (find the dead kernel)</button>
   <button id="tsProfile" style="background:#0969da; border-color:#0969da; color:#fff;" title="GPU-timestamp decode profiler: true per-kernel µs of one real batched decode forward (no flush contamination). Needs timestamp-query.">▶ Profile decode (GPU ts)</button>
+  <button id="tsPrefill" style="background:#0550ae; border-color:#0550ae; color:#fff;" title="GPU-timestamp prefill profiler: times a 256-tok chunk COLD (posBase 0, GEMM-bound) vs HOT (posBase ~2048, attention-bound) to show why long prefill crawls.">▶ Profile prefill (cold vs hot)</button>
   <button id="gemmAB" style="background:#1f883d; border-color:#1f883d; color:#fff;" title="Time the 3 prefill-GEMM paths (int4 DP4A vs f16 vs f32) at the down_proj shape — picks the fastest for this GPU">▶ Prefill GEMM A/B</button>
   <span id="status" class="hi"></span>
 </div>
@@ -48,6 +49,10 @@
   <div>DECODE compute ceiling: <b id="tsCeiling" style="color:#58a6ff; font-size:1.3rem;">—</b></div>
   <div id="tsTop" style="color:#c9d1d9; font-size:0.85rem; margin-top:0.4rem; word-break:break-word;"></div>
   <div id="tsTable" style="margin-top:0.5rem;"></div>
+</div>
+<div id="pfOut" style="display:none; margin:0.5rem 0; padding:0.8rem 1rem; background:#161b22; border:2px solid #0550ae; border-radius:8px; font-size:1.05rem;">
+  <div>PREFILL ceiling — cold <b id="pfCold" style="color:#58a6ff;">—</b> · hot <b id="pfHot" style="color:#f0883e;">—</b></div>
+  <div id="pfDetail" style="color:#c9d1d9; font-size:0.82rem; margin-top:0.4rem; word-break:break-word;"></div>
 </div>
 <pre id="dbgOut" style="display:none"></pre>
 
@@ -95,7 +100,7 @@
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
 <script src="../modules/webgpu-engine.js?v=53"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
-<script src="../modules/webgpu-qwen3.js?v=140"></script>
+<script src="../modules/webgpu-qwen3.js?v=141"></script>
 <script src="../modules/webgpu-lfm25.js?v=53"></script>
 <script>
   // Verbose engine logs in the console for this harness.
@@ -224,6 +229,25 @@
       set('status', 'ts profile done', 'ok');
     } catch (e) { $('tsCeiling').textContent = 'ERROR'; $('tsTop').textContent = (e && e.stack || e); console.error(e); }
     finally { $('tsProfile').disabled = false; }
+  });
+
+  $('tsPrefill').addEventListener('click', async () => {
+    $('tsPrefill').disabled = true;
+    const box = $('pfOut'); box.style.display = 'block';
+    $('pfCold').textContent = 'timing…'; $('pfHot').textContent = ''; $('pfDetail').textContent = '';
+    try {
+      const r = await window.SandpieQwen3._profilePrefillTS($('prompt').value || 'Hello', $('model').value === 'qwen3-1.7b' ? '1.7B' : '0.6B', 256, 2048);
+      if (r.error) { $('pfCold').textContent = 'unavailable'; $('pfDetail').textContent = r.error + (r.fallback ? ' — ' + r.fallback : ''); }
+      else {
+        $('pfCold').textContent = r.cold.prefillCeilingTps + ' tok/s (attn ' + r.cold.attnPct + '%)';
+        $('pfHot').textContent = r.hot.prefillCeilingTps + ' tok/s @' + r.hot.posBase + ' (attn ' + r.hot.attnPct + '%)';
+        $('pfDetail').innerHTML =
+          '<b>cold@0</b> ' + r.cold.gpuComputeMs + 'ms/' + r.T + 'tok — ' + r.cold.top +
+          '<br><b>hot@' + r.hot.posBase + '</b> ' + r.hot.gpuComputeMs + 'ms/' + r.T + 'tok — ' + r.hot.top;
+      }
+      set('status', 'prefill ts profile done', 'ok');
+    } catch (e) { $('pfCold').textContent = 'ERROR'; $('pfDetail').textContent = (e && e.stack || e); console.error(e); }
+    finally { $('tsPrefill').disabled = false; }
   });
 
   $('gemmAB').addEventListener('click', async () => {

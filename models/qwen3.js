@@ -3801,18 +3801,59 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     catch (e) { return { error: String(e && e.message || e), fallback: 'use Stage probe (flush-based _profileDecode)' }; }
     await forward([0], pos + 1, { chain: true });   // THE timed decode step — the real batched forward
     const passes = await E.endProfile();            // [{label, us}] per compute pass
-    // Aggregate per kernel label (each label runs ~numLayers times per forward).
-    const agg = {};
-    for (const p of passes) { const a = agg[p.label] || (agg[p.label] = { label: p.label, us: 0, n: 0 }); a.us += p.us; a.n++; }
-    const rows = Object.values(agg).sort((a, b) => b.us - a.us)
-      .map(a => ({ label: a.label, totalUs: +a.us.toFixed(1), calls: a.n, usEach: +(a.us / a.n).toFixed(2), pct: 0 }));
-    const totalUs = passes.reduce((s, p) => s + p.us, 0) || 1;
-    for (const r of rows) r.pct = +(100 * r.totalUs / totalUs).toFixed(1);
-    const top = rows.slice(0, 6).map(r => r.label + ' ' + r.totalUs + 'µs (' + r.pct + '%, ×' + r.calls + ')').join('   ');
+    const a = _aggPasses(passes);
+    const top = a.rows.slice(0, 6).map(r => r.label + ' ' + r.totalUs + 'µs (' + r.pct + '%, ×' + r.calls + ')').join('   ');
     // Pure-compute ceiling: if the ONLY cost were these kernels (no submit/readback/CPU-encode
     // overhead), decode would run this fast. Gap vs generate()'s real tok/s = the overhead budget.
-    return { gpuComputeMs: +(totalUs / 1000).toFixed(2), computeCeilingTps: +(1e6 / totalUs).toFixed(1),
-             dispatches: passes.length, top, rows, note: 'true GPU kernel µs (no flush contamination); computeCeilingTps excludes submit/readback overhead — compare to generate() real tok/s' };
+    return { gpuComputeMs: a.totalMs, computeCeilingTps: +(1e6 / a.totalUs).toFixed(1), attnPct: a.attnPct,
+             dispatches: passes.length, top, rows: a.rows, note: 'true GPU kernel µs (no flush contamination); computeCeilingTps excludes submit/readback overhead — compare to generate() real tok/s' };
+  }
+
+  // Aggregate raw [{label,us}] passes → per-kernel rows (sorted, with %), total, and the
+  // attention share (labels matching /attn/). Shared by the decode + prefill TS profilers.
+  function _aggPasses(passes) {
+    const agg = {};
+    for (const p of passes) { const a = agg[p.label] || (agg[p.label] = { label: p.label, us: 0, n: 0 }); a.us += p.us; a.n++; }
+    const totalUs = passes.reduce((s, p) => s + p.us, 0) || 1;
+    const rows = Object.values(agg).sort((a, b) => b.us - a.us)
+      .map(a => ({ label: a.label, totalUs: +a.us.toFixed(1), calls: a.n, usEach: +(a.us / a.n).toFixed(2), pct: +(100 * a.us / totalUs).toFixed(1) }));
+    const attnUs = passes.filter(p => /attn/i.test(p.label)).reduce((s, p) => s + p.us, 0);
+    return { rows, totalUs, totalMs: +(totalUs / 1000).toFixed(2), attnPct: +(100 * attnUs / totalUs).toFixed(1) };
+  }
+
+  // GPU-TIMESTAMP prefill profiler. Profiles ONE T-token prefill chunk at TWO positions to
+  // separate the two costs that make prefill slow: a COLD chunk at posBase=0 (GEMM-bound — the
+  // matmul re-read / kernel efficiency), and a HOT chunk at a high posBase (attention-bound —
+  // the O(T·S) cost that grows with context, i.e. why the 2.5k stress prefill crawls). The jump
+  // in attnPct cold→hot is the smoking gun. Same zero-main-path-cost guarantee as the decode TS
+  // profiler (dispatch() only times while E.beginProfile is active).
+  async function _profilePrefillTS(prompt, variant, T, posBaseHi) {
+    await loadModel({ variant: variant || _variant });
+    _cachedIds = null; _sysAnchor = null;
+    T = Math.max(8, Math.min(T || 256, 512));
+    const Phi = Math.max(T, posBaseHi || 2048);
+    let ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello' }]);
+    while (ids.length < T) ids = ids.concat(ids);
+    ids = ids.slice(0, T);                                   // exactly T tokens, repeated to fill
+    if (Phi + T + 8 > MAX_SEQ) _growCtx(Math.max(1024, Math.min(_ctxCap, Math.ceil((Phi + T + 8) / 1024) * 1024)));
+    if (Phi + T + 8 > _ctxCap) return { error: 'context cap ' + _ctxCap + ' too small for posBaseHi ' + Phi };
+    // COLD: warm-compile then time a chunk at posBase 0 (KV empty → attention over just T keys).
+    await forward(ids, 0);
+    let cold = null;
+    try { E.beginProfile(1500); } catch (e) { return { error: String(e && e.message || e), fallback: 'use Stage probe' }; }
+    await forward(ids, 0);
+    cold = _aggPasses(await E.endProfile());
+    // Fill KV up to Phi (untimed), then time a chunk there (attention over ~Phi keys).
+    for (let off = T; off < Phi; off += T) await forward(ids, off);
+    E.beginProfile(1500);
+    await forward(ids, Phi);
+    const hot = _aggPasses(await E.endProfile());
+    const fmt = (agg, posBase) => ({
+      posBase, gpuComputeMs: agg.totalMs, prefillCeilingTps: +(T / (agg.totalMs / 1000)).toFixed(1), attnPct: agg.attnPct,
+      top: agg.rows.slice(0, 6).map(r => r.label + ' ' + r.totalUs + 'µs (' + r.pct + '%)').join('   '), rows: agg.rows,
+    });
+    return { T, cold: fmt(cold, 0), hot: fmt(hot, Phi),
+             note: 'prefillCeilingTps = T tokens ÷ pure GPU kernel ms (excludes submit/readback). attnPct jump cold→hot shows how much the O(T·S) attention grows with context.' };
   }
 
   // ---- Double-buffered GPU-resident decode -----------------------------------
@@ -4942,7 +4983,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels, makeToolGrammar,
-    TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, _profileDecode, _profileDecodeTS, _lastGenStats: () => _lastGenStats, isLoaded: () => _loaded, variant: () => _variant,
+    TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, _profileDecode, _profileDecodeTS, _profilePrefillTS, _lastGenStats: () => _lastGenStats, isLoaded: () => _loaded, variant: () => _variant,
     runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchPrefillGemm, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
