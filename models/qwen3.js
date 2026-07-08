@@ -3945,6 +3945,38 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return { T, N, K, relErr, gemmQ_ms: +q_ms.toFixed(2), gemmDP4_ms: +dp_ms.toFixed(2), speedup: +(q_ms / dp_ms).toFixed(2) };
   }
 
+  // On-device prefill-GEMM A/B for mobile: time the three prefill matmul paths at the
+  // down_proj shape (the biggest per-layer GEMM) and report ms + GFLOP/s + winner. Picks
+  // the fastest to default on this GPU — Adreno may emulate dot4I8Packed (int4 DP4A) in
+  // software while its f16 FMA is native, so f16 gemmQ can win big. Standalone (synthetic
+  // weights); needs only E.init(). Returns which path the forward should use.
+  async function _benchPrefillGemm({ T = 256, N = 1024, K = 3072, iters = 6 } = {}) {
+    await E.init();
+    const words = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(N * words); for (let i = 0; i < pack.length; i++) pack[i] = (Math.imul(i, 2654435761) >>> 0);
+    const scales = new Uint16Array(N * gpr); for (let i = 0; i < scales.length; i++) scales[i] = 0x3000 + (i % 7);
+    const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.013) * 0.7;
+    const UF = U.STORAGE | U.COPY_DST | U.COPY_SRC;
+    const mk = (a) => { const b = E.createBuffer(a.byteLength, UF, 'bg'); E.device().queue.writeBuffer(b, 0, a.buffer, a.byteOffset || 0, a.byteLength); return b; };
+    const xb = mk(x), pb = mk(pack), sb = mk(scales), yb = E.createBuffer(T * N * 4, UF, 'yb');
+    const wrec = { pack: pb, scales: sb };
+    const savF16 = _f16Math, savBatch = globalThis.__forceBatch;
+    globalThis.__forceBatch = false;   // per-op submits so wall-clock times each GEMM (not overlapped)
+    const time = async (fn) => { uniformReset(); await fn(); await E.device().queue.onSubmittedWorkDone(); const t0 = performance.now(); for (let i = 0; i < iters; i++) { uniformReset(); await fn(); } await E.device().queue.onSubmittedWorkDone(); return (performance.now() - t0) / iters; };
+    let dp4_ms = 0, f16_ms = 0, f32_ms = 0;
+    try {
+      dp4_ms = await time(() => gemmDP4A(xb, wrec, yb, T, N, K));
+      _f16Math = true;  f16_ms = await time(() => gemmQ(xb, wrec, yb, T, N, K));
+      _f16Math = false; f32_ms = await time(() => gemmQ(xb, wrec, yb, T, N, K));
+    } finally { _f16Math = savF16; globalThis.__forceBatch = savBatch; }
+    [xb, pb, sb, yb].forEach(b => b.destroy());
+    const gf = (ms) => +(2 * T * N * K / (ms * 1e6)).toFixed(0);
+    const paths = [{ k: 'dp4', ms: dp4_ms }, { k: 'f16', ms: f16_ms }, { k: 'f32', ms: f32_ms }].sort((a, b) => a.ms - b.ms);
+    return { shape: T + 'x' + N + 'x' + K, dp4_ms: +dp4_ms.toFixed(1), f16_ms: +f16_ms.toFixed(1), f32_ms: +f32_ms.toFixed(1),
+      dp4_gflops: gf(dp4_ms), f16_gflops: gf(f16_ms), f32_gflops: gf(f32_ms),
+      winner: paths[0].k, recommend: (paths[0].k === 'dp4' ? 'keep DP4A (default)' : 'set __noDp4Gemm=true; ' + (paths[0].k === 'f32' ? 'and f16Math=false' : 'f16 wins')) };
+  }
+
   // RELIABLE A/B: GPU-TIMESTAMP, MIN-of-reps (the only stable method on this throttling
   // iGPU — wall-clock swings ±50%). Times pure GPU compute per call and separates the DP4A
   // activation-quantize (label *quant*) from the GEMM, so dp4gemm = the cost if the quantize
@@ -4814,7 +4846,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels, makeToolGrammar,
     TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchPrefillGemm, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
