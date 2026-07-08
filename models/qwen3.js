@@ -3427,7 +3427,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     try { if (_tokHist && _tokHist.destroy) _tokHist.destroy(); } catch (_) {}
     _kv = null; _tokHist = null; _cachedIds = null; _sysAnchor = null;   // realloc + invalidate prefix caches
   }
-  let _PERF = false, _perfData = null;   // CPU phase profiler (encode vs readback)
+  let _PERF = false, _perfData = null, _lastGenStats = null;   // CPU phase profiler (encode vs readback) + last generate() prefill/decode stats
   let _kv = null;     // per layer, sized MAX_SEQ: {k,v} f32, or {kq,ks,vq,vs} when _kvQ8
   let _kvQ8 = true;   // int8 KV cache (P2): 4× less decode-attention bandwidth; set in loadModel (__noKvQ8 or __noStreamDecAttn revert to f32 KV)
   let _scr = null;    // scratch buffers, sized to _scrT rows
@@ -3528,7 +3528,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // GPU work, far under the watchdog, so the ~15 submit-boundary stalls/token vanish (they
     // were ~half the per-token GPU idle). PREFILL (T>1): keep the 32-op flush (big kernels →
     // a single multi-second submit would trip the OS GPU watchdog / TDR).
-    E.beginBatch(T === 1 ? Infinity : undefined);
+    // Normally decode (T=1) records the whole forward as ONE submit. But when stage-tapping
+    // is on, each _tap() must drain a specific stage's buffer — an open Infinity batch would
+    // never flush and the readbacks would hang/lie. So fall back to per-op flush while tapping.
+    E.beginBatch((T === 1 && !globalThis.__dbgTapOn) ? Infinity : undefined);
     await embedGather(embIds, _weights['model.embed_tokens.weight'], s.x, T, H, embOff);
     await _tap('embed', s.x, H);
     const modSkip = (T === 1 && _kvQ8) ? _modSkipSet(C.numLayers) : null;   // decode-only layer skip (experiment)
@@ -3555,6 +3558,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         gemvDP4_only(qW.pack, qW.scales, s.q, nHq * hd, H);
         gemvDP4_only(kW.pack, kW.scales, s.k, nKv * hd, H);
         gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
+        if (l === 0) await _tap('l0.dec.norm+qkv', s.v, nKv * hd);
       } else {
         await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
         if (l === 0) await _tap('l0.attn_norm', s.normed, H);
@@ -3594,6 +3598,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         const gW = Wq(p + 'mlp.gate_proj.weight'), uW = Wq(p + 'mlp.up_proj.weight');
         rmsnormQ(s.x, W(p + 'post_attention_layernorm.weight'), H, C.rmsEps);
         gateUpSiluDP4_only(gW, uW, s.swi, I, H);
+        if (l === 0) await _tap('l0.dec.norm+gateup', s.swi, I);
       } else {
         await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight'), s.normed, T, H, C.rmsEps);
         await linearQ(s.normed, Wq(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
@@ -3747,6 +3752,33 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return { probeTokens: T, batchOk: (E.batchOk ? E.batchOk() : 'n/a'), firstZero, slowestStages: slowest, estPrefillMsAt_T: estPrefillMs, msNote: 'per-stage ms at T=' + T + ' (immediate mode; relative costs are what matter)', summary, stages: log };
   }
 
+  // Decode-stage profiler: warm-prefill a short prompt, then time each stage of ONE decode
+  // (T=1) forward via per-stage flush taps. Tells us which stage dominates decode — the thing
+  // to target to beat the CPU baseline. Absolute ms is INFLATED by the immediate-mode flushes
+  // (real batched decode fuses the whole forward into one submit and is faster); RELATIVE stage
+  // costs are the signal. For the real decode tok/s, use generate()'s reported number.
+  async function _profileDecode(prompt, variant) {
+    await loadModel({ variant: variant || _variant });
+    _cachedIds = null; _sysAnchor = null;
+    const ids = TOK.encodeChat([{ role: 'user', content: prompt || 'Hello' }]);
+    if (ids.length + 8 > MAX_SEQ) _growCtx(Math.max(1024, Math.min(_ctxCap, Math.ceil((ids.length + 8) / 1024) * 1024)));
+    await forward(ids, 0);                       // warm prefill (batched, untapped) → _tokHist[L]=token0
+    const pos = ids.length;
+    globalThis.__dbgTapOn = true; _dbgTapLog = []; _tapClock = 0;
+    try { await forward([0], pos, { chain: true }); }   // ONE decode step, GPU-resident chain (reads _tokHist[pos])
+    catch (e) { _dbgTapLog.push({ name: 'THREW', err: String(e && e.message || e) }); }
+    globalThis.__dbgTapOn = false;
+    const log = _dbgTapLog; _dbgTapLog = null;
+    // layer-0 stages repeat over numLayers; embed/final/logits run once → estimate a full decode step.
+    const L0 = log.filter(t => t.name.startsWith('l0.')).reduce((a, t) => a + (t.ms || 0), 0);
+    const once = log.filter(t => !t.name.startsWith('l0.') && !t.name.startsWith('layers_')).reduce((a, t) => a + (t.ms || 0), 0);
+    const estMs = Math.round(L0 * CONFIG.numLayers + once);
+    const slowest = log.slice().filter(t => t.ms).sort((a, b) => b.ms - a.ms).slice(0, 4).map(t => t.name + ' ' + t.ms + 'ms');
+    const summary = log.map(t => t.err ? (t.name + '=ERR') : (t.name + '=' + (t.ms || 0) + 'ms')).join('  ');
+    return { slowestStages: slowest, estDecodeMsImmediate: estMs, estDecodeTpsImmediate: +(1000 / Math.max(1, estMs)).toFixed(1),
+             note: 'immediate-mode flushes inflate absolute ms — use RELATIVE stage costs to target, and generate() for real decode tok/s', summary, stages: log };
+  }
+
   // ---- Double-buffered GPU-resident decode -----------------------------------
   // Decode tokens chain through _tokHist on the GPU (argmax@P writes _tokHist[P+1],
   // embed@P+1 reads it), so a batch of GEN_BATCH chained forwards needs no readback
@@ -3892,7 +3924,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   const GEN_BATCH = 32;   // tokens/GPU-resident batch (1 readback each) — big to amortize the
                           // vsync-throttled readback when the tab is focused (see decodeLoop).
   const PIPE_DEPTH = 3;   // batches kept in flight so the GPU never idles awaiting a readback.
-  async function generate(prompt, { maxTokens = 64, onToken, signal, toolNames, temperature } = {}) {
+  async function generate(prompt, { maxTokens = 64, onToken, onStats, signal, toolNames, temperature } = {}) {
     await loadModel({ variant: _variant });
     _cachedIds = null; _sysAnchor = null;   // one-shot path prefills KV from pos 0 → invalidate any prefix cache
     const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
@@ -3905,11 +3937,17 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     if (_need > MAX_SEQ) _growCtx(Math.max(1024, Math.min(_ctxCap, Math.ceil(_need / 1024) * 1024)));
     let tok0;
     const temp = temperature > 0 ? +temperature : 0;
+    const _pf0 = performance.now();
     for (let off = 0; off < L; off += 256) {     // prefill → _tokHist[L]=token0
       if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
       const last = off + 256 >= L;
       tok0 = await forward(ids.slice(off, Math.min(off + 256, L)), off, last && temp ? { temp } : undefined);   // temperature applies to the FIRST sampled token too
     }
+    // Prefill tok/s: prompt tokens ÷ time to finish the whole prefill (before the first
+    // decoded token). This is the metric the harness/phone bench reports next to decode t/s.
+    const _pfMs = performance.now() - _pf0;
+    _lastGenStats = { prefillTokens: L, prefillMs: +_pfMs.toFixed(1), prefillTps: +(L / (_pfMs / 1000)).toFixed(1) };
+    if (onStats) { try { onStats(_lastGenStats); } catch (_) {} }
     const outIds = []; let pos = L;
     const emit = (t) => { if (STOP(t)) return false; outIds.push(t); if (onToken) { try { onToken(TOK.decode([t])); } catch (_) {} } return true; };
     if (!emit(tok0)) return TOK.decode(outIds);
@@ -4868,7 +4906,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     CONFIG,
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels, makeToolGrammar,
-    TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, isLoaded: () => _loaded, variant: () => _variant,
+    TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, _profileDecode, _lastGenStats: () => _lastGenStats, isLoaded: () => _loaded, variant: () => _variant,
     runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchPrefillGemm, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,

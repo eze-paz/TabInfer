@@ -22,7 +22,7 @@
 </style>
 </head>
 <body>
-<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 143 · qwen3 v138 · engine v53</div>
+<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 144 · qwen3 v139 · engine v53</div>
 <h1>sandpie WebGPU engine — capability + GEMM bench</h1>
 <p class="sub">Open this in the browser you actually run sandpie in. It answers the one question the whole engine project rests on: does <em>this</em> device expose the fast subgroup / subgroup-matrix path?</p>
 
@@ -89,7 +89,7 @@
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
 <script src="../modules/webgpu-engine.js?v=53"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
-<script src="../modules/webgpu-qwen3.js?v=138"></script>
+<script src="../modules/webgpu-qwen3.js?v=139"></script>
 <script src="../modules/webgpu-lfm25.js?v=53"></script>
 <script>
   // Verbose engine logs in the console for this harness.
@@ -185,8 +185,14 @@
     $('stageFirst').textContent = 'running…'; $('stageSummary').textContent = '';
     try {
       const r = await window.SandpieQwen3._stageProbe($('prompt').value || 'Hello', '0.6B', 256);
-      $('stageFirst').textContent = 'firstZero=' + r.firstZero + ' | slowest: ' + (r.slowestStages || []).join(', ');
-      $('stageSummary').textContent = 'est prefill/layer-pass @T=' + r.probeTokens + ': ~' + r.estPrefillMsAt_T + 'ms · ' + r.summary;
+      const d = await window.SandpieQwen3._profileDecode($('prompt').value || 'Hello', '0.6B');
+      $('stageFirst').innerHTML =
+        'PREFILL slowest: <b style="color:#f0883e">' + (r.slowestStages || []).join(', ') + '</b>' +
+        '<br>DECODE slowest: <b style="color:#3fb950">' + (d.slowestStages || []).join(', ') + '</b>' +
+        (r.firstZero && r.firstZero.indexOf('none') !== 0 ? '<br><span style="color:#f85149">firstZero=' + r.firstZero + '</span>' : '');
+      $('stageSummary').textContent =
+        'PREFILL est ~' + r.estPrefillMsAt_T + 'ms @T=' + r.probeTokens + '  |  ' + r.summary +
+        '   ‖   DECODE est ~' + d.estDecodeMsImmediate + 'ms/tok (' + d.estDecodeTpsImmediate + ' tok/s, immediate-mode inflated)  |  ' + d.summary;
       set('status', 'stage probe done', 'ok');
     } catch (e) { $('stageFirst').textContent = 'ERROR'; $('stageSummary').textContent = (e && e.stack || e); console.error(e); }
     finally { $('stageProbe').disabled = false; }
@@ -255,14 +261,19 @@
         $('genstat').textContent = 'generating…';
       }
       const maxTokens = +$('maxtok').value || 80;
-      let n = 0, t0 = 0;
-      await Q.generate(prompt, { maxTokens, onToken: (piece) => {
-        if (n === 0) t0 = performance.now();   // start timing at first token (exclude prefill)
-        n++;
-        $('out').textContent += piece;
-      }});
+      let n = 0, t0 = 0, pf = null;
+      await Q.generate(prompt, {
+        maxTokens,
+        onStats: (s) => { pf = s; },           // fired once when prefill completes (before first token)
+        onToken: (piece) => {
+          if (n === 0) t0 = performance.now();   // start decode timing at first token (exclude prefill)
+          n++;
+          $('out').textContent += piece;
+        }});
       const secs = (performance.now() - t0) / 1000;
-      $('tps').textContent = n > 1 ? `${(n / secs).toFixed(1)} tok/s (${n} tokens)` : '';
+      const decStr = n > 1 ? `${(n / secs).toFixed(1)} tok/s decode (${n} tok)` : '';
+      const pfStr = pf ? `${pf.prefillTps} tok/s prefill (${pf.prefillTokens} tok, ${pf.prefillMs}ms)` : '';
+      $('tps').textContent = [pfStr, decStr].filter(Boolean).join('   ·   ');
       $('genstat').textContent = 'done';
     } catch (e) {
       $('genstat').textContent = 'error: ' + (e && e.message || e); console.error(e);
