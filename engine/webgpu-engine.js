@@ -410,6 +410,24 @@ struct U { mul:u32, _p0:u32, _p1:u32, _p2:u32 };
 fn main(@builtin(global_invocation_id) g:vec3<u32>) { if (g.x < 64u) { o[g.x] = f32((g.x + 1u) * u.mul); } }`;
   async function probeBatch() {
     if (_batchOk !== null) return _batchOk;
+    // DETERMINISTIC mobile-GPU gate. The probe kept FALSE-PASSING on Adreno (a bare batched
+    // dispatch works; the real breakage is subtler and the probe couldn't reliably trip it),
+    // so don't rely on detection: mobile GPUs (Adreno/Mali/ARM/PowerVR/Apple-mobile) that
+    // failed the batched forward get batching OFF outright. Immediate per-op submits are the
+    // exact path all kernel self-tests pass on these devices — correctness over the
+    // submit-bubble savings. Desktop vendors (Intel/NVIDIA/AMD/Apple desktop) keep batching.
+    // Override with globalThis.__forceBatch=true (re-enable) / false (force off).
+    try {
+      if (globalThis.__forceBatch === true) { _batchOk = true; return true; }
+      if (globalThis.__forceBatch === false) { _batchOk = false; console.warn('[webgpu] batching force-disabled (__forceBatch=false)'); return false; }
+      const a = (_caps && _caps.adapter) || {};
+      const sig = ((a.vendor || '') + ' ' + (a.architecture || '') + ' ' + (a.description || '')).toLowerCase();
+      if (/qualcomm|adreno|mali|\barm\b|powervr|img|apple-[am]|broadcom|vivante/.test(sig)) {
+        _batchOk = false;
+        console.warn('[webgpu] mobile GPU (' + sig.trim() + ') — batching DISABLED (per-op submits) to dodge the batched-encoder bug that gave all-"!" output');
+        return false;
+      }
+    } catch (_) {}
     let buf = null, ubuf = null;
     const MUL = 7, exp = i => (i + 1) * MUL;
     try {
