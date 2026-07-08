@@ -832,6 +832,29 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         if (rel > 8e-2) { globalThis.__noDp4 = true; console.warn('[qwen3] DP4A decode GEMV WRONG on this GPU (rel ' + rel.toFixed(3) + ') — routing decode through gemvQ'); }
         else console.log('[qwen3] DP4A decode GEMV verified (rel ' + rel.toExponential(1) + ')');
       }
+      // PERF A/B: dot4I8Packed is HARDWARE on desktop but SOFTWARE-EMULATED on Adreno (measured
+      // 19 vs 106 GFLOP/s — 5.5× slower than f16). Time gemmDP4A vs f16 gemmQ at a mid shape; if
+      // f16 clearly wins, route BOTH prefill (__noDp4Gemm) and decode (__noDp4) through gemmQ/gemvQ.
+      if (!globalThis.__noDp4Gemm && globalThis.__forceDp4 !== true) {
+        const T2 = 256, N2 = 1024, K2 = 3072, words = K2 / 8, gpr = K2 / QGROUP;   // ≈ down_proj (the real bottleneck shape; small shapes mislead — DP4A's quantize overhead dominates there)
+        const pk = new Uint32Array(N2 * words); for (let i = 0; i < pk.length; i++) pk[i] = (Math.imul(i, 2654435761) >>> 0);
+        const sc = new Uint16Array(N2 * gpr); for (let i = 0; i < sc.length; i++) sc[i] = 0x3000 + (i % 7);
+        const x2 = new Float32Array(T2 * K2); for (let i = 0; i < x2.length; i++) x2[i] = Math.sin(i * 0.013) * 0.7;
+        const xb2 = f32buf(x2);
+        const pb2 = E.createBuffer(pk.byteLength, ST(), 'dp4perf.pk'); E.device().queue.writeBuffer(pb2, 0, pk);
+        const sb2 = E.createBuffer(sc.byteLength, ST(), 'dp4perf.sc'); E.device().queue.writeBuffer(sb2, 0, sc);
+        const yb2 = E.createBuffer(T2 * N2 * 4, ST(), 'dp4perf.y'); const wr2 = { pack: pb2, scales: sb2 };
+        bufs.push(xb2, pb2, sb2, yb2);
+        const savF16 = _f16Math, savForce = globalThis.__forceBatch; globalThis.__forceBatch = false;
+        const time = async (fn) => { await fn(); await E.device().queue.onSubmittedWorkDone(); const t0 = performance.now(); for (let i = 0; i < 4; i++) { uniformReset(); await fn(); } await E.device().queue.onSubmittedWorkDone(); return (performance.now() - t0) / 4; };
+        let dp = 0, f16 = 0;
+        try { dp = await time(() => gemmDP4A(xb2, wr2, yb2, T2, N2, K2)); _f16Math = true; f16 = await time(() => gemmQ(xb2, wr2, yb2, T2, N2, K2)); }
+        finally { _f16Math = savF16; globalThis.__forceBatch = savForce; }
+        if (dp > f16 * 1.3) {   // f16 clearly faster (DP4A emulated) → switch the whole forward to gemmQ/gemvQ
+          globalThis.__noDp4Gemm = true; globalThis.__noDp4 = true;
+          console.warn('[qwen3] DP4A EMULATED here (dp4 ' + dp.toFixed(1) + 'ms vs f16 ' + f16.toFixed(1) + 'ms) — routing prefill+decode through f16 gemmQ/gemvQ (' + (dp / f16).toFixed(1) + '× faster)');
+        } else console.log('[qwen3] DP4A perf OK (dp4 ' + dp.toFixed(1) + 'ms vs f16 ' + f16.toFixed(1) + 'ms) — keeping DP4A');
+      }
     } catch (e) {
       globalThis.__noDp4Gemm = true; globalThis.__noDp4 = true;
       console.warn('[qwen3] DP4A probe failed — routing forward through f16/f32 dequant path:', (e && e.message) || e);
