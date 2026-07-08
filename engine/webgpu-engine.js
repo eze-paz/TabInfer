@@ -396,37 +396,50 @@ const SandpieWebGPU = (function () {
   // kernel (out[i]=i+1) once inside beginBatch/endBatch and once as an immediate dispatch;
   // if the batched result is wrong (Adreno left it zero) but the immediate one is right,
   // disable batching so the forward uses per-op submits. Called once from init().
+  // The kernel reads a UNIFORM (mul) and writes o[i]=(i+1)*mul. The probe writes that
+  // uniform via queue.writeBuffer WHILE the batch encoder is open, then dispatches a pass
+  // that reads it — the exact pattern every real kernel uses (uniform() → writeBuffer,
+  // then dispatch). Adreno drops a writeBuffer issued before an as-yet-unsubmitted encoder,
+  // so the kernel reads mul=0 → all-zero output, even though a bare batched dispatch (no
+  // in-batch writeBuffer) works. A probe without the in-batch write is a FALSE PASS.
   const _BATCHPROBE_WGSL = `
+struct U { mul:u32, _p0:u32, _p1:u32, _p2:u32 };
 @group(0) @binding(0) var<storage, read_write> o : array<f32>;
+@group(0) @binding(1) var<uniform> u : U;
 @compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) g:vec3<u32>) { if (g.x < 64u) { o[g.x] = f32(g.x) + 1.0; } }`;
+fn main(@builtin(global_invocation_id) g:vec3<u32>) { if (g.x < 64u) { o[g.x] = f32((g.x + 1u) * u.mul); } }`;
   async function probeBatch() {
     if (_batchOk !== null) return _batchOk;
-    let buf = null;
+    let buf = null, ubuf = null;
+    const MUL = 7, exp = i => (i + 1) * MUL;
     try {
       const pipe = getPipeline('__batchprobe', _BATCHPROBE_WGSL);
       buf = createBuffer(64 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, 'batchprobe');
-      // Batched run.
+      ubuf = createBuffer(16, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST, 'batchprobe.u');
+      // Batched run — uniform written INSIDE the open batch (mirrors uniform()).
       _batchOk = true;                                   // let beginBatch build an encoder for the probe
       beginBatch(Infinity);
-      dispatch(pipe, [buf], [1, 1, 1]);
+      device().queue.writeBuffer(ubuf, 0, new Uint32Array([MUL, 0, 0, 0]));   // write while encoder is open
+      dispatch(pipe, [buf, ubuf], [1, 1, 1]);
       await endBatch();
       const batched = await readF32(buf, 64);
-      const okBatched = batched[0] === 1 && batched[10] === 11 && batched[63] === 64;
-      if (okBatched) { _batchOk = true; dbg('batch probe: batched dispatch OK'); return true; }
+      const okBatched = batched[0] === exp(0) && batched[10] === exp(10) && batched[63] === exp(63);
+      if (okBatched) { _batchOk = true; dbg('batch probe: batched writeBuffer+dispatch OK'); return true; }
       // Batched failed — confirm the immediate path works before blaming batching.
       device().queue.writeBuffer(buf, 0, new Float32Array(64));   // clear
-      dispatch(pipe, [buf], [1, 1, 1]);                            // immediate submit (no batch)
+      device().queue.writeBuffer(ubuf, 0, new Uint32Array([MUL, 0, 0, 0]));
+      dispatch(pipe, [buf, ubuf], [1, 1, 1]);                      // immediate submit (no batch)
       await device().queue.onSubmittedWorkDone();
       const imm = await readF32(buf, 64);
-      const okImm = imm[0] === 1 && imm[10] === 11 && imm[63] === 64;
+      const okImm = imm[0] === exp(0) && imm[10] === exp(10) && imm[63] === exp(63);
       _batchOk = false;
-      console.warn('[webgpu] batched command encoder produces no output on this GPU (immediate=' + (okImm ? 'OK' : 'ALSO BROKEN') + ') — disabling batching, using per-op submits');
+      console.warn('[webgpu] batched command encoder drops in-batch writeBuffer on this GPU (immediate=' + (okImm ? 'OK' : 'ALSO BROKEN') + ') — disabling batching, using per-op submits');
     } catch (e) {
       _batchOk = false;
       console.warn('[webgpu] batch probe failed — disabling batching:', (e && e.message) || e);
     } finally {
       try { buf && buf.destroy(); } catch (_) {}
+      try { ubuf && ubuf.destroy(); } catch (_) {}
     }
     return _batchOk;
   }
