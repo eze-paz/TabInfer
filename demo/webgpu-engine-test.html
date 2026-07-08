@@ -22,6 +22,7 @@
 </style>
 </head>
 <body>
+<div id="buildTag" style="position:fixed; top:0; right:0; background:#1f6feb; color:#fff; font:12px/1.4 ui-monospace,monospace; padding:0.25rem 0.6rem; border-bottom-left-radius:6px; z-index:9999;">build 132 · qwen3 v132 · engine v48</div>
 <h1>sandpie WebGPU engine — capability + GEMM bench</h1>
 <p class="sub">Open this in the browser you actually run sandpie in. It answers the one question the whole engine project rests on: does <em>this</em> device expose the fast subgroup / subgroup-matrix path?</p>
 
@@ -76,9 +77,9 @@
 <pre id="bench">—</pre>
 
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
-<script src="../modules/webgpu-engine.js?v=46"></script>
+<script src="../modules/webgpu-engine.js?v=48"></script>
 <script src="../modules/webgpu-grammar.js?v=1"></script>
-<script src="../modules/webgpu-qwen3.js?v=131"></script>
+<script src="../modules/webgpu-qwen3.js?v=132"></script>
 <script src="../modules/webgpu-lfm25.js?v=53"></script>
 <script>
   // Verbose engine logs in the console for this harness.

@@ -109,7 +109,7 @@ const SandpieWebGPU = (function () {
       // model can rebuild proactively instead of erroring on the user's next message.
       _lastLost = { reason: (info && info.reason) || 'unknown', message: (info && info.message) || '', at: (typeof performance !== 'undefined' ? Math.round(performance.now()) : 0) };
       console.error('[webgpu-engine] DEVICE LOST:', _lastLost.reason, '—', _lastLost.message);
-      _device = null; _caps = null; _pipelineCache.clear(); _bgCache.clear();
+      _device = null; _caps = null; _batchOk = null; _pipelineCache.clear(); _bgCache.clear();
       for (const fn of _lostListeners) { try { fn(_lastLost); } catch (_) {} }
     });
 
@@ -139,6 +139,8 @@ const SandpieWebGPU = (function () {
       },
     };
     dbg('init caps', _caps);
+    try { await probeBatch(); } catch (_) {}   // disable the batched encoder on devices that silently drop its output (Adreno all-"!")
+    _caps.batchOk = _batchOk;
     return _caps;
   }
 
@@ -354,12 +356,20 @@ const SandpieWebGPU = (function () {
   // CPU/GPU) — short command buffers alone let the GPU preempt and dodge the watchdog.
   let _batchEncoder = null, _batchCount = 0, _batchFlush = 32;
   const _BATCH_FLUSH = 32;
+  // Some drivers (observed: Qualcomm Adreno 7xx) do NOT produce visible results from a
+  // command encoder that records many passes before a single submit — the whole forward
+  // batched into one encoder ran but left every output buffer zero-initialised, so the
+  // model emitted only "!" (all-zero logits). probeBatch() verifies a trivial batched
+  // dispatch actually writes its output; if not, _batchOk=false makes beginBatch() a
+  // no-op so every dispatch() submits immediately (the proven per-op path — all kernel
+  // self-tests pass that way). Correctness over the submit-bubble savings on such devices.
+  let _batchOk = null;   // null=unprobed, true=batching works, false=forced immediate submits
   // beginBatch(flushEvery): flush the encoder every `flushEvery` GPU ops (default 32 —
   // keeps each submit short so a long PREFILL can't trip the OS GPU watchdog). Pass a
   // large value (e.g. Infinity) for short, safe batches like a single T=1 DECODE forward
   // (~14ms of GPU work total) to record the whole forward as ONE submit — eliminating the
   // ~15 submit-boundary stalls/token that otherwise idle the iGPU between passes.
-  function beginBatch(flushEvery) { _batchEncoder = device().createCommandEncoder({ label: 'forward' }); _batchCount = 0; _batchFlush = flushEvery || _BATCH_FLUSH; }
+  function beginBatch(flushEvery) { if (_batchOk === false) return; _batchEncoder = device().createCommandEncoder({ label: 'forward' }); _batchCount = 0; _batchFlush = flushEvery || _BATCH_FLUSH; }
   function _batchTick() {
     if (!_batchEncoder) return;
     if (++_batchCount >= _batchFlush) {
@@ -380,6 +390,45 @@ const SandpieWebGPU = (function () {
     const enc = device().createCommandEncoder();
     enc.copyBufferToBuffer(src, srcByteOff, dst, dstByteOff, bytes);
     device().queue.submit([enc.finish()]);
+  }
+
+  // Verify a batched dispatch actually writes its output on this device. Runs a trivial
+  // kernel (out[i]=i+1) once inside beginBatch/endBatch and once as an immediate dispatch;
+  // if the batched result is wrong (Adreno left it zero) but the immediate one is right,
+  // disable batching so the forward uses per-op submits. Called once from init().
+  const _BATCHPROBE_WGSL = `
+@group(0) @binding(0) var<storage, read_write> o : array<f32>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) g:vec3<u32>) { if (g.x < 64u) { o[g.x] = f32(g.x) + 1.0; } }`;
+  async function probeBatch() {
+    if (_batchOk !== null) return _batchOk;
+    let buf = null;
+    try {
+      const pipe = getPipeline('__batchprobe', _BATCHPROBE_WGSL);
+      buf = createBuffer(64 * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST, 'batchprobe');
+      // Batched run.
+      _batchOk = true;                                   // let beginBatch build an encoder for the probe
+      beginBatch(Infinity);
+      dispatch(pipe, [buf], [1, 1, 1]);
+      await endBatch();
+      const batched = await readF32(buf, 64);
+      const okBatched = batched[0] === 1 && batched[10] === 11 && batched[63] === 64;
+      if (okBatched) { _batchOk = true; dbg('batch probe: batched dispatch OK'); return true; }
+      // Batched failed — confirm the immediate path works before blaming batching.
+      device().queue.writeBuffer(buf, 0, new Float32Array(64));   // clear
+      dispatch(pipe, [buf], [1, 1, 1]);                            // immediate submit (no batch)
+      await device().queue.onSubmittedWorkDone();
+      const imm = await readF32(buf, 64);
+      const okImm = imm[0] === 1 && imm[10] === 11 && imm[63] === 64;
+      _batchOk = false;
+      console.warn('[webgpu] batched command encoder produces no output on this GPU (immediate=' + (okImm ? 'OK' : 'ALSO BROKEN') + ') — disabling batching, using per-op submits');
+    } catch (e) {
+      _batchOk = false;
+      console.warn('[webgpu] batch probe failed — disabling batching:', (e && e.message) || e);
+    } finally {
+      try { buf && buf.destroy(); } catch (_) {}
+    }
+    return _batchOk;
   }
 
   // ============================================================
@@ -508,7 +557,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   async function unload() {
     _pipelineCache.clear();
     if (_device) { try { _device.destroy(); } catch (_) {} }
-    _device = null; _adapter = null; _caps = null;
+    _device = null; _adapter = null; _caps = null; _batchOk = null;
   }
   async function streamRound() { throw new Error('webgpu-engine: model graph not implemented yet (engine core only)'); }
   async function runConversation(_ctx, emit) {
@@ -520,7 +569,7 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
     // engine core
     init, device, caps, deviceGen: () => _deviceGen,
     lastLoss: () => _lastLost, onLost: (fn) => { if (typeof fn === 'function') _lostListeners.push(fn); },
-    renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling, beginBatch, endBatch, copyBuffer,
+    renderWGSL, getPipeline, dispatch, beginProfile, endProfile, profiling, beginBatch, endBatch, copyBuffer, probeBatch, batchOk: () => _batchOk,
     createBuffer, uploadF32, readF32, gemm,
     createTexture2D, texView, texFromF32, texFromF16, f32ToF16,
     // measurement

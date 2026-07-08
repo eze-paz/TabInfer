@@ -3590,7 +3590,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     let caps = null; try { caps = E.caps && E.caps(); } catch (_) {}
     return {
       promptTokens: L, vocab: lg.length, tok0, argmax: amax,
-      flags: { noDp4Gemm: !!globalThis.__noDp4Gemm, noDp4: !!globalThis.__noDp4, f16Math: _f16Math, noStreamDecAttn: !!globalThis.__noStreamDecAttn, noKvQ8: !!globalThis.__noKvQ8 },
+      flags: { batchOk: (E.batchOk ? E.batchOk() : 'n/a'), noDp4Gemm: !!globalThis.__noDp4Gemm, noDp4: !!globalThis.__noDp4, f16Math: _f16Math, noStreamDecAttn: !!globalThis.__noStreamDecAttn, noKvQ8: !!globalThis.__noKvQ8 },
       caps: caps ? { adapter: caps.adapter, hasF16: caps.hasF16, hasSubgroups: caps.hasSubgroups, subgroupSize: caps.subgroupSize } : null,
       embedWeightNonzero: wnz + '/1024',   // -1 = couldn't read; 0 = WEIGHTS ARE ZERO (load failed)
       embedOut: { nonzero: embnz + '/' + H, min: +embmin.toFixed(3), max: +embmax.toFixed(3) },   // embed alone; 0 = embed/weights bad
