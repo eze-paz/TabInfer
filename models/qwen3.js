@@ -4946,6 +4946,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         // Synthesize the tool_calls delta so conversations.js builds the call bubbles.
         if (toolCalls.length) emit({ type: 'delta', delta: { tool_calls: toolCalls.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } })) } });
         emit({ type: 'round_end', content });
+        // Report REAL token usage: ids.length is the exact tokenizer count of the
+        // prompt this round saw. This is authoritative (not an estimate), so it
+        // drives the context meter / popup and the reported-only compaction trigger
+        // for local models exactly as a cloud provider's usage would.
+        try { emit({ type: 'usage', usage: { prompt_tokens: ids.length, total_tokens: ids.length } }); } catch (_) {}
         const asst = { role: 'assistant', content };
         if (toolCalls.length) asst.tool_calls = toolCalls;
         emit({ type: 'message_added', message: asst });

@@ -2490,6 +2490,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
         }
         if (toolCalls.length) emit({ type: 'delta', delta: { tool_calls: toolCalls.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: { name: tc.function.name, arguments: tc.function.arguments } })) } });
         emit({ type: 'round_end', content });
+        // Real prompt-token count (exact tokenizer output) → reported usage, so the
+        // context meter / popup and the reported-only compaction trigger work here.
+        try { emit({ type: 'usage', usage: { prompt_tokens: encLen, total_tokens: encLen } }); } catch (_) {}
         const asst = { role: 'assistant', content };
         if (toolCalls.length) asst.tool_calls = toolCalls;
         emit({ type: 'message_added', message: asst });
