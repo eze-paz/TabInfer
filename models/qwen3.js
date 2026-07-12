@@ -686,8 +686,13 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   let _f16Math = null;   // null = auto (caps.hasF16); set by probeF16Gemm / _setF16Math
   function _useF16Math() { return _f16Math !== null ? _f16Math : !!(E.caps && E.caps() && E.caps().hasF16); }
   const _gemmPad = false;   // bank-conflict padding — MEASURED 10% regression on gen-12lp → off
-  function gemmqWgsl(f16math, pad) {
-    const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = GEMMQ_BK, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
+  // Tunable f16-GEMM tile config. Defaults to the Iris-tuned block; the on-device autotuner
+  // (autotuneGemmQ) can replace it with a faster block for THIS GPU (e.g. Adreno wants a
+  // different tiling than gen-12lp). BK stays QGROUP (tied to the int4 quant group).
+  let _gemmCfg = { BM: GEMMQ_BM, BN: GEMMQ_BN, TM: GEMMQ_TM, TN: GEMMQ_TN };
+  function gemmqWgsl(f16math, pad, cfg) {
+    cfg = cfg || _gemmCfg;
+    const BM = cfg.BM, BN = cfg.BN, BK = GEMMQ_BK, TM = cfg.TM, TN = cfg.TN, BK4 = BK / 4;
     const NTH = (BM / TM) * (BN / TN), TILEA4 = BM * BK4, TILEB4 = BN * BK4, RN = BN / TN;
     const SW = BK4 + (pad ? 1 : 0);
     let s = `
@@ -742,12 +747,70 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return s;
   }
   function gemmQ(xBuf, wrec, yBuf, T, N, K, acc) {
-    const f16 = _useF16Math(), pad = _gemmPad;
-    const key = (f16 ? 'q3.gemmQ.f16' : 'q3.gemmQ') + (pad ? '.p' : '');
-    const pipe = E.getPipeline(key, gemmqWgsl(f16, pad));
+    const f16 = _useF16Math(), pad = _gemmPad, c = _gemmCfg;
+    const key = (f16 ? 'q3.gemmQ.f16' : 'q3.gemmQ') + (pad ? '.p' : '') + '.' + c.BM + '_' + c.BN + '_' + c.TM + '_' + c.TN;
+    const pipe = E.getPipeline(key, gemmqWgsl(f16, pad, c));
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
-    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
+    return E.dispatch(pipe, [xBuf, wrec.pack, wrec.scales, yBuf, d], [Math.ceil(N / c.BN), Math.ceil(T / c.BM), 1]);
   }
+  // ON-DEVICE GEMM AUTOTUNER. The f16 prefill GEMM tiling (64×64 block, 4×4 register) was
+  // tuned for Iris Xe gen-12lp; other GPUs (Adreno) want a different block/register shape and
+  // run the default at a fraction of peak. Sweep a handful of tile configs at the real
+  // bottleneck shape (down_proj), keep the FASTEST that also matches the reference bit-for-bit
+  // (a bad tiling can miscompute — never ship a fast-but-wrong kernel). Sets _gemmCfg. Only run
+  // when the f16 path is active (mobile); desktop uses DP4A for prefill so tuning gemmQ is moot.
+  let _gemmTuned = false;
+  const _GEMM_DEFAULT_CFG = { BM: GEMMQ_BM, BN: GEMMQ_BN, TM: GEMMQ_TM, TN: GEMMQ_TN };
+  async function autotuneGemmQ() {
+    if (_gemmTuned || globalThis.__noGemmTune) return; _gemmTuned = true;
+    const BK4 = GEMMQ_BK / 4;
+    let maxInv = 256, maxStore = 16384;
+    try { const L = E.device().limits; maxInv = L.maxComputeInvocationsPerWorkgroup | 0; maxStore = L.maxComputeWorkgroupStorageSize | 0; } catch (_) {}
+    // Candidate tile blocks. Filter by: threads/wg ≤ device max, workgroup storage fits, and the
+    // cooperative-load loops divide evenly (TILE%NTH==0) so every tile element is loaded.
+    const cands = [
+      { BM: 64, BN: 64, TM: 4, TN: 4 }, { BM: 32, BN: 64, TM: 4, TN: 4 }, { BM: 64, BN: 32, TM: 4, TN: 4 },
+      { BM: 64, BN: 64, TM: 8, TN: 8 }, { BM: 128, BN: 64, TM: 8, TN: 4 }, { BM: 64, BN: 128, TM: 4, TN: 8 },
+      { BM: 32, BN: 32, TM: 4, TN: 4 }, { BM: 128, BN: 128, TM: 8, TN: 8 }, { BM: 128, BN: 64, TM: 4, TN: 4 },
+    ];
+    const valid = cands.filter(c => {
+      const NTH = (c.BM / c.TM) * (c.BN / c.TN), store = (c.BM + c.BN) * BK4 * 8;   // vec4<f16> = 8B
+      return NTH <= maxInv && NTH <= 1024 && store <= maxStore && (c.BM * BK4) % NTH === 0 && (c.BN * BK4) % NTH === 0 && c.BM % c.TM === 0 && c.BN % c.TN === 0;
+    });
+    let bufs = [];
+    try {
+      const T = 256, N = 1024, K = 3072, words = K / 8, gpr = K / QGROUP;
+      const pk = new Uint32Array(N * words); for (let i = 0; i < pk.length; i++) pk[i] = (Math.imul(i, 2654435761) >>> 0);
+      const sc = new Uint16Array(N * gpr); for (let i = 0; i < sc.length; i++) sc[i] = 0x3000 + (i % 7);
+      const x = new Float32Array(T * K); for (let i = 0; i < x.length; i++) x[i] = Math.sin(i * 0.013) * 0.7;
+      const xb = f32buf(x);
+      const pb = E.createBuffer(pk.byteLength, ST(), 'tune.pk'); E.device().queue.writeBuffer(pb, 0, pk);
+      const sb = E.createBuffer(sc.byteLength, ST(), 'tune.sc'); E.device().queue.writeBuffer(sb, 0, sc);
+      const yb = E.createBuffer(T * N * 4, ST(), 'tune.y'); const wr = { pack: pb, scales: sb };
+      bufs = [xb, pb, sb, yb];
+      const savCfg = _gemmCfg, savForce = globalThis.__forceBatch; globalThis.__forceBatch = false;
+      // Reference from the known-good default block.
+      _gemmCfg = _GEMM_DEFAULT_CFG; await gemmQ(xb, wr, yb, T, N, K, false);
+      const ref = await E.readF32(yb, T * N); const refMax = Math.max(1e-9, ...Array.from(ref.slice(0, 4096)).map(Math.abs));
+      const time = async () => { uniformReset(); await gemmQ(xb, wr, yb, T, N, K, false); await E.device().queue.onSubmittedWorkDone(); const t0 = performance.now(); for (let i = 0; i < 5; i++) { uniformReset(); await gemmQ(xb, wr, yb, T, N, K, false); } await E.device().queue.onSubmittedWorkDone(); return (performance.now() - t0) / 5; };
+      let best = _GEMM_DEFAULT_CFG, bestMs = Infinity, results = [];
+      for (const c of valid) {
+        try {
+          _gemmCfg = c; await gemmQ(xb, wr, yb, T, N, K, false); const got = await E.readF32(yb, T * N);
+          let e = 0; for (let i = 0; i < 4096; i++) e = Math.max(e, Math.abs(got[i] - ref[i]));
+          if (e / refMax > 1e-2) { results.push(c.BM + 'x' + c.BN + '/' + c.TM + 'x' + c.TN + '=WRONG'); continue; }   // never ship a wrong kernel
+          const ms = await time(); results.push(c.BM + 'x' + c.BN + '/' + c.TM + 'x' + c.TN + '=' + ms.toFixed(1) + 'ms');
+          if (ms < bestMs) { bestMs = ms; best = c; }
+        } catch (e) { results.push(c.BM + 'x' + c.BN + '=ERR'); }
+      }
+      globalThis.__forceBatch = savForce; _gemmCfg = best;
+      const gflops = bestMs < Infinity ? Math.round(2 * T * N * K / (bestMs * 1e6)) : 0;
+      console.log('[qwen3] GEMM autotune → ' + best.BM + 'x' + best.BN + '/' + best.TM + 'x' + best.TN + ' (' + bestMs.toFixed(1) + 'ms, ' + gflops + ' GF/s). tried: ' + results.join('  '));
+      globalThis.__gemmTuneResult = { best, bestMs: +bestMs.toFixed(1), gflops, results };
+    } catch (e) { _gemmCfg = _GEMM_DEFAULT_CFG; console.warn('[qwen3] GEMM autotune failed — using default block:', (e && e.message) || e); }
+    finally { for (const b of bufs) { try { b.destroy(); } catch (_) {} } }
+  }
+
   // Verify the f16-dot GEMM vs the f32-dot reference at load; a GPU that computes f16
   // wrong falls back to f32. Defaults to caps.hasF16 if never called.
   let _f16Probed = false;
@@ -3320,6 +3383,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     if (MAX_SEQ > _attnMaxS) MAX_SEQ = _attnMaxS;   // never allocate beyond the decode-attn capacity
     try { await probeF16Gemm(); } catch (_) {}   // pick f16 vs f32 prefill-GEMM dot for this GPU
     try { await probeDp4(); } catch (_) {}        // verify DP4A forward path; fall back to gemmQ/gemvQ if the GPU miscompiles dot4I8Packed (all-"!" on Adreno)
+    if (globalThis.__noDp4Gemm) { try { await autotuneGemmQ(); } catch (_) {} }   // f16 prefill active (mobile) → tune the GEMM tile for THIS GPU
     await TOK.load(MODEL_ROOT);
     onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
 
@@ -3714,6 +3778,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     return {
       promptTokens: L, vocab: lg.length, tok0, argmax: amax,
       flags: { batchOk: (E.batchOk ? E.batchOk() : 'n/a'), noDp4Gemm: !!globalThis.__noDp4Gemm, noDp4: !!globalThis.__noDp4, f16Math: _f16Math, noStreamDecAttn: !!globalThis.__noStreamDecAttn, noKvQ8: !!globalThis.__noKvQ8 },
+      gemmTune: globalThis.__gemmTuneResult ? { best: globalThis.__gemmTuneResult.best, gflops: globalThis.__gemmTuneResult.gflops, results: globalThis.__gemmTuneResult.results } : null,
       caps: caps ? { adapter: caps.adapter, hasF16: caps.hasF16, hasSubgroups: caps.hasSubgroups, subgroupSize: caps.subgroupSize } : null,
       embedWeightNonzero: wnz + '/1024',   // -1 = couldn't read; 0 = WEIGHTS ARE ZERO (load failed)
       embedOut: { nonzero: embnz + '/' + H, min: +embmin.toFixed(3), max: +embmax.toFixed(3) },   // embed alone; 0 = embed/weights bad
@@ -4655,6 +4720,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       _uPool = []; _uIdx = 0;                 // uniform-pool buffers belong to the old device
       _f16Probed = false; _f16Math = null;    // re-probe against the rebuilt device
       _dp4Probed = false;                     // re-verify the DP4A forward path on the rebuilt device
+      _gemmTuned = false; _gemmCfg = _GEMM_DEFAULT_CFG;   // re-tune the GEMM tile on the rebuilt device
       try { await E.unload && E.unload(); } catch (_) {}
     }
   }
@@ -4989,7 +5055,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     rmsnorm, linearT, gemv, linear, embedGather, ropeQK, attention, swiglu, addInPlace,
     selfTestKernels, makeToolGrammar,
     TOK, loadModel, forward, generate, readLogits, _debugLogits, _stageProbe, _profileDecode, _profileDecodeTS, _profilePrefillTS, _lastGenStats: () => _lastGenStats, isLoaded: () => _loaded, variant: () => _variant,
-    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchPrefillGemm, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
+    runConversation, setToolRunner, DEFAULT_MODELS, DEFAULT_N_CTX, unload, _benchMatmul, _benchAttn, _benchAttnDec, _benchAttnDecQ8, _benchAttnPrefillQ8, _benchBigN, _benchGemv, _benchDP4, _benchGateUp, _benchGemmDP4, _benchPrefillGemm, autotuneGemmQ, _benchGemmTS, _benchGemmTex, _benchGemmTex2, _benchGemmTex3, _benchAttnF16, attentionF16, _attnF16Wgsl: (KT) => attnF16Wgsl(KT || 8),
     _setMatvec: (b) => { _USE_MATVEC = !!b; },
     _setPerf: (b) => { _PERF = !!b; }, _perf: () => _perfData,
     _dbg: {
