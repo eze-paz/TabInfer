@@ -123,15 +123,6 @@
       tools: config.tools,
       convId: config.convId,
     };
-    // Debug: window.SandpieLastRequest = the exact request the local model sees (system
-    // prompt + INPUT messages + tool defs). window.SandpieLastResponse = the assistant/tool
-    // messages it GENERATES this turn, growing live — the engine runs the whole agent loop
-    // inside the worker, so generated turns arrive as 'message_added' events (captured in the
-    // onmessage handler below), NOT in cfg. Both logged when localStorage 'sandpie-llm-debug'==='1'.
-    const respMsgs = [];
-    try {
-      window.SandpieLastRequest = cfg;
-      window.SandpieLastResponse = respMsgs;
       if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg);
     } catch (_) {}
     const p = new Promise((resolve, reject) => {
