@@ -116,6 +116,7 @@
     const w = worker();
     const id = ++_seq;
     const signal = config && config.signal;
+    const respMsgs = [];
     try {
     const cfg = {                       // strip the non-serializable AbortSignal
       provider: config.provider,
