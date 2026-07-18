@@ -116,12 +116,14 @@
     const w = worker();
     const id = ++_seq;
     const signal = config && config.signal;
+    try {
     const cfg = {                       // strip the non-serializable AbortSignal
       provider: config.provider,
       messages: config.messages,
       systemPrompt: config.systemPrompt,
       tools: config.tools,
       convId: config.convId,
+      logprobs: config.logprobs,        // confidence display mode (opt-in)
     };
       if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg);
     } catch (_) {}

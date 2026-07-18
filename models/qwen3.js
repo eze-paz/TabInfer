@@ -3701,6 +3701,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     const _t2 = _PERF ? performance.now() : 0;
     const tok = await readU32At(_tokHist, posBase + T);   // the token just predicted
     if (_PERF) _perfData = { encode_ms: +(_t1 - _t0).toFixed(2), gpu_drain_ms: +(_t2 - _t1).toFixed(2), map_ms: +(performance.now() - _t2).toFixed(2) };
+    if (opts && opts.logprobs) {
+      const _lp = await readLogits();                 // full Float32Array[CONFIG.vocab]
+      return { tok, logprob: logProbOfToken(_lp, tok), topLogprobs: topKLogits(_lp, tok, 5) };
+    }
     return tok;
   }
 
@@ -3729,6 +3733,38 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   }
   // Debug: full logits readback (call right after a forward, before the next one).
   async function readLogits() { return E.readF32(_scr.logits, CONFIG.vocab); }
+
+  // Log-prob of the chosen token against the vocab distribution currently in
+  // _scr.logits. Only used when opts.logprobs is set (confidence display mode);
+  // reading the full vocab back is costly, so it is opt-in and the decode path
+  // goes serial while it is on. Never Math.max(...arr) over the vocab (150k args
+  // throws RangeError) -- use an explicit loop. Returns log(softmax(logits)[tok]).
+  function logProbOfToken(logits, tok) {
+    let max = -Infinity;
+    for (let i = 0; i < logits.length; i++) { const v = logits[i]; if (v > max) max = v; }
+    let sum = 0;
+    for (let i = 0; i < logits.length; i++) sum += Math.exp(logits[i] - max);
+    return logits[tok] - (max + Math.log(sum));
+  }
+  // Top-K tokens by logprob (incl. the chosen one). K small (<=8). Used by the
+  // confidence UI to show "other possible words" for a clicked token.
+  function topKLogits(logits, chosenTok, K) {
+    const max = -Infinity;
+    for (let i = 0; i < logits.length; i++) { const v = logits[i]; if (v > max) max = v; }
+    let sum = 0;
+    for (let i = 0; i < logits.length; i++) sum += Math.exp(logits[i] - max);
+    const lse = max + Math.log(sum);
+    const best = [];   // [logit, idx], kept sorted ascending by logit
+    for (let i = 0; i < logits.length; i++) {
+      const v = logits[i];
+      if (best.length < K) { best.push([v, i]); if (best.length === K) best.sort((a, b) => a[0] - b[0]); }
+      else if (v > best[0][0]) { best[0] = [v, i]; best.sort((a, b) => a[0] - b[0]); }
+    }
+    const out = best.map(([v, i]) => ({ tok: i, logprob: v - lse }));
+    if (!out.some(o => o.tok === chosenTok)) out.push({ tok: chosenTok, logprob: logits[chosenTok] - lse });
+    out.sort((a, b) => b.logprob - a.logprob);
+    return out.slice(0, K).map(o => ({ t: TOK.decode([o.tok]), lp: o.logprob }));
+  }
 
   // DIAGNOSTIC: prefill a short prompt and report logit STATISTICS (not just the token). Tells us
   // whether the assembled forward produces NaN / Inf / all-equal (degenerate → "!") vs a real
@@ -3946,6 +3982,31 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // is still its own bounded submit (no single giant submit → no TDR). On stop/abort
   // we stop emitting immediately and discard the ≤PIPE_DEPTH-1 already-queued batches
   // (bounded wasted compute + bounded KV overrun, both harmless).
+  // Serial decode used ONLY when logprobs is requested: each token waits for its
+  // own logits readback (the pipelined batch reuses the single _scr.logits buffer,
+  // so it cannot keep per-token distributions). Emits a 'token' event per generated
+  // token so the UI can render clickable, confidence-tagged spans. pushTok still
+  // drives outIds + parser push; emitTokenEv carries the visual event.
+  async function _decodeLogprobs(pos, maxTokens, pushTok, signal, count, temp, emitTokenEv) {
+    let p = pos;
+    let acc = '', inThink = false;
+    while (p - pos < maxTokens) {
+      if (signal && signal.aborted) break;
+      const r = await forward(null, p, { chain: true, logprobs: true, temp });
+      if (!pushTok(r.tok)) break;
+      const text = TOK.decode([r.tok]);
+      acc += text;
+      const open = (acc.match(/<think>/g) || []).length;
+      const close = (acc.match(/<\/think>/g) || []).length;
+      inThink = open > close;
+      const _alts = (r.topLogprobs || []).filter(a => a.t !== text).slice(0, 5)
+        .map(a => ({ text: a.t, logprob: +a.lp.toFixed(4) }));
+      if (emitTokenEv) emitTokenEv({ type: 'token', token: { text, logprob: +r.logprob.toFixed(4), alts: _alts }, region: inThink ? 'reasoning' : 'content' });
+      p++;
+      if (count() >= maxTokens) break;
+    }
+  }
+
   async function decodeLoop(pos, maxTokens, emitTok, signal, count, temp) {
     let submitted = 0;
     const submitBatch = async () => {
@@ -4727,7 +4788,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
 
   // Stream from pre-encoded ids (same prefill+decode as generate(), but the
   // caller supplies the full chat token sequence and gets clean UTF-8 deltas).
-  async function _streamIds(ids, { maxTokens = 512, onToken, signal, grammar, temperature } = {}) {
+  async function _streamIds(ids, { maxTokens = 512, onToken, signal, grammar, temperature, logprobs, tokenEv } = {}) {
     const temp = temperature > 0 ? +temperature : 0;
     await loadModel({ variant: _variant });
     const L = ids.length;
@@ -4806,8 +4867,13 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       prevText = txt; return true;
     };
     if (!pushTok(tok0)) return prevText;
-    if (grammar) await decodeWithGrammar(L, maxTokens, pushTok, signal, () => outIds.length, grammar, () => prevText, temp);
-    else await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length, temp);
+    if (logprobs) {
+      await _decodeLogprobs(pos, maxTokens, pushTok, signal, () => outIds.length, temp, tokenEv);
+    } else if (grammar) {
+      await decodeWithGrammar(L, maxTokens, pushTok, signal, () => outIds.length, grammar, () => prevText, temp);
+    } else {
+      await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length, temp);
+    }
     const _te = performance.now();
     const _dms = _te - _tp1, _n = outIds.length;
     const _split = _pf ? (' | prefill split: encode=' + _pf.encode_ms + 'ms gpu=' + _pf.gpu_drain_ms + 'ms map=' + _pf.map_ms + 'ms') : '';
@@ -4974,9 +5040,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         emit({ type: 'round_start' });
         let firstTok = false;
         const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
+        const _wantLP = !!config.logprobs;
         const parser = makeRoundParser(
-          (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },   // <think> → Thinking box
-          (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },     // answer → streamed content
+          _wantLP ? (() => {}) : (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },   // <think> → Thinking box
+          _wantLP ? (() => {}) : (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },     // answer → streamed content
         );
         const ids = TOK.encodeChat(work);
         if (round === 0) _sysCacheClaim(ids, sys, variant, emit);   // skip re-prefilling the system block if resident
@@ -4984,7 +5051,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         // token-masked to be a VALID call to a REGISTERED tool — malformed JSON / made-up
         // tool names can't be generated at all. Built once per conversation, reused per round.
         if (toolList.length && _grammar === undefined) _grammar = makeToolGrammar(toolList.map(t => t.function && t.function.name).filter(Boolean));
-        await _streamIds(ids, { maxTokens, signal, grammar: _grammar || null, onToken: (p) => parser.push(p) });
+        await _streamIds(ids, { maxTokens, signal, grammar: (_wantLP ? null : (_grammar || null)), onToken: (p) => parser.push(p), logprobs: _wantLP, tokenEv: _wantLP ? (ev) => emit(ev) : null });
         if (round === 0) _sysCacheRecord(sys, variant);             // _kv[0..P_sys) now holds this system block
         parser.flush();
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
