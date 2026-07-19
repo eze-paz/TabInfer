@@ -117,7 +117,6 @@
     const id = ++_seq;
     const signal = config && config.signal;
     const respMsgs = [];
-    try {
     const cfg = {                       // strip the non-serializable AbortSignal
       provider: config.provider,
       messages: config.messages,
@@ -126,8 +125,7 @@
       convId: config.convId,
       logprobs: config.logprobs,        // confidence display mode (opt-in)
     };
-      if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg);
-    } catch (_) {}
+    try { if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg); } catch (_) {}
     const p = new Promise((resolve, reject) => {
       _runs.set(id, { emit: emit || (function () {}), resolve, reject, resp: respMsgs });
       if (signal) {
