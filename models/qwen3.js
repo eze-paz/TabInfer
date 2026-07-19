@@ -3749,7 +3749,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Top-K tokens by logprob (incl. the chosen one). K small (<=8). Used by the
   // confidence UI to show "other possible words" for a clicked token.
   function topKLogits(logits, chosenTok, K) {
-    const max = -Infinity;
+    let max = -Infinity;
     for (let i = 0; i < logits.length; i++) { const v = logits[i]; if (v > max) max = v; }
     let sum = 0;
     for (let i = 0; i < logits.length; i++) sum += Math.exp(logits[i] - max);
