@@ -5040,7 +5040,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         emit({ type: 'round_start' });
         let firstTok = false;
         const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
-        const _wantLP = !!config.logprobs;
+        const _wantLP = !!(provider && provider.logprobs);
         const parser = makeRoundParser(
           _wantLP ? (() => {}) : (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },   // <think> → Thinking box
           _wantLP ? (() => {}) : (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },     // answer → streamed content
