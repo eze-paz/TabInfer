@@ -4985,7 +4985,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     _sysAnchor = (sysIds && sysIds.length >= 16 && _kv) ? { variant, ids: sysIds } : null;
   }
 
-  async function runConversation({ provider, messages, systemPrompt, tools, convId, signal }, emit) {
+  async function runConversation({ provider, messages, systemPrompt, tools, convId, signal, logprobs }, emit) {
     // Generation budget per round. NO artificial thinking cap by default — a reasoning <think>
     // block can be long, and a fixed cap (512, then 2048) truncated it mid-thought. EOS (im_end)
     // stops finished turns; the only hard bound is the context window (the decode loop caps at
@@ -5040,7 +5040,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         emit({ type: 'round_start' });
         let firstTok = false;
         const clearInfo = () => { if (!firstTok) { firstTok = true; emit({ type: 'info', message: null }); } };
-        const _wantLP = !!(provider && provider.logprobs);
+        const _wantLP = !!logprobs;
         const parser = makeRoundParser(
           _wantLP ? (() => {}) : (rz) => { clearInfo(); emit({ type: 'delta', delta: { reasoning: rz } }); },   // <think> → Thinking box
           _wantLP ? (() => {}) : (ct) => { clearInfo(); emit({ type: 'delta', delta: { content: ct } }); },     // answer → streamed content
