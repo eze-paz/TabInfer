@@ -399,8 +399,8 @@ ${wgReduceWGSL(GEMVQ_NR, GEMV_WG)}
     // queued command buffers still reference them — destroying mid-flight triggers
     // "[Buffer xs] used in submit while destroyed" and reads garbage. Defer to unload().
     // (Reallocation happens at most once or twice ever — K only grows to intermediate.)
-    if (_dp4) { _dp4dead.push(_dp4.xq, _dp4.xs); }
-    _dp4 = { cap: K, xq: E.createBuffer((K / 4) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xq'), xs: E.createBuffer((K / QGROUP) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xs') };
+    if (_dp4) { _dp4dead.push(_dp4.xq, _dp4.xs, _dp4.xsum); }
+    _dp4 = { cap: K, xq: E.createBuffer((K / 4) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xq'), xs: E.createBuffer((K / QGROUP) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xs'), xsum: E.createBuffer((K / 16) * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'xsum') };
   }
   // Quantize the activation vector x[K] → _dp4.xq (packed int8) + _dp4.xs (group scales).
   // Split out of gemvDP4A so several projections that share the SAME activation (q/k/v all
@@ -411,6 +411,7 @@ ${wgReduceWGSL(GEMVQ_NR, GEMV_WG)}
     const qd = uniform(new Uint32Array([K, 0, 0, 0]));
     const groups = K / QGROUP, qgx = Math.min(groups, 65535), qgy = Math.ceil(groups / qgx);
     E.dispatch(qp, [xBuf, _dp4.xq, _dp4.xs, qd], [qgx, qgy, 1]);
+    if (_ternAny) ternXsum(K);   // ternary Σx term rides every decode activation quantize
   }
   // GEMV against the CURRENTLY-quantized activation in _dp4 (caller ran quantQ8 first).
   function gemvDP4_only(packBuf, scBuf, yBuf, N, K, acc) {
@@ -422,6 +423,96 @@ ${wgReduceWGSL(GEMVQ_NR, GEMV_WG)}
   function gemvDP4A(xBuf, packBuf, scBuf, yBuf, N, K, acc) {
     quantQ8(xBuf, K);
     return gemvDP4_only(packBuf, scBuf, yBuf, N, K, acc);
+  }
+
+  // ---- TERNARY weight path (Bonsai / BitNet-style {-1,0,+1} weights, 2.125 bpw) ----
+  // Detected losslessly at quantize time (every value in a scale group is exactly
+  // {-s, 0, +s}); stored as 16 2-bit codes/u32 with a lane swizzle (weight k=16w+4s+b
+  // lives at bits 8b+2s, so `(word >> 2s) & 0x03030303` drops 4 consecutive-k codes
+  // straight into dot4-ready byte lanes) + f16 scales in the SAME per-QGROUP layout as
+  // int4 (each 64-group scale duplicated ×2) so all scale indexing stays identical.
+  // Decode inner loop uses the ternary identity (c-1)·x = c·x − Σx: dot the raw {0,1,2}
+  // codes and subtract a precomputed per-16-word activation sum — zero sign-decode ALU.
+  // Only active when DP4A is verified (__noDp4 falls back to plain int4, which also
+  // represents ternary exactly). Measured (Iris Xe, GPU-ts): lm_head GEMV 2.0× vs int4.
+  let _ternAny = false;
+  const XSUM16_WGSL = `
+struct P { W16:u32, _a:u32, _b:u32, _c:u32 };   // W16 = K/16 output words
+@group(0) @binding(0) var<storage, read>       xq   : array<u32>;   // [K/4] packed int8
+@group(0) @binding(1) var<storage, read_write> xsum : array<i32>;   // [K/16]
+@group(0) @binding(2) var<uniform>             p    : P;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
+  let w = gid.x; if (w >= p.W16) { return; }
+  var t = 0i;
+  for (var j = 0u; j < 4u; j++) {
+    let v = vec4<i32>(unpack4xI8(xq[4u*w + j]));
+    t += v.x + v.y + v.z + v.w;
+  }
+  xsum[w] = t;
+}`;
+  // Per-16 activation sums for the ternary Σx term; reads the CURRENT _dp4.xq.
+  // Dispatched after every decode activation quantize when a ternary model is loaded.
+  function ternXsum(K) {
+    const pipe = E.getPipeline('q3.xsum16', XSUM16_WGSL);
+    const p = uniform(new Uint32Array([K / 16, 0, 0, 0]));
+    E.dispatch(pipe, [_dp4.xq, _dp4.xsum, p], [Math.ceil(K / 16 / 64), 1, 1]);
+  }
+  function gemvTernWgsl(NR) { return `
+enable f16;
+struct D { N:u32, K:u32, acc:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       xq   : array<u32>;   // [K/4] packed int8 activations
+@group(0) @binding(1) var<storage, read>       W    : array<u32>;   // [N*K/16] ternary codes
+@group(0) @binding(2) var<storage, read>       sc   : array<f16>;   // [N*K/QGROUP] weight scales (dup per-32)
+@group(0) @binding(3) var<storage, read>       xs   : array<f32>;   // [K/QGROUP] activation scales
+@group(0) @binding(4) var<storage, read>       xsum : array<i32>;   // [K/16] Σ int8 x per code-word
+@group(0) @binding(5) var<storage, read_write> y    : array<f32>;   // [N]
+@group(0) @binding(6) var<uniform>             d    : D;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
+  if (rowBase >= d.N) { return; }
+  let words = d.K / 16u; let gpr = d.K / ${QGROUP}u;
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = xq[4u*w]; let xb = xq[4u*w+1u]; let xc = xq[4u*w+2u]; let xd = xq[4u*w+3u];
+    let grp = (w*16u)/${QGROUP}u;
+    let xsc = xs[grp]; let xsm = xsum[w];
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
+      let row = rowBase + r;
+      let p = W[row*words + w];
+      let ia = dot4I8Packed(p & 0x03030303u, xa)
+             + dot4I8Packed((p >> 2u) & 0x03030303u, xb)
+             + dot4I8Packed((p >> 4u) & 0x03030303u, xc)
+             + dot4I8Packed((p >> 6u) & 0x03030303u, xd)
+             - xsm;
+      acc[r] = acc[r] + f32(sc[row*gpr + grp]) * xsc * f32(ia);
+    }
+    w = w + ${GEMV_WG}u;
+  }
+${wgReduceWGSL(NR, GEMV_WG)}
+  if (lid.x < ${NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.N) { y[row] = select(0.0, y[row], d.acc != 0u) + part[lid.x*${GEMV_WG}u + 0u]; }
+  }
+}`; }
+  // Ternary GEMV against the CURRENTLY-quantized activation in _dp4 (+xsum).
+  function gemvTern_only(wrec, yBuf, N, K, acc) {
+    const NR = N >= 16384 ? 16 : 8;   // lm_head prefers wider row blocks (measured NR16 best at 151936)
+    const pipe = E.getPipeline('q3.gemvTern.' + NR, gemvTernWgsl(NR));
+    const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
+    const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [_dp4.xq, wrec.pack, wrec.scales, _dp4.xs, _dp4.xsum, yBuf, d], [gx, gy, 1]);
+  }
+  // Kind router for the fused decode call sites (q/k/v etc.) that share one quantized activation.
+  function projGemv(wrec, yBuf, N, K, acc) {
+    if (wrec.tern) return gemvTern_only(wrec, yBuf, N, K, acc);
+    return gemvDP4_only(wrec.pack, wrec.scales, yBuf, N, K, acc);
   }
 
   // FUSED rmsnorm + int8 quantize (decode T=1): emit the per-group int8 activation that the
@@ -476,7 +567,9 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>) {
     const u = new Uint32Array(4); const du = new DataView(u.buffer);
     du.setUint32(0, H, true); du.setFloat32(4, eps, true);
     const p = uniform(u);
-    return E.dispatch(pipe, [xBuf, wBuf, _dp4.xq, _dp4.xs, p], [1, 1, 1]);
+    const r = E.dispatch(pipe, [xBuf, wBuf, _dp4.xq, _dp4.xs, p], [1, 1, 1]);
+    if (_ternAny) ternXsum(H);   // ternary Σx term rides the fused norm+quantize too
+    return r;
   }
 
   // ---- FUSED int4 gate+up+SwiGLU (T=1): swi[i] = silu(gate·x)*(up·x) ----
@@ -597,7 +690,66 @@ ${wgReduce2WGSL(NR, GEMV_WG)}
   }
   // gate+up+SwiGLU against the CURRENTLY-quantized activation in _dp4 (caller ran quantQ8 or
   // rmsnormQ first) — lets the MLP norm feed it pre-quantized, dropping the quantize dispatch.
+  // Ternary variant of the fused gate+up+SwiGLU: same structure, ternary code words
+  // (H/16 per row) + the (c-1)·x = c·x − Σx identity (xsum read once, shared by gate AND up).
+  function gateupTernWgsl(NR) { return `
+enable f16;
+struct D { I:u32, H:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       xq   : array<u32>;   // [H/4] packed int8 activations
+@group(0) @binding(1) var<storage, read>       gW   : array<u32>;   // [I*H/16] ternary codes
+@group(0) @binding(2) var<storage, read>       gS   : array<f16>;
+@group(0) @binding(3) var<storage, read>       uW   : array<u32>;
+@group(0) @binding(4) var<storage, read>       uS   : array<f16>;
+@group(0) @binding(5) var<storage, read>       xs   : array<f32>;   // [H/QGROUP] activation scales
+@group(0) @binding(6) var<storage, read>       xsum : array<i32>;   // [H/16]
+@group(0) @binding(7) var<storage, read_write> swi  : array<f32>;   // [I]
+@group(0) @binding(8) var<uniform>             d    : D;
+var<workgroup> pg : array<f32, ${NR * GEMV_WG}>;
+var<workgroup> pu : array<f32, ${NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
+  if (rowBase >= d.I) { return; }
+  let words = d.H / 16u; let gpr = d.H / ${QGROUP}u;
+  var ga : array<f32, ${NR}>; var ua : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { ga[r]=0.0; ua[r]=0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = xq[4u*w]; let xb = xq[4u*w+1u]; let xc = xq[4u*w+2u]; let xd = xq[4u*w+3u];
+    let grp = (w*16u)/${QGROUP}u; let xsc = xs[grp]; let xsm = xsum[w];
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
+      let row = rowBase + r; let wi = row*words + w; let si = row*gpr + grp;
+      let gp = gW[wi];
+      let gi = dot4I8Packed(gp & 0x03030303u, xa) + dot4I8Packed((gp >> 2u) & 0x03030303u, xb)
+             + dot4I8Packed((gp >> 4u) & 0x03030303u, xc) + dot4I8Packed((gp >> 6u) & 0x03030303u, xd) - xsm;
+      ga[r] = ga[r] + f32(gS[si])*xsc*f32(gi);
+      let up = uW[wi];
+      let ui = dot4I8Packed(up & 0x03030303u, xa) + dot4I8Packed((up >> 2u) & 0x03030303u, xb)
+             + dot4I8Packed((up >> 4u) & 0x03030303u, xc) + dot4I8Packed((up >> 6u) & 0x03030303u, xd) - xsm;
+      ua[r] = ua[r] + f32(uS[si])*xsc*f32(ui);
+    }
+    w = w + ${GEMV_WG}u;
+  }
+${wgReduce2WGSL(NR, GEMV_WG)}
+  if (lid.x < ${NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.I) {
+      let g = pg[lid.x*${GEMV_WG}u+0u]; let u = pu[lid.x*${GEMV_WG}u+0u];
+      let silu = g / (1.0 + exp(-g));
+      swi[row] = silu * u;
+    }
+  }
+}`; }
   function gateUpSiluDP4_only(gRec, uRec, swiBuf, I, H, NR) {
+    if (gRec.tern) {
+      NR = NR || 2;
+      const pipe = E.getPipeline('q3.gateupTern.' + NR, gateupTernWgsl(NR));
+      const d = uniform(new Uint32Array([I, H, 0, 0]));
+      const nWG = Math.ceil(I / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+      return E.dispatch(pipe, [_dp4.xq, gRec.pack, gRec.scales, uRec.pack, uRec.scales, _dp4.xs, _dp4.xsum, swiBuf, d], [gx, gy, 1]);
+    }
     NR = NR || 2;   // measured optimum (min-of-5 GPU-ts at I=3072,H=1024): NR2 91.8µs / NR4 98.3 / NR8 114.7 / NR16 150.7 — 93% of the bandwidth floor
     const pipe = E.getPipeline(NR === GUSQ_NR ? 'q3.gateupDP4' : 'q3.gateupDP4.' + NR, gateupDP4Wgsl(NR));
     const d = uniform(new Uint32Array([I, H, 0, 0]));
@@ -1051,7 +1203,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   // scalar accumulators (i0..15 int32 per tile, f0..15 f32 across tiles). int8 inner via
   // dot4I8Packed — gen-12lp's NATIVE matrix path is DP4A, so the headroom is real if the
   // accumulators stay in registers. A/B vs f16 gemmQ via _benchGemmDP4.
-  function gemmdp4Wgsl() {
+  function gemmdp4Wgsl(tern) {
     const BM = GEMMQ_BM, BN = GEMMQ_BN, BK = QGROUP, TM = GEMMQ_TM, TN = GEMMQ_TN, BK4 = BK / 4;
     const NTH = (BM / TM) * (BN / TN), RN = BN / TN, TILEA = BM * BK4, TILEB = BN * BK4;
     let s = `
@@ -1069,7 +1221,7 @@ var<workgroup> Bs : array<u32, ${TILEB}>;   // [BN][BK4] packed int8 weights (in
 fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>) {
   let lx = lid.x; let tN = lx % ${RN}u; let tM = lx / ${RN}u;
   let mBase = wg.y*${BM}u; let nBase = wg.x*${BN}u;
-  let WPR = d.K/8u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u; let nTiles = d.K/${BK}u;
+  let WPR = d.K/${tern ? 16 : 8}u; let gpr = d.K/${QGROUP}u; let K4 = d.K/4u; let nTiles = d.K/${BK}u;
 `;
     for (let r = 0; r < TM * TN; r++) s += `  var f${r}:f32=0.0;\n`;
     s += `  for (var kt:u32=0u; kt<nTiles; kt=kt+1u) {
@@ -1082,13 +1234,16 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       let idx = lx + r*${NTH}u; let ln = idx/${BK4}u; let kk4 = idx%${BK4}u; let gn = nBase+ln;
       var packed = 0u;
       if (gn < d.N) {
-        let kk = k0 + kk4*4u; let word = W[gn*WPR + (kk>>3u)]; let b = (kk & 7u);
+${tern ? `        let kk = k0 + kk4*4u; let word = W[gn*WPR + (kk>>4u)]; let sub = (kk>>2u) & 3u;
+        let v = (word >> (2u*sub)) & 0x03030303u;
+        packed = ((v | 0x80808080u) - 0x01010101u) ^ 0x80808080u;   // per-byte c-1 -> i8 {-1,0,+1}
+` : `        let kk = k0 + kk4*4u; let word = W[gn*WPR + (kk>>3u)]; let b = (kk & 7u);
         let n0 = i32((word >> (4u*(b+0u))) & 0xFu) - 8;
         let n1 = i32((word >> (4u*(b+1u))) & 0xFu) - 8;
         let n2 = i32((word >> (4u*(b+2u))) & 0xFu) - 8;
         let n3 = i32((word >> (4u*(b+3u))) & 0xFu) - 8;
         packed = pack4xI8(vec4<i32>(n0,n1,n2,n3));
-      }
+`}      }
       Bs[idx] = packed;
     }
     workgroupBarrier();
@@ -1126,7 +1281,20 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const qd = uniform(new Uint32Array([K, gpr, ng, 0]));
     const qgx = Math.min(ng, 65535), qgy = Math.ceil(ng / qgx);
     E.dispatch(qp, [xBuf, _dp4g.xq, _dp4g.xs, qd], [qgx, qgy, 1]);
-    const pipe = E.getPipeline('q3.gemmDP4v2', gemmdp4Wgsl());
+    const pipe = E.getPipeline('q3.gemmDP4v2', gemmdp4Wgsl(false));
+    const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
+    return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
+  }
+  // Ternary prefill GEMM: identical tiling/codegen to gemmDP4v2 — only the Bs weight-tile
+  // load decodes 2-bit ternary codes instead of int4 nibbles. Scales share the int4 layout.
+  function gemmTern(xBuf, wrec, yBuf, T, N, K, acc) {
+    ensureDp4G(T, K);
+    const gpr = K / QGROUP, ng = T * gpr;
+    const qp = E.getPipeline('q3.quantq8t', QUANTQ8T_WGSL);
+    const qd = uniform(new Uint32Array([K, gpr, ng, 0]));
+    const qgx = Math.min(ng, 65535), qgy = Math.ceil(ng / qgx);
+    E.dispatch(qp, [xBuf, _dp4g.xq, _dp4g.xs, qd], [qgx, qgy, 1]);
+    const pipe = E.getPipeline('q3.gemmTernv2', gemmdp4Wgsl(true));
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
     return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
@@ -1303,6 +1471,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     // repack ALU makes it 0.81× there — route big N to the f32-dequant gemvQ, and at NR=4
     // rows/WG (2494µs/35.1GB/s vs NR8 2592/NR16 3002 at the lm_head shape — more WGs win
     // when N is huge; all GPU timestamps min-of-reps on gen-12lp, warm).
+    if (wrec.tern) {
+      // Ternary kind: gemvTern for ALL N at T=1 (wins biggest exactly at huge N — lm_head
+      // 2.0× vs int4, ~29GB/s eff on gen-12lp); ternary tiled GEMM for prefill.
+      if (T === 1) { quantQ8(xBuf, K); return gemvTern_only(wrec, yBuf, N, K, acc); }
+      return gemmTern(xBuf, wrec, yBuf, T, N, K, acc);
+    }
     if (T === 1) {
       if (!globalThis.__noDp4 && N < 16384) return gemvDP4A(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc);
       return gemvQ(xBuf, wrec.pack, wrec.scales, yBuf, N, K, acc, N >= 16384 ? 4 : undefined);
@@ -3130,6 +3304,43 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     }
     return { pack, scales };
   }
+  // TERNARY detection + pack (Bonsai/BitNet-style weights). A tensor is ternary iff, in
+  // every QGROUP-scale group, all values are exactly {-s, 0, +s} for the group absmax s
+  // (bit-exact bf16 compare — quantization-aware-trained ternary survives f16→bf16 rounding
+  // because every nonzero in a group shares the same magnitude bits). Returns
+  // { pack: Uint32Array(N*K/16 codes), scales: Uint16Array(N*K/QGROUP f16) } or null.
+  // Codes are w+1 in {0,1,2}; swizzle: weight k=16w+4s+b at bits (8b+2s) of word w —
+  // shaped so (word >> 2s) & 0x03030303 yields 4 consecutive-k codes in dot4 byte lanes.
+  // Scales reuse the EXACT int4 per-QGROUP layout so all downstream scale indexing is shared.
+  function quantizeTernaryBf16(u16, N, K) {
+    if (K % 64 !== 0) return null;
+    const G = QGROUP, wpr = K / 16, gpr = K / G;
+    // cheap pre-check on the first few rows before committing to the full pass
+    const preRows = Math.min(N, 4);
+    for (let n = 0; n < preRows; n++) {
+      for (let g = 0; g < gpr; g++) {
+        let mx = 0;
+        for (let j = 0; j < G; j++) { const m = u16[n*K + g*G + j] & 0x7FFF; if (m > mx) mx = m; }
+        for (let j = 0; j < G; j++) { const m = u16[n*K + g*G + j] & 0x7FFF; if (m !== 0 && m !== mx) return null; }
+      }
+    }
+    const pack = new Uint32Array(N * wpr), scaleBf16 = new Uint16Array(N * gpr);
+    for (let n = 0; n < N; n++) {
+      const rU = n * K, rP = n * wpr, rS = n * gpr;
+      for (let g = 0; g < gpr; g++) {
+        let mx = 0;
+        for (let j = 0; j < G; j++) { const m = u16[rU + g*G + j] & 0x7FFF; if (m > mx) mx = m; }
+        scaleBf16[rS + g] = mx;
+        for (let j = 0; j < G; j++) {
+          const k = g*G + j, bits = u16[rU + k], m = bits & 0x7FFF;
+          if (m !== 0 && m !== mx) return null;                      // not ternary after all → int4 fallback
+          const c = m === 0 ? 1 : ((bits & 0x8000) ? 0 : 2);         // {-1,0,+1} + 1
+          pack[rP + (k >> 4)] |= c << (((k & 3) << 3) + ((k >> 2) & 3) * 2);   // bits 8b+2s, b=k&3, s=(k>>2)&3
+        }
+      }
+    }
+    return { pack, scales: bf16ToF16bits(scaleBf16) };
+  }
   const isQuantWeight = (name) => name.includes('_proj.weight') || name === 'lm_head.weight';
 
   // Single-file download (no raw-safetensors caching — the quantized-weights cache
@@ -3168,6 +3379,21 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     if (info.dtype !== 'BF16' && isQuantWeight(name)) throw new Error('quant path expects BF16 for ' + name);
     if (isQuantWeight(name)) {
       const N = info.shape[0], K = info.shape[1];
+      // Ternary fast path: lossless 2.125-bpw storage + dedicated kernels. Only when the
+      // DP4A path is live (__noDp4 GPUs fall back to int4, which is also ternary-exact).
+      if (!globalThis.__noDp4 && !globalThis.__noTernary) {
+        const tern = quantizeTernaryBf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
+        if (tern) {
+          const packBuf = E.createBuffer(tern.pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.tpack');
+          const scBuf = E.createBuffer(tern.scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.tsc');
+          E.device().queue.writeBuffer(packBuf, 0, tern.pack);
+          E.device().queue.writeBuffer(scBuf, 0, tern.scales);
+          _weights[name] = { pack: packBuf, scales: scBuf, N, K, tern: true, shape: info.shape, numel };
+          _ternAny = true;
+          if (sink) { await sink.add(name, 'pack', new Uint8Array(tern.pack.buffer, 0, tern.pack.byteLength), { kind: 'tern', shape: info.shape, numel, N, K }); await sink.add(name, 'scales', new Uint8Array(tern.scales.buffer, 0, tern.scales.byteLength), { kind: 'tern', shape: info.shape, numel, N, K }); }
+          return;
+        }
+      }
       const { pack, scales } = quantizeInt4Bf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
       const packBuf = E.createBuffer(pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.pack');
       const scBuf = E.createBuffer(scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.sc');
@@ -3327,9 +3553,12 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       const sg = m.segs[i];
       const b = E.createBuffer(_ceil16(sg.len), U.STORAGE | U.COPY_DST | U.COPY_SRC, sg.name + '.' + sg.role);
       segBufs[i] = b;
-      if (sg.kind === 'int4') {
-        let rec = _weights[sg.name] || (_weights[sg.name] = { int4: true, N: sg.N, K: sg.K, shape: sg.shape, numel: sg.numel });
+      if (sg.kind === 'int4' || sg.kind === 'tern') {
+        let rec = _weights[sg.name] || (_weights[sg.name] = sg.kind === 'tern'
+          ? { tern: true, N: sg.N, K: sg.K, shape: sg.shape, numel: sg.numel }
+          : { int4: true, N: sg.N, K: sg.K, shape: sg.shape, numel: sg.numel });
         if (sg.role === 'pack') rec.pack = b; else rec.scales = b;
+        if (sg.kind === 'tern') _ternAny = true;
       } else {
         _weights[sg.name] = { buf: b, shape: sg.shape, numel: sg.numel };
       }
@@ -3367,6 +3596,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       return;
     }
     if (_loaded) unload();
+    _ternAny = false;   // re-detected per model (weights parse or quant-cache manifest)
     if (!(variant in CONFIGS)) throw new Error('unknown Qwen3 variant: ' + variant);
     Object.assign(CONFIG, CONFIGS[variant]);
     MODEL_ROOT = MODEL_ROOTS[variant];
@@ -3608,8 +3838,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         // identity: s.x is simply not modified by this layer.
         const kW = Wq(p + 'self_attn.k_proj.weight'), vW = Wq(p + 'self_attn.v_proj.weight');
         rmsnormQ(s.x, W(p + 'input_layernorm.weight'), H, C.rmsEps);
-        gemvDP4_only(kW.pack, kW.scales, s.k, nKv * hd, H);
-        gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
+        projGemv(kW, s.k, nKv * hd, H);
+        projGemv(vW, s.v, nKv * hd, H);
         attnPrepKvOnly(s.k, s.v, W(p + 'self_attn.k_norm.weight'), _kv[l], nHq, nKv, hd, posBase, C.ropeTheta, C.rmsEps);
         continue;
       }
@@ -3619,9 +3849,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       if (T === 1) {
         const qW = Wq(p + 'self_attn.q_proj.weight'), kW = Wq(p + 'self_attn.k_proj.weight'), vW = Wq(p + 'self_attn.v_proj.weight');
         rmsnormQ(s.x, W(p + 'input_layernorm.weight'), H, C.rmsEps);
-        gemvDP4_only(qW.pack, qW.scales, s.q, nHq * hd, H);
-        gemvDP4_only(kW.pack, kW.scales, s.k, nKv * hd, H);
-        gemvDP4_only(vW.pack, vW.scales, s.v, nKv * hd, H);
+        projGemv(qW, s.q, nHq * hd, H);
+        projGemv(kW, s.k, nKv * hd, H);
+        projGemv(vW, s.v, nKv * hd, H);
         if (l === 0) await _tap('l0.dec.norm+qkv', s.v, nKv * hd);
       } else {
         await rmsnorm(s.x, W(p + 'input_layernorm.weight'), s.normed, T, H, C.rmsEps);
