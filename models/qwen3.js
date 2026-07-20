@@ -441,6 +441,66 @@ ${wgReduceWGSL(GEMVQ_NR, GEMV_WG)}
   // Only active when DP4A is verified (__noDp4 falls back to plain int4, which also
   // represents ternary exactly). Measured (Iris Xe, GPU-ts): lm_head GEMV 2.0× vs int4.
   let _ternAny = false;
+  // v2 ternary GEMV: vec2<u32> weight loads (32 weights = exactly ONE scale group per
+  // load, so grp == the loop index — no division/select anywhere) + subgroup reduce
+  // (matvecQ's pattern) instead of the shared-memory tree — the barrier tree dominated
+  // the many small q/k/v dispatches (measured ~15 GB/s eff vs 29 at lm_head). Rows of a
+  // workgroup share each thread's activation registers across NR rows as before.
+  function gemvTern2Wgsl(NR) { return `
+enable f16;
+enable subgroups;
+struct D { N:u32, K:u32, acc:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       xq   : array<vec2<u32>>; // [K/8] packed int8 activations (paired)
+@group(0) @binding(1) var<storage, read>       W    : array<vec2<u32>>; // [N*K/32] ternary codes (paired)
+@group(0) @binding(2) var<storage, read>       sc   : array<f16>;       // [N*K/QGROUP] weight scales
+@group(0) @binding(3) var<storage, read>       xs   : array<f32>;       // [K/QGROUP] activation scales
+@group(0) @binding(4) var<storage, read>       xsum : array<i32>;       // [K/16] Σ int8 x per code-word
+@group(0) @binding(5) var<storage, read_write> y    : array<f32>;       // [N]
+@group(0) @binding(6) var<uniform>             d    : D;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
+  if (rowBase >= d.N) { return; }
+  let w2n = d.K / 32u;            // vec2 code-loads per row == scale groups per row
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
+  var g = lid.x;
+  loop {
+    if (g >= w2n) { break; }
+    let xA = xq[4u*g];  let xB = xq[4u*g+1u];  let xC = xq[4u*g+2u];  let xD = xq[4u*g+3u];
+    let xsc = xs[g];
+    let xsm = xsum[2u*g] + xsum[2u*g+1u];
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
+      let row = rowBase + r;
+      let p = W[row*w2n + g];
+      let ia = dot4I8Packed(p.x & 0x03030303u, xA.x) + dot4I8Packed((p.x >> 2u) & 0x03030303u, xA.y)
+             + dot4I8Packed((p.x >> 4u) & 0x03030303u, xB.x) + dot4I8Packed((p.x >> 6u) & 0x03030303u, xB.y)
+             + dot4I8Packed(p.y & 0x03030303u, xC.x) + dot4I8Packed((p.y >> 2u) & 0x03030303u, xC.y)
+             + dot4I8Packed((p.y >> 4u) & 0x03030303u, xD.x) + dot4I8Packed((p.y >> 6u) & 0x03030303u, xD.y)
+             - xsm;
+      acc[r] = acc[r] + f32(sc[row*w2n + g]) * xsc * f32(ia);
+    }
+    g = g + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
+    let ssum = subgroupAdd(acc[r]);
+    if (sgi == 0u) { part[r*${GEMV_WG}u + sgIdx] = ssum; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.N) {
+      let nsg = (${GEMV_WG}u + sgs - 1u) / sgs;
+      var tot = 0.0;
+      for (var i:u32=0u; i<nsg; i=i+1u) { tot = tot + part[lid.x*${GEMV_WG}u + i]; }
+      y[row] = select(0.0, y[row], d.acc != 0u) + tot;
+    }
+  }
+}`; }
   function gemvTernWgsl(NR) { return `
 enable f16;
 struct D { N:u32, K:u32, acc:u32, _b:u32 };
@@ -487,7 +547,9 @@ ${wgReduceWGSL(NR, GEMV_WG)}
   // Ternary GEMV against the CURRENTLY-quantized activation in _dp4 (+xsum).
   function gemvTern_only(wrec, yBuf, N, K, acc) {
     const NR = (globalThis.__ternGemvNR | 0) || (N >= 16384 ? 16 : 8);   // lm_head prefers wider row blocks (measured NR16 best at 151936); __ternGemvNR = tuning override
-    const pipe = E.getPipeline('q3.gemvTern.' + NR, gemvTernWgsl(NR));
+    const pipe = globalThis.__ternGemvV1
+      ? E.getPipeline('q3.gemvTern.' + NR, gemvTernWgsl(NR))
+      : E.getPipeline('q3.gemvTern2.' + NR, gemvTern2Wgsl(NR));
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
     const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [_dp4.xq, wrec.pack, wrec.scales, _dp4.xs, _dp4.xsum, yBuf, d], [gx, gy, 1]);
