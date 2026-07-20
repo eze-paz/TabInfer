@@ -741,6 +741,73 @@ ${wgReduce2WGSL(NR, GEMV_WG)}
   // rmsnormQ first) — lets the MLP norm feed it pre-quantized, dropping the quantize dispatch.
   // Ternary variant of the fused gate+up+SwiGLU: same structure, ternary code words
   // (H/16 per row) + the (c-1)·x = c·x − Σx identity (xsum read once, shared by gate AND up).
+  // v2 fused gate+up+SwiGLU: vec2<u32> weight loads (32 weights = one scale group/iter,
+  // no index division) + subgroup reduce (both ga and ua) instead of the shared-mem tree.
+  // Same win as gemvTern2 — the small-N reduction barrier was the bottleneck.
+  function gateupTern2Wgsl(NR) { return `
+enable f16;
+enable subgroups;
+struct D { I:u32, H:u32, _a:u32, _b:u32 };
+@group(0) @binding(0) var<storage, read>       xq   : array<vec2<u32>>; // [H/8] packed int8 activations (paired)
+@group(0) @binding(1) var<storage, read>       gW   : array<vec2<u32>>; // [I*H/32] ternary codes (paired)
+@group(0) @binding(2) var<storage, read>       gS   : array<f16>;
+@group(0) @binding(3) var<storage, read>       uW   : array<vec2<u32>>;
+@group(0) @binding(4) var<storage, read>       uS   : array<f16>;
+@group(0) @binding(5) var<storage, read>       xs   : array<f32>;   // [H/QGROUP] activation scales
+@group(0) @binding(6) var<storage, read>       xsum : array<i32>;   // [H/16]
+@group(0) @binding(7) var<storage, read_write> swi  : array<f32>;   // [I]
+@group(0) @binding(8) var<uniform>             d    : D;
+var<workgroup> pg : array<f32, ${NR * GEMV_WG}>;
+var<workgroup> pu : array<f32, ${NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>,
+        @builtin(subgroup_size) sgs:u32, @builtin(subgroup_invocation_id) sgi:u32) {
+  let rowBase = (wg.x + wg.y * nwg.x) * ${NR}u;
+  if (rowBase >= d.I) { return; }
+  let w2n = d.H / 32u;             // vec2 code-loads per row == scale groups per row
+  var ga : array<f32, ${NR}>; var ua : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { ga[r]=0.0; ua[r]=0.0; }
+  var g = lid.x;
+  loop {
+    if (g >= w2n) { break; }
+    let xA = xq[4u*g];  let xB = xq[4u*g+1u];  let xC = xq[4u*g+2u];  let xD = xq[4u*g+3u];
+    let xsc = xs[g];
+    let xsm = xsum[2u*g] + xsum[2u*g+1u];
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
+      let row = rowBase + r; let wi = row*w2n + g; let si = row*w2n + g;
+      let gp = gW[wi];
+      let gi = dot4I8Packed(gp.x & 0x03030303u, xA.x) + dot4I8Packed((gp.x >> 2u) & 0x03030303u, xA.y)
+             + dot4I8Packed((gp.x >> 4u) & 0x03030303u, xB.x) + dot4I8Packed((gp.x >> 6u) & 0x03030303u, xB.y)
+             + dot4I8Packed(gp.y & 0x03030303u, xC.x) + dot4I8Packed((gp.y >> 2u) & 0x03030303u, xC.y)
+             + dot4I8Packed((gp.y >> 4u) & 0x03030303u, xD.x) + dot4I8Packed((gp.y >> 6u) & 0x03030303u, xD.y) - xsm;
+      ga[r] = ga[r] + f32(gS[si])*xsc*f32(gi);
+      let up = uW[wi];
+      let ui = dot4I8Packed(up.x & 0x03030303u, xA.x) + dot4I8Packed((up.x >> 2u) & 0x03030303u, xA.y)
+             + dot4I8Packed((up.x >> 4u) & 0x03030303u, xB.x) + dot4I8Packed((up.x >> 6u) & 0x03030303u, xB.y)
+             + dot4I8Packed(up.y & 0x03030303u, xC.x) + dot4I8Packed((up.y >> 2u) & 0x03030303u, xC.y)
+             + dot4I8Packed((up.y >> 4u) & 0x03030303u, xD.x) + dot4I8Packed((up.y >> 6u) & 0x03030303u, xD.y) - xsm;
+      ua[r] = ua[r] + f32(uS[si])*xsc*f32(ui);
+    }
+    g = g + ${GEMV_WG}u;
+  }
+  let sgIdx = lid.x / sgs;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) {
+    let gsum = subgroupAdd(ga[r]); let usum = subgroupAdd(ua[r]);
+    if (sgi == 0u) { pg[r*${GEMV_WG}u + sgIdx] = gsum; pu[r*${GEMV_WG}u + sgIdx] = usum; }
+  }
+  workgroupBarrier();
+  if (lid.x < ${NR}u) {
+    let row = rowBase + lid.x;
+    if (row < d.I) {
+      let nsg = (${GEMV_WG}u + sgs - 1u) / sgs;
+      var g = 0.0; var u = 0.0;
+      for (var i:u32=0u; i<nsg; i=i+1u) { g = g + pg[lid.x*${GEMV_WG}u + i]; u = u + pu[lid.x*${GEMV_WG}u + i]; }
+      let silu = g / (1.0 + exp(-g));
+      swi[row] = silu * u;
+    }
+  }
+}`; }
   function gateupTernWgsl(NR) { return `
 enable f16;
 struct D { I:u32, H:u32, _a:u32, _b:u32 };
@@ -795,7 +862,9 @@ ${wgReduce2WGSL(NR, GEMV_WG)}
     if (gRec.tern) {
       // NR=8 measured optimum on gen-12lp (GPU-ts sweep, I=6144/H=2048: NR1 29.0ms NR2 16.5 NR4 15.3 NR8 10.8 NR16 16.5-20 per token)
       NR = (globalThis.__ternGateUpNR | 0) || 8;   // __ternGateUpNR = tuning override
-      const pipe = E.getPipeline('q3.gateupTern.' + NR, gateupTernWgsl(NR));
+      const pipe = globalThis.__ternGemvV1
+        ? E.getPipeline('q3.gateupTern.' + NR, gateupTernWgsl(NR))
+        : E.getPipeline('q3.gateupTern2.' + NR, gateupTern2Wgsl(NR));
       const d = uniform(new Uint32Array([I, H, 0, 0]));
       const nWG = Math.ceil(I / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
       return E.dispatch(pipe, [_dp4.xq, gRec.pack, gRec.scales, uRec.pack, uRec.scales, _dp4.xs, _dp4.xsum, swiBuf, d], [gx, gy, 1]);
