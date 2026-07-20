@@ -19,10 +19,14 @@
 //         q,k L2-normalized per head (eps 1e-6) inside the kernel; q scaled 1/√dk
 //         output: RMSNorm(o)·weight  THEN  ·silu(z)   ("Norm before gate" — NOT Mamba order)
 //
-// LOADER CONTRACT (phase B): HF's in_proj_qkvz / in_proj_ba outputs are INTERLEAVED per
-// head ([q_h|k_h|v_h|z_h] × 16, [b_h|a_h] × 16). The loader must PERMUTE THE WEIGHT ROWS
-// once so projections emit contiguous q|k|v|z and b|a — kernels below assume that layout
-// and pay zero runtime cost for it.
+// LAYOUTS (verified against the actual checkpoint header 2026-07-20): unlike Qwen3-Next,
+// the Qwen3.5 checkpoint ships in_proj_qkv [6144,H] (plain contiguous q|k|v — the split
+// is torch.split, NOT per-head interleaved), plus separate in_proj_z/in_proj_b/in_proj_a.
+// Kernels assume exactly that layout; NO permutation needed on the GDN side. The one
+// interleaved tensor is attention q_proj [4096,H] = per-head [q(256)|gate(256)]×8 — the
+// loader permutes its rows to [all q | all gate] once (gate = sigmoid, applied to attn
+// out before o_proj). RoPE is PARTIAL: rotary factor 0.25 → first 64 of 256 dims (mrope
+// collapses to standard RoPE for text-only). A_log + linear_attn.norm ship as F32.
 //
 // PHASE PLAN:
 //   A (this file, now): gdnConv, gdnGates, gdnQkNorm, gdnDelta, gatedRmsNorm + self-tests
@@ -457,10 +461,352 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     return { ok: fails.length === 0, results: out };
   }
 
+  // ============================================================
+  // PHASE B — tokenizer + streaming weight loader.
+  // Adapted from webgpu-lfm25.js (same design, minus MoE/expert-streaming/folder
+  // store — this model is a single 1.75GB file, ~0.95GB resident after quant).
+  // ============================================================
+  const MODELS = {
+    '0.8B': {
+      root: 'https://huggingface.co/Qwen/Qwen3.5-0.8B/resolve/main/',
+      file: 'model.safetensors-00001-of-00001.safetensors',
+      cfg: { ...CONFIG, eos: 248044 },
+    },
+  };
+  let _variant = null, _cfg = null, _weights = null, _loaded = false;
+
+  // ---- tokenizer: byte-level BPE, pre_tokenizer regex extracted from tokenizer.json
+  // (same generic machinery as lfm25; Qwen chat template — NO BOS token).
+  function buildByteMaps() {
+    const bs = [];
+    for (let i = 33; i <= 126; i++) bs.push(i);
+    for (let i = 161; i <= 172; i++) bs.push(i);
+    for (let i = 174; i <= 255; i++) bs.push(i);
+    const cs = bs.slice(); let n = 0;
+    for (let b = 0; b < 256; b++) if (!bs.includes(b)) { bs.push(b); cs.push(256 + n); n++; }
+    const byteEnc = new Array(256), byteDec = {};
+    for (let i = 0; i < bs.length; i++) { const ch = String.fromCharCode(cs[i]); byteEnc[bs[i]] = ch; byteDec[ch] = bs[i]; }
+    return { byteEnc, byteDec };
+  }
+  function _jsRegexFrom(hfPattern) {
+    let p = hfPattern.replace(/\(\?i:('s\|'t\|'re\|'ve\|'m\|'ll\|'d)\)/i,
+      "(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])");
+    try { return new RegExp(p, 'gu'); } catch (_) {
+      return /(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+/gu;
+    }
+  }
+  const TOK = (function () {
+    let vocab = null, idToTok = null, bpeRanks = null, byteEnc = null, byteDec = null, ready = false, pretokRe = null;
+    let imStart = -1, imEnd = -1;
+    const _addedIds = new Set();
+    const enc = new TextEncoder(), dec = new TextDecoder();
+    async function load(root) {
+      if (ready) return;
+      const j = await (await fetch(root + 'tokenizer.json')).json();
+      vocab = j.model.vocab;
+      idToTok = {}; for (const k in vocab) idToTok[vocab[k]] = k;
+      for (const a of (j.added_tokens || [])) { vocab[a.content] = a.id; idToTok[a.id] = a.content; _addedIds.add(a.id); }
+      bpeRanks = new Map();
+      const merges = j.model.merges || [];
+      for (let i = 0; i < merges.length; i++) { const m = merges[i]; bpeRanks.set(Array.isArray(m) ? (m[0] + ' ' + m[1]) : m, i); }
+      let pat = null;
+      const scan = (pt) => { if (!pt) return; if (pt.pattern && pt.pattern.Regex) pat = pt.pattern.Regex; (pt.pretokenizers || []).forEach(scan); };
+      scan(j.pre_tokenizer);
+      pretokRe = pat ? _jsRegexFrom(pat) : _jsRegexFrom('');
+      ({ byteEnc, byteDec } = buildByteMaps());
+      imStart = vocab['<|im_start|>'] ?? -1; imEnd = vocab['<|im_end|>'] ?? -1;
+      ready = true;
+    }
+    function bpe(piece) {
+      let word = Array.from(piece);
+      if (word.length < 2) return word;
+      for (;;) {
+        let bestRank = Infinity, bestI = -1;
+        for (let i = 0; i < word.length - 1; i++) { const r = bpeRanks.get(word[i] + ' ' + word[i + 1]); if (r !== undefined && r < bestRank) { bestRank = r; bestI = i; } }
+        if (bestI < 0) break;
+        word = word.slice(0, bestI).concat(word[bestI] + word[bestI + 1], word.slice(bestI + 2));
+      }
+      return word;
+    }
+    function encodeText(text) {
+      const ids = [];
+      for (const piece of (text.match(pretokRe) || [])) {
+        const bytes = enc.encode(piece);
+        let s = ''; for (const b of bytes) s += byteEnc[b];
+        for (const sub of bpe(s)) { const id = vocab[sub]; if (id !== undefined) ids.push(id); }
+      }
+      return ids;
+    }
+    // Qwen chat format: no BOS; <|im_start|>role\n…<|im_end|>\n per message.
+    // Phase C replaces this with the full template (system/tools/<think> handling)
+    // mirroring webgpu-qwen3.js's encodeChat.
+    function encodeChat(messages, { addGenerationPrompt = true } = {}) {
+      const ids = [];
+      for (const m of messages) {
+        ids.push(imStart); ids.push(...encodeText(m.role + '\n' + (typeof m.content === 'string' ? m.content : ''))); ids.push(imEnd); ids.push(...encodeText('\n'));
+      }
+      if (addGenerationPrompt) { ids.push(imStart); ids.push(...encodeText('assistant\n')); }
+      return ids;
+    }
+    function decode(ids) {
+      let s = ''; for (const id of ids) { const t = idToTok[id]; if (t !== undefined) s += t; }
+      const bytes = []; for (const ch of s) { const b = byteDec[ch]; if (b !== undefined) bytes.push(b); }
+      return dec.decode(new Uint8Array(bytes));
+    }
+    return { load, encodeText, encodeChat, decode, isReady: () => ready, specialIds: () => _addedIds, imEnd: () => imEnd, id: (t) => vocab ? vocab[t] : undefined };
+  })();
+
+  // ---- streaming single-pass loader (lfm25 design): header via Range, one sequential
+  // body stream, each tensor quantized the moment its bytes complete, raw bytes dropped.
+  const QGROUP = 32;
+  const _f32a = new Float32Array(1), _u32a = new Uint32Array(_f32a.buffer);
+  function _f32ToF16(v) { _f32a[0] = v; const x = _u32a[0]; const sign = (x >>> 16) & 0x8000, exp = (x >>> 23) & 0xff, mant = x & 0x7fffff; if (exp === 0xff) return sign | (mant ? 0x7e00 : 0x7c00); let e = exp - 127 + 15; if (e >= 31) return sign | 0x7c00; if (e <= 0) { if (e < -10) return sign; const m = mant | 0x800000, sh = 14 - e; let h = m >>> sh; if ((m >>> (sh - 1)) & 1) h += 1; return sign | h; } let h = (e << 10) | (mant >>> 13); if ((mant >>> 12) & 1) h += 1; return sign | h; }
+  function _f16ToF32s(h) { const s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x03ff; if (e === 0) return (s ? -1 : 1) * Math.pow(2, -14) * (f / 1024); if (e === 31) return f ? NaN : (s ? -Infinity : Infinity); return (s ? -1 : 1) * Math.pow(2, e - 15) * (1 + f / 1024); }
+  function _bf16ToF16bits(u16) { const out = new Uint16Array(u16.length); const t = new Float32Array(1), ti = new Uint32Array(t.buffer); for (let i = 0; i < u16.length; i++) { ti[0] = u16[i] << 16; out[i] = _f32ToF16(t[0]); } return out; }
+  function _quantInt4(u16, rows, K) {
+    const wpr = K / 8, gpr = K / QGROUP;
+    const pack = new Uint32Array(rows * wpr), scales = new Uint16Array(rows * gpr);
+    const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+    for (let n = 0; n < rows; n++) {
+      const rU = n * K, rP = n * wpr, rS = n * gpr;
+      for (let g = 0; g < gpr; g++) {
+        let maxabs = 0;
+        for (let j = 0; j < QGROUP; j++) { ti[0] = u16[rU + g * QGROUP + j] << 16; const v = Math.abs(t[0]); if (v > maxabs) maxabs = v; }
+        const sBits = _f32ToF16(maxabs > 0 ? maxabs / 7 : 1e-8); scales[rS + g] = sBits;
+        const inv = 1 / _f16ToF32s(sBits);
+        for (let j = 0; j < QGROUP; j++) {
+          const k = g * QGROUP + j; ti[0] = u16[rU + k] << 16;
+          let q = Math.round(t[0] * inv); if (q < -8) q = -8; else if (q > 7) q = 7;
+          pack[rP + (k >> 3)] |= ((q + 8) & 0xF) << (4 * (k & 7));
+        }
+      }
+    }
+    return { pack, scales };
+  }
+  // Quant plan by tensor name.
+  const _skip = (n) => /^model\.visual\./.test(n) || /^mtp\./.test(n);   // vision tower + MTP head: never loaded
+  const _isInt4 = (n) => /(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj|out_proj|in_proj_qkv|in_proj_z)\.weight$/.test(n);
+  const _isF32T = (n) => /(A_log|dt_bias|linear_attn\.norm\.weight)$/.test(n);   // small GDN params: exact
+  const EMBED = 'model.language_model.embed_tokens.weight';
+
+  // q_proj rows are per-head interleaved [q(256)|gate(256)]×8 (torch.chunk on the
+  // reshaped [..., head, 2*hd] output). Permute rows → [all q | all gate] once here
+  // so Phase C's projections are two contiguous halves. Zero runtime cost.
+  function _permuteQGate(u16, rows, K, headDim) {
+    const out = new Uint16Array(u16.length);
+    const nH = rows / (2 * headDim);
+    for (let h = 0; h < nH; h++) for (let d = 0; d < headDim; d++) {
+      out.set(u16.subarray((h * 2 * headDim + d) * K, (h * 2 * headDim + d + 1) * K), (h * headDim + d) * K);                       // q half
+      out.set(u16.subarray((h * 2 * headDim + headDim + d) * K, (h * 2 * headDim + headDim + d + 1) * K), (rows / 2 + h * headDim + d) * K);   // gate half
+    }
+    return out;
+  }
+
+  async function _uploadTensor(name, info, raw, sink) {
+    if (_skip(name)) return;
+    const numel = info.shape.reduce((a, b) => a * b, 1);
+    const put = (buf, arr) => E.device().queue.writeBuffer(buf, 0, arr.buffer, arr.byteOffset, arr.byteLength);
+    // F32 tensors (A_log, linear_attn.norm) arrive as raw f32 — no conversion.
+    if (info.dtype === 'F32') {
+      const f32 = new Float32Array(raw.buffer, raw.byteOffset, numel).slice();
+      const buf = E.createBuffer(f32.byteLength, ST(), name);
+      put(buf, f32);
+      _weights[name] = { buf, f32: true, shape: info.shape };
+      if (sink) await sink.add(name, 'buf', f32, { kind: 'f32', shape: info.shape });
+      return;
+    }
+    let u16 = new Uint16Array(raw.buffer, raw.byteOffset, numel);
+    if (/self_attn\.q_proj\.weight$/.test(name)) u16 = _permuteQGate(u16, info.shape[0], info.shape[1], _cfg.headDim);
+    if (_isInt4(name) && info.shape.length >= 2 && (info.shape[info.shape.length - 1] % QGROUP) === 0) {
+      const K = info.shape[info.shape.length - 1], rows = numel / K;
+      const { pack, scales } = _quantInt4(u16, rows, K);
+      const packBuf = E.createBuffer(pack.byteLength, ST(), name + '.pack');
+      const scBuf = E.createBuffer(scales.byteLength, ST(), name + '.sc');
+      put(packBuf, pack); put(scBuf, scales);
+      _weights[name] = { pack: packBuf, scales: scBuf, N: rows, K, int4: true, shape: info.shape };
+      if (sink) { await sink.add(name, 'pack', pack, { kind: 'int4', shape: info.shape, N: rows, K }); await sink.add(name, 'scales', scales, { kind: 'int4', shape: info.shape, N: rows, K }); }
+    } else if (_isF32T(name)) {
+      const f32 = new Float32Array(numel); const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+      for (let i = 0; i < numel; i++) { ti[0] = u16[i] << 16; f32[i] = t[0]; }
+      const buf = E.createBuffer(f32.byteLength, ST(), name);
+      put(buf, f32);
+      _weights[name] = { buf, f32: true, shape: info.shape };
+      if (sink) await sink.add(name, 'buf', f32, { kind: 'f32', shape: info.shape });
+    } else {
+      const bits = info.dtype === 'BF16' ? _bf16ToF16bits(u16) : u16;
+      const buf = E.createBuffer(numel * 2, ST(), name);
+      put(buf, bits);
+      _weights[name] = { buf, shape: info.shape };
+      if (sink) await sink.add(name, 'buf', bits, { kind: 'f16', shape: info.shape });
+    }
+    // TIED lm_head: int4 twin of the embedding for the vocab GEMV, made while the
+    // raw bf16 is still in hand (it is never resident again after this call).
+    if (name === EMBED && !_weights['lm_head.weight']) {
+      const K = info.shape[1], rows = info.shape[0];
+      const { pack, scales } = _quantInt4(u16, rows, K);
+      const packBuf = E.createBuffer(pack.byteLength, ST(), 'lm_head.pack');
+      const scBuf = E.createBuffer(scales.byteLength, ST(), 'lm_head.sc');
+      put(packBuf, pack); put(scBuf, scales);
+      _weights['lm_head.weight'] = { pack: packBuf, scales: scBuf, N: rows, K, int4: true, shape: info.shape };
+      if (sink) { await sink.add('lm_head.weight', 'pack', pack, { kind: 'int4', shape: info.shape, N: rows, K }); await sink.add('lm_head.weight', 'scales', scales, { kind: 'int4', shape: info.shape, N: rows, K }); }
+    }
+  }
+
+  // ---- persistent quantized-weights cache (lfm25/qwen3 design; namespaced /gdn/).
+  // GPU-ready bytes in fixed 64MiB chunks; manifest written LAST = commit point.
+  const QC_NAME = 'sandpie-webgpu-quant';
+  const QC_VER = 1;
+  const QC_CHUNK = 64 * 1024 * 1024;
+  const _qcUrl = (variant, part) => 'https://sandpie.quant/gdn/v' + QC_VER + '/' + variant + '/' + part;
+  function _makeSink(variant) {
+    let cache = null, buf = new Uint8Array(QC_CHUNK), used = 0, chunkIdx = 0, globalOff = 0, dead = false;
+    const segs = [];
+    const flush = async () => {
+      if (!used) return;
+      await cache.put(_qcUrl(variant, 'c' + chunkIdx), new Response(buf.subarray(0, used)));
+      chunkIdx++; buf = new Uint8Array(QC_CHUNK); used = 0;
+    };
+    return {
+      async open() {
+        try { cache = await caches.open(QC_NAME); await cache.delete(_qcUrl(variant, 'manifest')); return true; } catch (_) { dead = true; return false; }
+      },
+      async add(name, part, arr, meta) {
+        if (dead) return;
+        try {
+          const bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+          const pad = (4 - (globalOff % 4)) % 4;
+          for (let p = 0; p < pad; p++) { if (used === QC_CHUNK) await flush(); buf[used++] = 0; globalOff++; }
+          const lenPad = (4 - (bytes.byteLength % 4)) % 4;
+          segs.push({ name, part, off: globalOff, len: bytes.byteLength + lenPad, ...meta });
+          let src = 0;
+          while (src < bytes.byteLength) {
+            if (used === QC_CHUNK) await flush();
+            const n = Math.min(QC_CHUNK - used, bytes.byteLength - src);
+            buf.set(bytes.subarray(src, src + n), used); used += n; src += n; globalOff += n;
+          }
+          for (let p = 0; p < lenPad; p++) { if (used === QC_CHUNK) await flush(); buf[used++] = 0; globalOff++; }
+        } catch (e) { dead = true; try { console.warn('[gdn] quant-cache write failed (quota?) — continuing uncached', e); } catch (_) {} }
+      },
+      async finish() {
+        if (dead) return false;
+        try {
+          await flush();
+          const manifest = { ver: QC_VER, qgroup: QGROUP, chunkSize: QC_CHUNK, nChunks: chunkIdx, totalBytes: globalOff, segs };
+          await cache.put(_qcUrl(variant, 'manifest'), new Response(JSON.stringify(manifest), { headers: { 'content-type': 'application/json' } }));
+          return true;
+        } catch (_) { return false; }
+      },
+    };
+  }
+  async function _readQuantCache(variant, onProgress) {
+    let cache; try { cache = await caches.open(QC_NAME); } catch (_) { return false; }
+    const mResp = await cache.match(_qcUrl(variant, 'manifest'));
+    if (!mResp) return false;
+    let m; try { m = await mResp.json(); } catch (_) { return false; }
+    if (!m || m.ver !== QC_VER || m.qgroup !== QGROUP || m.chunkSize !== QC_CHUNK) return false;
+    const bySeg = [];
+    for (const s of m.segs) {
+      const rec = _weights[s.name] || (_weights[s.name] = s.kind === 'int4' ? { N: s.N, K: s.K, int4: true, shape: s.shape } : { shape: s.shape, ...(s.kind === 'f32' ? { f32: true } : {}) });
+      const buf = E.createBuffer(s.len, ST(), s.name + '.' + s.part);
+      if (s.part === 'pack') rec.pack = buf; else if (s.part === 'scales') rec.scales = buf; else rec.buf = buf;
+      bySeg.push({ ...s, buf });
+    }
+    for (let ci = 0; ci < m.nChunks; ci++) {
+      const resp = await cache.match(_qcUrl(variant, 'c' + ci));
+      if (!resp) return false;
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      const cStart = ci * QC_CHUNK, cEnd = cStart + bytes.byteLength;
+      for (const s of bySeg) {
+        if (s.off + s.len <= cStart || s.off >= cEnd) continue;
+        const b = Math.max(s.off, cStart), e = Math.min(s.off + s.len, cEnd);
+        E.device().queue.writeBuffer(s.buf, b - s.off, bytes.buffer, b - cStart, e - b);
+      }
+      onProgress && onProgress({ phase: 'cache', pct: Math.round((ci + 1) / m.nChunks * 100) });
+    }
+    return true;
+  }
+
+  async function _streamWeights(url, onProgress, sink) {
+    const h8 = await (await fetch(url, { headers: { Range: 'bytes=0-7' } })).arrayBuffer();
+    const headerLen = Number(new DataView(h8).getBigUint64(0, true));
+    const hResp = await fetch(url, { headers: { Range: 'bytes=8-' + (7 + headerLen) } });
+    const header = JSON.parse(new TextDecoder().decode(await hResp.arrayBuffer()));
+    const dataStart = 8 + headerLen;
+    const tensors = Object.keys(header).filter(n => n !== '__metadata__')
+      .map(n => ({ name: n, info: header[n], begin: header[n].data_offsets[0], end: header[n].data_offsets[1] }))
+      .sort((a, b) => a.begin - b.begin);
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('download failed: HTTP ' + resp.status);
+    const total = +(resp.headers.get('content-length') || 0);
+    const reader = resp.body.getReader();
+    let chunks = [], winStart = 0, recv = 0, ti = 0;
+    const takeRange = (begin, end) => {
+      const out = new Uint8Array(end - begin); let w = 0, off = winStart;
+      for (const c of chunks) { const cEnd = off + c.length;
+        if (cEnd > begin && off < end) { const s = Math.max(begin - off, 0), e = Math.min(end - off, c.length); out.set(c.subarray(s, e), w); w += e - s; }
+        off = cEnd; }
+      return out;
+    };
+    const dropTo = (abs) => { let off = winStart;
+      while (chunks.length && off + chunks[0].length <= abs) { off += chunks[0].length; chunks.shift(); }
+      winStart = off; };
+    let skippedHeader = false;
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (value) {
+        if (!skippedHeader) {
+          const priorRecv = recv; recv += value.length;
+          if (recv <= dataStart) continue;
+          const cut = Math.max(dataStart - priorRecv, 0);
+          chunks.push(value.subarray(cut)); winStart = 0; recv = recv - dataStart; skippedHeader = true;
+        } else { chunks.push(value); recv += value.length; }
+        while (ti < tensors.length && tensors[ti].end <= recv) {
+          const t = tensors[ti];
+          await _uploadTensor(t.name, t.info, takeRange(t.begin, t.end), sink);
+          ti++; dropTo(ti < tensors.length ? tensors[ti].begin : recv);
+          onProgress && onProgress({ phase: 'parse', pct: Math.round(ti / tensors.length * 100) });
+        }
+        if (total && onProgress) onProgress({ phase: 'download', pct: Math.round((recv + dataStart) / total * 100) });
+      }
+      if (done) break;
+    }
+    if (ti < tensors.length) throw new Error('stream ended early: ' + tensors[ti].name);
+  }
+
+  async function loadModel({ variant = '0.8B', onProgress } = {}) {
+    if (_loaded && _variant === variant) return;
+    const m = MODELS[variant]; if (!m) throw new Error('unknown Qwen3.5 variant ' + variant);
+    // Free the previous variant's buffers first (lfm25 lesson: orphaned buffers → GPU OOM).
+    if (_loaded || _weights) {
+      try { await E.device().queue.onSubmittedWorkDone(); } catch (_) {}
+      unload();
+    }
+    _variant = variant; _cfg = m.cfg; _weights = {};
+    await E.init();
+    await TOK.load(m.root);
+    onProgress && onProgress({ phase: 'tokenizer', pct: 100 });
+    let hit = false;
+    try { hit = await _readQuantCache(variant, onProgress); } catch (e) { try { console.warn('[gdn] cache read failed — falling back to download', e); } catch (_) {} _weights = {}; hit = false; }
+    if (!hit) {
+      _weights = {};
+      const sink = _makeSink(variant);
+      const sinkOk = await sink.open();
+      await _streamWeights(m.root + m.file, onProgress, sinkOk ? sink : null);
+      if (sinkOk) { const committed = await sink.finish(); try { console.log('[gdn] quant cache ' + (committed ? 'written' : 'NOT written (quota?)')); } catch (_) {} }
+    }
+    _loaded = true;
+  }
+  function unload() {
+    try { if (_weights) for (const k in _weights) { const w = _weights[k]; for (const p of ['buf', 'pack', 'scales']) if (w[p] && w[p].destroy) try { w[p].destroy(); } catch (_) {} } } catch (_) {}
+    _weights = null; _loaded = false; _variant = null;
+  }
+
   return {
-    CONFIG, GDN_CONV_DIM,
+    CONFIG, GDN_CONV_DIM, MODELS,
     gdnConv, gdnGates, gdnQkNorm, gdnDelta, gatedRmsNorm,
+    loadModel, unload, TOK,
     _selfTest: selfTestKernels,
+    _weightsInfo: () => { const o = {}; let bytes = 0; for (const k in (_weights || {})) { const w = _weights[k]; o[k] = { int4: !!w.int4, f32: !!w.f32, shape: w.shape }; } return { count: Object.keys(o).length, tensors: o }; },
   };
 })();
 
