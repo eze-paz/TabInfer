@@ -335,6 +335,7 @@ struct Q { K:u32, _a:u32, _b:u32, _c:u32 };
 @group(0) @binding(1) var<storage, read_write> xq : array<u32>;     // [K/4] packed int8
 @group(0) @binding(2) var<storage, read_write> xs : array<f32>;     // [K/QGROUP] group scales
 @group(0) @binding(3) var<uniform>             q  : Q;
+@group(0) @binding(4) var<storage, read_write> xsum : array<i32>;   // [K/16] Σ int8 per 16 (ternary Σx term; ~free for int4)
 var<workgroup> msh : array<f32, ${QGROUP}>;
 var<workgroup> qsh : array<i32, ${QGROUP}>;
 @compute @workgroup_size(${QGROUP},1,1)
@@ -348,6 +349,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lidv:
   qsh[lid] = clamp(i32(round(val*inv)), -127, 127); workgroupBarrier();
   if (lid < ${QGROUP / 4}u) {
     xq[g*${QGROUP / 4}u + lid] = pack4xI8(vec4<i32>(qsh[lid*4u], qsh[lid*4u+1u], qsh[lid*4u+2u], qsh[lid*4u+3u]));
+  }
+  if (lid < ${QGROUP / 16}u) {   // per-16 sums for the ternary (c-1)·x = c·x − Σx identity
+    var t = 0i;
+    for (var j = 0u; j < 16u; j++) { t += qsh[lid*16u + j]; }
+    xsum[g*${QGROUP / 16}u + lid] = t;
   }
 }`;
   const GEMVDP4_WGSL = `
@@ -410,8 +416,7 @@ ${wgReduceWGSL(GEMVQ_NR, GEMV_WG)}
     const qp = E.getPipeline('q3.quantq8', QUANTQ8_WGSL);
     const qd = uniform(new Uint32Array([K, 0, 0, 0]));
     const groups = K / QGROUP, qgx = Math.min(groups, 65535), qgy = Math.ceil(groups / qgx);
-    E.dispatch(qp, [xBuf, _dp4.xq, _dp4.xs, qd], [qgx, qgy, 1]);
-    if (_ternAny) ternXsum(K);   // ternary Σx term rides every decode activation quantize
+    E.dispatch(qp, [xBuf, _dp4.xq, _dp4.xs, qd, _dp4.xsum], [qgx, qgy, 1]);
   }
   // GEMV against the CURRENTLY-quantized activation in _dp4 (caller ran quantQ8 first).
   function gemvDP4_only(packBuf, scBuf, yBuf, N, K, acc) {
@@ -436,28 +441,6 @@ ${wgReduceWGSL(GEMVQ_NR, GEMV_WG)}
   // Only active when DP4A is verified (__noDp4 falls back to plain int4, which also
   // represents ternary exactly). Measured (Iris Xe, GPU-ts): lm_head GEMV 2.0× vs int4.
   let _ternAny = false;
-  const XSUM16_WGSL = `
-struct P { W16:u32, _a:u32, _b:u32, _c:u32 };   // W16 = K/16 output words
-@group(0) @binding(0) var<storage, read>       xq   : array<u32>;   // [K/4] packed int8
-@group(0) @binding(1) var<storage, read_write> xsum : array<i32>;   // [K/16]
-@group(0) @binding(2) var<uniform>             p    : P;
-@compute @workgroup_size(64,1,1)
-fn main(@builtin(global_invocation_id) gid:vec3<u32>) {
-  let w = gid.x; if (w >= p.W16) { return; }
-  var t = 0i;
-  for (var j = 0u; j < 4u; j++) {
-    let v = vec4<i32>(unpack4xI8(xq[4u*w + j]));
-    t += v.x + v.y + v.z + v.w;
-  }
-  xsum[w] = t;
-}`;
-  // Per-16 activation sums for the ternary Σx term; reads the CURRENT _dp4.xq.
-  // Dispatched after every decode activation quantize when a ternary model is loaded.
-  function ternXsum(K) {
-    const pipe = E.getPipeline('q3.xsum16', XSUM16_WGSL);
-    const p = uniform(new Uint32Array([K / 16, 0, 0, 0]));
-    E.dispatch(pipe, [_dp4.xq, _dp4.xsum, p], [Math.ceil(K / 16 / 64), 1, 1]);
-  }
   function gemvTernWgsl(NR) { return `
 enable f16;
 struct D { N:u32, K:u32, acc:u32, _b:u32 };
@@ -503,7 +486,7 @@ ${wgReduceWGSL(NR, GEMV_WG)}
 }`; }
   // Ternary GEMV against the CURRENTLY-quantized activation in _dp4 (+xsum).
   function gemvTern_only(wrec, yBuf, N, K, acc) {
-    const NR = N >= 16384 ? 16 : 8;   // lm_head prefers wider row blocks (measured NR16 best at 151936)
+    const NR = (globalThis.__ternGemvNR | 0) || (N >= 16384 ? 16 : 8);   // lm_head prefers wider row blocks (measured NR16 best at 151936); __ternGemvNR = tuning override
     const pipe = E.getPipeline('q3.gemvTern.' + NR, gemvTernWgsl(NR));
     const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
     const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
@@ -529,6 +512,7 @@ struct P { H:u32, eps:f32, _a:u32, _b:u32 };
 @group(0) @binding(2) var<storage, read_write> xq : array<u32>;
 @group(0) @binding(3) var<storage, read_write> xs : array<f32>;
 @group(0) @binding(4) var<uniform>             p  : P;
+@group(0) @binding(5) var<storage, read_write> xsum : array<i32>;   // [H/16] Σ int8 per 16 (ternary Σx term)
 var<workgroup> red : array<f32, ${WG_H}>;
 @compute @workgroup_size(${WG_H},1,1)
 fn main(@builtin(local_invocation_id) lid:vec3<u32>) {
@@ -549,6 +533,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>) {
     for (var j:u32=0u; j<${QGROUP}u; j=j+1u) { mx = max(mx, abs(x[base+j]*inv*f32(w[base+j]))); }
     let scale = mx/127.0; let invs = select(0.0, 1.0/scale, scale > 0.0);
     xs[g] = scale;
+    var sA = 0i; var sB = 0i;   // per-16 sums (ternary Σx term): words 0-3 → sA, 4-7 → sB
     for (var k:u32=0u; k<${QGROUP / 4}u; k=k+1u) {
       let b = base + k*4u;
       let q0 = clamp(i32(round(x[b]    *inv*f32(w[b])    *invs)), -127, 127);
@@ -556,7 +541,10 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>) {
       let q2 = clamp(i32(round(x[b+2u] *inv*f32(w[b+2u]) *invs)), -127, 127);
       let q3 = clamp(i32(round(x[b+3u] *inv*f32(w[b+3u]) *invs)), -127, 127);
       xq[g*${QGROUP / 4}u + k] = pack4xI8(vec4<i32>(q0, q1, q2, q3));
+      let t = q0 + q1 + q2 + q3;
+      if (k < ${QGROUP / 8}u) { sA += t; } else { sB += t; }
     }
+    xsum[g*2u] = sA; xsum[g*2u + 1u] = sB;
     g = g + ${WG_H}u;
   }
 }`;
@@ -567,9 +555,7 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>) {
     const u = new Uint32Array(4); const du = new DataView(u.buffer);
     du.setUint32(0, H, true); du.setFloat32(4, eps, true);
     const p = uniform(u);
-    const r = E.dispatch(pipe, [xBuf, wBuf, _dp4.xq, _dp4.xs, p], [1, 1, 1]);
-    if (_ternAny) ternXsum(H);   // ternary Σx term rides the fused norm+quantize too
-    return r;
+    return E.dispatch(pipe, [xBuf, wBuf, _dp4.xq, _dp4.xs, p, _dp4.xsum], [1, 1, 1]);
   }
 
   // ---- FUSED int4 gate+up+SwiGLU (T=1): swi[i] = silu(gate·x)*(up·x) ----
@@ -745,7 +731,8 @@ ${wgReduce2WGSL(NR, GEMV_WG)}
 }`; }
   function gateUpSiluDP4_only(gRec, uRec, swiBuf, I, H, NR) {
     if (gRec.tern) {
-      NR = NR || 2;
+      // NR=8 measured optimum on gen-12lp (GPU-ts sweep, I=6144/H=2048: NR1 29.0ms NR2 16.5 NR4 15.3 NR8 10.8 NR16 16.5-20 per token)
+      NR = (globalThis.__ternGateUpNR | 0) || 8;   // __ternGateUpNR = tuning override
       const pipe = E.getPipeline('q3.gateupTern.' + NR, gateupTernWgsl(NR));
       const d = uniform(new Uint32Array([I, H, 0, 0]));
       const nWG = Math.ceil(I / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
