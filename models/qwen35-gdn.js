@@ -823,6 +823,19 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       if (sinkOk) { const committed = await sink.finish(); try { console.log('[gdn] quant cache ' + (committed ? 'written' : 'NOT written (quota?)')); } catch (_) {} }
     }
     _loaded = true;
+    // AUTOTUNE the decode GEMV for this device+model: cached verdict → instant;
+    // else a ~2-4s sweep over real weight tensors, persisted next to the quant cache.
+    try {
+      const cache = await caches.open(QC_NAME).catch(() => null);
+      const tResp = cache && await cache.match(_qcUrl(variant, 'tune'));
+      if (tResp) {
+        const t = await tResp.json();
+        if (t && t.v === 1 && t.tune) { _tune = t.tune; console.log('[gdn] gemv tune (cached): ' + JSON.stringify(_tune)); }
+      } else {
+        const r = await autotune();
+        if (cache) await cache.put(_qcUrl(variant, 'tune'), new Response(JSON.stringify({ v: 1, tune: _tune, table: r.table.slice(0, 6) }), { headers: { 'content-type': 'application/json' } })).catch(() => {});
+      }
+    } catch (e) { try { console.warn('[gdn] autotune skipped', e); } catch (_) {} }
   }
   function unload() {
     try { if (_weights) for (const k in _weights) { const w = _weights[k]; for (const p of ['buf', 'pack', 'scales']) if (w[p] && w[p].destroy) try { w[p].destroy(); } catch (_) {} } } catch (_) {}
@@ -899,9 +912,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const gx = Math.min(N, 65535), gy = Math.ceil(N / gx);
     return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, yBuf, d], [gx, gy, 1]);
   }
-  let _gemvNR = 4, _gemvWG = 32;
-  const _NR = () => Math.max(1, (globalThis.__gemvNR | 0) || _gemvNR);
-  const _WG = () => Math.max(32, (globalThis.__gemvWG | 0) || _gemvWG);
+  // GEMV config: AUTOTUNED at loadModel (see autotune()); globals override for experiments.
+  let _tune = { nr: 4, wg: 32, impl: 'q8' };
+  const _NR = () => Math.max(1, (globalThis.__gemvNR | 0) || _tune.nr);
+  const _WG = () => Math.max(32, (globalThis.__gemvWG | 0) || _tune.wg);
   function gemvQ8Wgsl(NR, GEMV_WG) { return `
 enable f16;
 struct D { N:u32, K:u32, acc:u32, _p:u32 };
@@ -945,6 +959,89 @@ ${wgReduceWGSL(NR, GEMV_WG)}
     const pipe = E.getPipeline('gdn.gemvQ8.' + NR + '.' + WG, gemvQ8Wgsl(NR, WG));
     const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
     return E.dispatch(pipe, [xBuf, rec.pack, rec.scales, yBuf, d], [gx, gy, 1]);
+  }
+
+  // ---- T=1 DP4A GEMV (lfm25 copy): int8 activation × int4 weight via dot4I8Packed.
+  // Autotune candidate — on lfm25's shapes the f32-dequant gemvQ8 beat it on gen-12lp,
+  // but that verdict is shape-dependent, so it competes in the sweep here.
+  const QUANTQ8_WGSL = `
+struct Q { K:u32, _a:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       x  : array<f32>;
+@group(0) @binding(1) var<storage, read_write> xq : array<u32>;
+@group(0) @binding(2) var<storage, read_write> xs : array<f32>;
+@group(0) @binding(3) var<uniform>             q  : Q;
+var<workgroup> msh : array<f32, ${QGROUP}>;
+var<workgroup> qsh : array<i32, ${QGROUP}>;
+@compute @workgroup_size(${QGROUP},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let g = wg.x; let i = g*${QGROUP}u + lid.x;
+  let v = select(0.0, x[i], i < q.K);
+  msh[lid.x] = abs(v); workgroupBarrier();
+  var s = ${QGROUP}u/2u;
+  loop { if (s==0u){break;} if (lid.x<s){ msh[lid.x]=max(msh[lid.x],msh[lid.x+s]); } workgroupBarrier(); s=s/2u; }
+  let mx = msh[0];
+  let scale = select(mx/127.0, 1e-8, mx < 1e-12);
+  if (lid.x == 0u) { xs[g] = scale; }
+  var qv = i32(round(v/scale)); qv = clamp(qv, -127, 127);
+  qsh[lid.x] = qv; workgroupBarrier();
+  if (lid.x < ${QGROUP}u/4u) {
+    let b = lid.x*4u;
+    let packed = (u32(qsh[b]) & 0xFFu) | ((u32(qsh[b+1u]) & 0xFFu)<<8u) | ((u32(qsh[b+2u]) & 0xFFu)<<16u) | ((u32(qsh[b+3u]) & 0xFFu)<<24u);
+    xq[g*(${QGROUP}u/4u) + lid.x] = packed;
+  }
+}`;
+  let _dp4 = null;
+  function ensureDp4(K) { if (_dp4 && _dp4.cap >= K) return; if (_dp4) { try { _dp4.xq.destroy(); _dp4.xs.destroy(); } catch (_) {} } _dp4 = { cap: K, xq: E.createBuffer((K / 4) * 4, ST(), 'xq'), xs: E.createBuffer((K / QGROUP) * 4, ST(), 'xs') }; }
+  function quantAct(xBuf, K) {
+    ensureDp4(K);
+    const q = uniform(new Uint32Array([K, 0, 0, 0]));
+    const groups = K / QGROUP, gx = Math.min(groups, 65535), gy = Math.ceil(groups / gx);
+    return E.dispatch(E.getPipeline('gdn.quantq8', QUANTQ8_WGSL), [xBuf, _dp4.xq, _dp4.xs, q], [gx, gy, 1]);
+  }
+  function gemvDP4Wgsl(NR, GEMV_WG) { return `
+enable f16;
+struct D { N:u32, K:u32, acc:u32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       xq : array<u32>;
+@group(0) @binding(1) var<storage, read>       W  : array<u32>;
+@group(0) @binding(2) var<storage, read>       sc : array<f16>;
+@group(0) @binding(3) var<storage, read>       xs : array<f32>;
+@group(0) @binding(4) var<storage, read_write> y  : array<f32>;
+@group(0) @binding(5) var<uniform>             d  : D;
+var<workgroup> part : array<f32, ${NR * GEMV_WG}>;
+@compute @workgroup_size(${GEMV_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>,
+        @builtin(num_workgroups) nwg:vec3<u32>) {
+  let nBase = (wg.x + wg.y*nwg.x) * ${NR}u;
+  let words = d.K / 8u; let gpr = d.K / ${QGROUP}u;
+  var acc : array<f32, ${NR}>;
+  for (var r:u32=0u; r<${NR}u; r=r+1u) { acc[r] = 0.0; }
+  var w = lid.x;
+  loop {
+    if (w >= words) { break; }
+    let xa = xq[2u*w]; let xb = xq[2u*w + 1u];
+    let grp = (w*8u)/${QGROUP}u; let xsc = xs[grp];
+    for (var r:u32=0u; r<${NR}u; r=r+1u) {
+      let n = nBase + r; if (n >= d.N) { continue; }
+      let p = W[n*words + w];
+      let lo = vec4<i32>(unpack4xU8(p & 0x0F0F0F0Fu)); let hi = vec4<i32>(unpack4xU8((p >> 4u) & 0x0F0F0F0Fu));
+      let wa = pack4xI8(vec4<i32>(lo.x,hi.x,lo.y,hi.y) - vec4<i32>(8));
+      let wb = pack4xI8(vec4<i32>(lo.z,hi.z,lo.w,hi.w) - vec4<i32>(8));
+      acc[r] = acc[r] + (f32(sc[n*gpr + grp])*xsc) * f32(dot4I8Packed(wa, xa) + dot4I8Packed(wb, xb));
+    }
+    w = w + ${GEMV_WG}u;
+  }
+${wgReduceWGSL(NR, GEMV_WG)}
+  if (lid.x < ${NR}u) {
+    let n = nBase + lid.x;
+    if (n < d.N) { y[n] = select(0.0, y[n], d.acc != 0u) + part[lid.x*${GEMV_WG}u + 0u]; }
+  }
+}`; }
+  function gemvDP4(rec, yBuf, N, K, acc) {   // caller ran quantAct(input, K) → _dp4
+    const NR = _NR(), WG = _WG();
+    const d = uniform(new Uint32Array([N, K, acc ? 1 : 0, 0]));
+    const pipe = E.getPipeline('gdn.gemvDP4.' + NR + '.' + WG, gemvDP4Wgsl(NR, WG));
+    const nWG = Math.ceil(N / NR), gx = Math.min(nWG, 65535), gy = Math.ceil(nWG / gx);
+    return E.dispatch(pipe, [_dp4.xq, rec.pack, rec.scales, _dp4.xs, yBuf, d], [gx, gy, 1]);
   }
 
   // ---- DP4A int8 GEMM for T>1 prefill (qwen3 d8db4ed recipe, via lfm25) ----
@@ -1050,9 +1147,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     const d = uniform(new Uint32Array([T, N, K, acc ? 1 : 0]));
     return E.dispatch(pipe, [_dp4g.xq, wrec.pack, wrec.scales, _dp4g.xs, yBuf, d], [Math.ceil(N / GEMMQ_BN), Math.ceil(T / GEMMQ_BM), 1]);
   }
-  // T=1 → 4-row f32-dequant GEMV; T>1 → DP4A GEMM (or batched matvecQ fallback).
+  // T=1 → tuned GEMV (q8 or dp4, per autotune); T>1 → DP4A GEMM (matvecQ fallback).
   function mv(xBuf, rec, yBuf, T, N, K, acc) {
     if (T !== 1) return (globalThis.__noDp4Gemm ? matvecQ : gemmDP4A)(xBuf, rec, yBuf, T, N, K, acc);
+    if (_tune.impl === 'dp4') { quantAct(xBuf, K); return gemvDP4(rec, yBuf, N, K, acc); }
     return gemvQ8(xBuf, rec, yBuf, N, K, acc);
   }
 
@@ -1795,8 +1893,60 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
     return (await readU32Range(_scr.tokHist, 3, 1))[0];
   }
 
+  // ============================================================
+  // GEMV AUTOTUNER — race every (impl × NR × WG) config over the model's REAL
+  // decode-GEMV shapes (weighted by per-token call count), pick the fastest.
+  // Wall-clock with a full drain per config+shape — coarse but robust (no
+  // timestamp-query dependency); differences worth acting on are >10%.
+  // ============================================================
+  async function autotune() {
+    if (!_loaded) throw new Error('loadModel first');
+    const W = (n) => _weights[n];
+    // (rec, K, per-token call weight). Covers ~all of the 26ms gemv budget:
+    // mlp gate/up ×36, down ×18 (K=3584), qkv ×18, z/out/attn-class ×~44, lm_head ×1.
+    const shapes = [
+      { rec: W('model.language_model.layers.0.mlp.gate_proj.weight'), K: 1024, w: 36, label: '3584x1024' },
+      { rec: W('model.language_model.layers.0.mlp.down_proj.weight'), K: 3584, w: 18, label: '1024x3584' },
+      { rec: W('model.language_model.layers.0.linear_attn.in_proj_qkv.weight'), K: 1024, w: 18, label: '6144x1024' },
+      { rec: W('model.language_model.layers.0.linear_attn.in_proj_z.weight'), K: 1024, w: 44, label: '2048x1024' },
+      { rec: W('lm_head.weight'), K: 1024, w: 1, label: '248320x1024' },
+    ].filter(s => s.rec && s.rec.int4);
+    const maxK = 4096, maxN = 248320;
+    const x = new Float32Array(maxK); for (let i = 0; i < maxK; i++) x[i] = Math.sin(i * 0.13);
+    const xb = E.uploadF32(x, ST()), yb = E.createBuffer(maxN * 4, ST(), 'tuneY');
+    const ITER = 6;
+    const configs = [];
+    for (const impl of ['q8', 'dp4']) for (const nr of [2, 4, 8, 16]) for (const wg of [32, 64, 128]) configs.push({ impl, nr, wg });
+    const saved = _tune;
+    const table = [];
+    for (const cfg of configs) {
+      _tune = cfg;
+      let score = 0, ok = true;
+      for (const s of shapes) {
+        try {
+          mv(xb, s.rec, yb, 1, s.rec.N, s.K, false);                       // warm (pipeline compile)
+          await E.device().queue.onSubmittedWorkDone();
+          const t0 = performance.now();
+          for (let i = 0; i < ITER; i++) mv(xb, s.rec, yb, 1, s.rec.N, s.K, false);
+          await E.device().queue.onSubmittedWorkDone();
+          score += s.w * (performance.now() - t0) / ITER;
+        } catch (_) { ok = false; break; }
+      }
+      if (ok) table.push({ ...cfg, ms: +score.toFixed(2) });
+    }
+    _tune = saved;
+    [xb, yb].forEach(b => b.destroy());
+    table.sort((a, b) => a.ms - b.ms);
+    if (table.length) {
+      _tune = { nr: table[0].nr, wg: table[0].wg, impl: table[0].impl };
+      try { console.log('[gdn] autotune → ' + JSON.stringify(_tune) + ' (' + table[0].ms + 'ms weighted; worst ' + table[table.length - 1].ms + 'ms)'); } catch (_) {}
+    }
+    return { tune: _tune, table };
+  }
+
   return {
     CONFIG, GDN_CONV_DIM, MODELS, _stageProbe, _l0Probe, _readTok, _writeTokHist, _readLast, _readLogits, _readScr, _testArgmax,
+    autotune,
     gdnConv, gdnGates, gdnQkNorm, gdnDelta, gatedRmsNorm,
     loadModel, unload, TOK, generate, forward,
     lastProf: () => _lastProf,
