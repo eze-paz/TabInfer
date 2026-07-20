@@ -46,7 +46,7 @@ const SandpieQwen35 = (function () {
   const CONFIG = {
     numLayers: 24, hidden: 1024, vocab: 248320,
     attnLayers: [3, 7, 11, 15, 19, 23],
-    nHeads: 8, nKvHeads: 2, headDim: 256, ropeTheta: 10000000, rmsEps: 1e-6,
+    nHeads: 8, nKvHeads: 2, headDim: 256, rotDim: 64, ropeTheta: 10000000, rmsEps: 1e-6,
     intermediate: 3584, tieEmbeddings: true,
     gdn: { nHeads: 16, dk: 128, dv: 128, convL: 4 },   // convDim = 16*(128+128)+16*128 = 6144
   };
@@ -116,26 +116,26 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // ============================================================
   const GATES_WGSL = `
 struct P { T:u32, V:u32, _b:u32, _c:u32 };
-@group(0) @binding(0) var<storage, read>       ba      : array<f32>;   // [T, 2V] = b|a
-@group(0) @binding(1) var<storage, read>       alog    : array<f32>;   // [V]
-@group(0) @binding(2) var<storage, read>       dtbias  : array<f32>;   // [V]
-@group(0) @binding(3) var<storage, read_write> beta    : array<f32>;   // [T, V]
-@group(0) @binding(4) var<storage, read_write> gexp    : array<f32>;   // [T, V]
-@group(0) @binding(5) var<uniform>             p       : P;
+@group(0) @binding(0) var<storage, read>       b       : array<f32>;   // [T, V] (in_proj_b output)
+@group(0) @binding(1) var<storage, read>       a       : array<f32>;   // [T, V] (in_proj_a output)
+@group(0) @binding(2) var<storage, read>       alog    : array<f32>;   // [V]
+@group(0) @binding(3) var<storage, read>       dtbias  : array<f32>;   // [V]
+@group(0) @binding(4) var<storage, read_write> beta    : array<f32>;   // [T, V]
+@group(0) @binding(5) var<storage, read_write> gexp    : array<f32>;   // [T, V]
+@group(0) @binding(6) var<uniform>             p       : P;
 fn softplus(x:f32) -> f32 { if (x > 20.0) { return x; } return log(1.0 + exp(x)); }
 @compute @workgroup_size(64,1,1)
 fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   let i = gid.x; let V = p.V;
   if (i >= p.T*V) { return; }
-  let t = i / V; let h = i % V;
-  beta[i] = 1.0 / (1.0 + exp(-ba[t*2u*V + h]));
-  let a = ba[t*2u*V + V + h];
-  gexp[i] = exp(-exp(alog[h]) * softplus(a + dtbias[h]));
+  let h = i % V;
+  beta[i] = 1.0 / (1.0 + exp(-b[i]));
+  gexp[i] = exp(-exp(alog[h]) * softplus(a[i] + dtbias[h]));
 }`;
-  function gdnGates(baBuf, alogBuf, dtbiasBuf, betaBuf, gexpBuf, T, V) {
+  function gdnGates(bBuf, aBuf, alogBuf, dtbiasBuf, betaBuf, gexpBuf, T, V) {
     const p = uniform(new Uint32Array([T, V, 0, 0]));
     const pipe = E.getPipeline('gdn.gates', GATES_WGSL);
-    return E.dispatch(pipe, [baBuf, alogBuf, dtbiasBuf, betaBuf, gexpBuf, p], [Math.ceil((T * V) / 64), 1, 1]);
+    return E.dispatch(pipe, [bBuf, aBuf, alogBuf, dtbiasBuf, betaBuf, gexpBuf, p], [Math.ceil((T * V) / 64), 1, 1]);
   }
 
   // ============================================================
@@ -189,13 +189,15 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // ============================================================
   const DELTA_WGSL = `
 struct P { T:u32, H:u32, D:u32, useState:u32 };
-@group(0) @binding(0) var<storage, read>       qkv      : array<f32>;   // [T, 3*H*D] normed q|k|v
-@group(0) @binding(1) var<storage, read>       beta     : array<f32>;   // [T, H]
-@group(0) @binding(2) var<storage, read>       gexp     : array<f32>;   // [T, H]
-@group(0) @binding(3) var<storage, read>       stateIn  : array<f32>;   // [H, D, D] (i-major: [h][i][j])
-@group(0) @binding(4) var<storage, read_write> stateOut : array<f32>;   // [H, D, D]
-@group(0) @binding(5) var<storage, read_write> o        : array<f32>;   // [T, H*D]
-@group(0) @binding(6) var<uniform>             p        : P;
+@group(0) @binding(0) var<storage, read>       qkv   : array<f32>;   // [T, 3*H*D] normed q|k|v
+@group(0) @binding(1) var<storage, read>       beta  : array<f32>;   // [T, H]
+@group(0) @binding(2) var<storage, read>       gexp  : array<f32>;   // [T, H]
+@group(0) @binding(3) var<storage, read_write> state : array<f32>;   // [H, D, D] (i-major) — SINGLE
+   // buffer, in-place: each element is read once at entry and written once at exit by
+   // exactly ONE thread (no cross-thread state access), so no double-buffer is needed —
+   // and a separate read binding of the same buffer would be illegal binding aliasing.
+@group(0) @binding(4) var<storage, read_write> o     : array<f32>;   // [T, H*D]
+@group(0) @binding(5) var<uniform>             p     : P;
 var<workgroup> red : array<f32, 128>;
 var<workgroup> kvm : f32;
 @compute @workgroup_size(128,1,1)
@@ -204,7 +206,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   let h = wg.x / D; let j = wg.x % D;
   let i = lid.x;
   var s = 0.0;
-  if (p.useState != 0u) { s = stateIn[(h*D + i)*D + j]; }
+  if (p.useState != 0u) { s = state[(h*D + i)*D + j]; }
   for (var t:u32 = 0u; t < p.T; t = t + 1u) {
     let row = t*C;
     let kt = qkv[row + H*D + h*D + i];
@@ -229,12 +231,12 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if (i == 0u) { o[t*H*D + h*D + j] = red[0]; }
     workgroupBarrier();
   }
-  stateOut[(h*D + i)*D + j] = s;
+  state[(h*D + i)*D + j] = s;
 }`;
-  function gdnDelta(qkvBuf, betaBuf, gexpBuf, stateInBuf, stateOutBuf, oBuf, T, H, D, useState) {
+  function gdnDelta(qkvBuf, betaBuf, gexpBuf, stateBuf, oBuf, T, H, D, useState) {
     const p = uniform(new Uint32Array([T, H, D, useState ? 1 : 0]));
     const pipe = E.getPipeline('gdn.delta', DELTA_WGSL);
-    return E.dispatch(pipe, [qkvBuf, betaBuf, gexpBuf, stateInBuf, stateOutBuf, oBuf, p], [H * D, 1, 1]);
+    return E.dispatch(pipe, [qkvBuf, betaBuf, gexpBuf, stateBuf, oBuf, p], [H * D, 1, 1]);
   }
 
   // ============================================================
@@ -244,11 +246,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // NOTE: norm FIRST, then gate — this is NOT the Mamba2 order.
   // ============================================================
   const GNORM_WGSL = `
-enable f16;
 struct P { T:u32, H:u32, D:u32, eps:f32 };
 @group(0) @binding(0) var<storage, read>       o   : array<f32>;   // [T, H*D]
 @group(0) @binding(1) var<storage, read>       z   : array<f32>;   // [T, H*D]
-@group(0) @binding(2) var<storage, read>       w   : array<f16>;   // [D]
+@group(0) @binding(2) var<storage, read>       w   : array<f32>;   // [D] (ships F32 in the checkpoint — kept exact)
 @group(0) @binding(3) var<storage, read_write> out : array<f32>;   // [T, H*D]
 @group(0) @binding(4) var<uniform>             p   : P;
 var<workgroup> red : array<f32, 128>;
@@ -267,7 +268,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   }
   let inv = inverseSqrt(red[0] / f32(D) + p.eps);
   let zg = z[base + i];
-  out[base + i] = v * inv * f32(w[i]) * (zg / (1.0 + exp(-zg)));
+  out[base + i] = v * inv * w[i] * (zg / (1.0 + exp(-zg)));
 }`;
   function gatedRmsNorm(oBuf, zBuf, wBuf, outBuf, T, H, D, eps) {
     const pb = new ArrayBuffer(16); const dv = new DataView(pb);
@@ -368,19 +369,20 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     // --- gdnGates: beta/gexp formulas ---
     {
       const T = 5, V = 16;
-      const ba = new Float32Array(T * 2 * V); for (let i = 0; i < ba.length; i++) ba[i] = Math.sin(i * 0.31) * 2;
+      const bIn = new Float32Array(T * V), aIn = new Float32Array(T * V);
+      for (let i = 0; i < T * V; i++) { bIn[i] = Math.sin(i * 0.31) * 2; aIn[i] = Math.cos(i * 0.41) * 2; }
       const alog = new Float32Array(V); for (let i = 0; i < V; i++) alog[i] = Math.log(0.5 + i * 0.4);
       const dtb = new Float32Array(V); dtb.fill(1);
       const refB = new Float32Array(T * V), refG = new Float32Array(T * V);
-      for (let t = 0; t < T; t++) for (let h = 0; h < V; h++) {
-        refB[t * V + h] = 1 / (1 + Math.exp(-ba[t * 2 * V + h]));
-        refG[t * V + h] = Math.exp(-Math.exp(alog[h]) * softplus(ba[t * 2 * V + V + h] + dtb[h]));
+      for (let i = 0; i < T * V; i++) {
+        refB[i] = 1 / (1 + Math.exp(-bIn[i]));
+        refG[i] = Math.exp(-Math.exp(alog[i % V]) * softplus(aIn[i] + dtb[i % V]));
       }
-      const bab = f32buf(ba), ab = f32buf(alog), db = f32buf(dtb), bb = E.createBuffer(T * V * 4, ST(), 'b'), gb = E.createBuffer(T * V * 4, ST(), 'g');
-      await gdnGates(bab, ab, db, bb, gb, T, V);
+      const b0 = f32buf(bIn), a0 = f32buf(aIn), ab = f32buf(alog), db = f32buf(dtb), bb = E.createBuffer(T * V * 4, ST(), 'b'), gb = E.createBuffer(T * V * 4, ST(), 'g');
+      await gdnGates(b0, a0, ab, db, bb, gb, T, V);
       check('gdn gates (beta)', maxAbs(await E.readF32(bb, T * V), refB), 1e-5);
       check('gdn gates (gexp)', maxAbs(await E.readF32(gb, T * V), refG), 1e-5);
-      [bab, ab, db, bb, gb].forEach(b => b.destroy());
+      [b0, a0, ab, db, bb, gb].forEach(b => b.destroy());
     }
 
     // --- gdnQkNorm: in-place per-head l2 norm, q scaled ---
@@ -403,11 +405,11 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       for (let i = 0; i < T * H; i++) { beta[i] = 0.3 + 0.6 * Math.abs(Math.sin(i)); gexp[i] = 0.85 + 0.14 * Math.abs(Math.cos(i * 0.7)); }
       const ref = deltaRef(qkv, beta, gexp, null, T, H, D, 0);
       const qb = f32buf(qkv), bb = f32buf(beta), gb = f32buf(gexp);
-      const s0 = f32buf(new Float32Array(H * D * D)), s1 = E.createBuffer(H * D * D * 4, ST(), 'ds1'), ob = E.createBuffer(T * H * D * 4, ST(), 'do');
-      await gdnDelta(qb, bb, gb, s0, s1, ob, T, H, D, false);
+      const sb = E.createBuffer(H * D * D * 4, ST(), 'ds'), ob = E.createBuffer(T * H * D * 4, ST(), 'do');
+      await gdnDelta(qb, bb, gb, sb, ob, T, H, D, false);
       check('gdn delta (prefill o)', maxAbs(await E.readF32(ob, T * H * D), ref.o), 2e-3);
-      check('gdn delta (prefill state)', maxAbs(await E.readF32(s1, H * D * D), ref.S), 2e-3);
-      [qb, bb, gb, s0, s1, ob].forEach(b => b.destroy());
+      check('gdn delta (prefill state)', maxAbs(await E.readF32(sb, H * D * D), ref.S), 2e-3);
+      [qb, bb, gb, sb, ob].forEach(b => b.destroy());
     }
 
     // --- gdnDelta: LONG state continuity — 512 tokens as 8×64-chunks ≡ one T=512 CPU pass.
@@ -421,20 +423,19 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       for (let i = 0; i < T * H; i++) { beta[i] = 0.2 + 0.7 * Math.abs(Math.sin(i * 0.3)); gexp[i] = 0.9 + 0.099 * Math.abs(Math.cos(i * 0.11)); }
       const ref = deltaRef(qkv, beta, gexp, null, T, H, D, 0);
       const rowC = 3 * H * D;
-      let sIn = f32buf(new Float32Array(H * D * D)), sOut = E.createBuffer(H * D * D * 4, ST(), 'ls');
+      const sb = E.createBuffer(H * D * D * 4, ST(), 'ls');   // single in-place state, as the forward uses it
       const gotO = new Float32Array(T * H * D);
       for (let c = 0; c < T / CH; c++) {
         const qb = f32buf(qkv.slice(c * CH * rowC, (c + 1) * CH * rowC));
         const bb = f32buf(beta.slice(c * CH * H, (c + 1) * CH * H));
         const gb = f32buf(gexp.slice(c * CH * H, (c + 1) * CH * H));
         const ob = E.createBuffer(CH * H * D * 4, ST(), 'lo');
-        await gdnDelta(qb, bb, gb, sIn, sOut, ob, CH, H, D, c > 0);
+        await gdnDelta(qb, bb, gb, sb, ob, CH, H, D, c > 0);
         gotO.set(await E.readF32(ob, CH * H * D), c * CH * H * D);
         [qb, bb, gb, ob].forEach(b => b.destroy());
-        const tmp = sIn; sIn = sOut; sOut = tmp;
       }
       check('gdn delta (512-tok chunked continuity)', maxAbs(gotO, ref.o), 5e-3);
-      [sIn, sOut].forEach(b => b.destroy());
+      sb.destroy();
     }
 
     // --- gatedRmsNorm: norm-then-gate order ---
@@ -450,9 +451,9 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         const inv = 1 / Math.sqrt(ss / D + eps);
         for (let i = 0; i < D; i++) ref[base + i] = o[base + i] * inv * w[i] * silu(z[base + i]);
       }
-      const ob = f32buf(o), zb = f32buf(z), wb = f16buf(w), rb = E.createBuffer(T * H * D * 4, ST(), 'gn');
+      const ob = f32buf(o), zb = f32buf(z), wb = f32buf(w), rb = E.createBuffer(T * H * D * 4, ST(), 'gn');
       await gatedRmsNorm(ob, zb, wb, rb, T, H, D, eps);
-      check('gdn gated rmsnorm (norm-before-gate)', maxAbs(await E.readF32(rb, T * H * D), ref), 5e-3);
+      check('gdn gated rmsnorm (norm-before-gate)', maxAbs(await E.readF32(rb, T * H * D), ref), 1e-4);
       [ob, zb, wb, rb].forEach(b => b.destroy());
     }
 
@@ -590,16 +591,18 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   const EMBED = 'model.language_model.embed_tokens.weight';
 
   // q_proj rows are per-head interleaved [q(256)|gate(256)]×8 (torch.chunk on the
-  // reshaped [..., head, 2*hd] output). Permute rows → [all q | all gate] once here
-  // so Phase C's projections are two contiguous halves. Zero runtime cost.
-  function _permuteQGate(u16, rows, K, headDim) {
-    const out = new Uint16Array(u16.length);
+  // reshaped [..., head, 2*hd] output). SPLIT into two separate weight tensors at
+  // load — q rows must be contiguous [T, nH*hd] for ropeQK (a single permuted
+  // tensor would give q a T-row stride of 2*nH*hd). Zero runtime cost.
+  function _splitQGate(u16, rows, K, headDim) {
+    const half = rows / 2;
+    const q = new Uint16Array(half * K), g = new Uint16Array(half * K);
     const nH = rows / (2 * headDim);
     for (let h = 0; h < nH; h++) for (let d = 0; d < headDim; d++) {
-      out.set(u16.subarray((h * 2 * headDim + d) * K, (h * 2 * headDim + d + 1) * K), (h * headDim + d) * K);                       // q half
-      out.set(u16.subarray((h * 2 * headDim + headDim + d) * K, (h * 2 * headDim + headDim + d + 1) * K), (rows / 2 + h * headDim + d) * K);   // gate half
+      q.set(u16.subarray((h * 2 * headDim + d) * K, (h * 2 * headDim + d + 1) * K), (h * headDim + d) * K);
+      g.set(u16.subarray((h * 2 * headDim + headDim + d) * K, (h * 2 * headDim + headDim + d + 1) * K), (h * headDim + d) * K);
     }
-    return out;
+    return { q, g };
   }
 
   async function _uploadTensor(name, info, raw, sink) {
@@ -616,7 +619,22 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       return;
     }
     let u16 = new Uint16Array(raw.buffer, raw.byteOffset, numel);
-    if (/self_attn\.q_proj\.weight$/.test(name)) u16 = _permuteQGate(u16, info.shape[0], info.shape[1], _cfg.headDim);
+    if (/self_attn\.q_proj\.weight$/.test(name)) {
+      // split fused [q|gate]-per-head projection into two int4 tensors
+      const rows = info.shape[0], K = info.shape[1], half = rows / 2;
+      const { q, g } = _splitQGate(u16, rows, K, _cfg.headDim);
+      const store = async (nm, u) => {
+        const { pack, scales } = _quantInt4(u, half, K);
+        const packBuf = E.createBuffer(pack.byteLength, ST(), nm + '.pack');
+        const scBuf = E.createBuffer(scales.byteLength, ST(), nm + '.sc');
+        put(packBuf, pack); put(scBuf, scales);
+        _weights[nm] = { pack: packBuf, scales: scBuf, N: half, K, int4: true, shape: [half, K] };
+        if (sink) { await sink.add(nm, 'pack', pack, { kind: 'int4', shape: [half, K], N: half, K }); await sink.add(nm, 'scales', scales, { kind: 'int4', shape: [half, K], N: half, K }); }
+      };
+      await store(name, q);
+      await store(name.replace('q_proj', 'out_gate'), g);
+      return;
+    }
     if (_isInt4(name) && info.shape.length >= 2 && (info.shape[info.shape.length - 1] % QGROUP) === 0) {
       const K = info.shape[info.shape.length - 1], rows = numel / K;
       const { pack, scales } = _quantInt4(u16, rows, K);
@@ -633,7 +651,17 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
       _weights[name] = { buf, f32: true, shape: info.shape };
       if (sink) await sink.add(name, 'buf', f32, { kind: 'f32', shape: info.shape });
     } else {
-      const bits = info.dtype === 'BF16' ? _bf16ToF16bits(u16) : u16;
+      let bits = info.dtype === 'BF16' ? _bf16ToF16bits(u16) : u16;
+      // ZERO-CENTERED RMSNorm (Qwen3_5RMSNorm): checkpoint stores weight-1 (zeros-init),
+      // forward multiplies by (1.0 + weight). Bake the +1 in at load so the plain
+      // rmsnorm/ropeQK kernels stay unchanged. Does NOT apply to linear_attn.norm
+      // (Qwen3_5RMSNormGated is ones-init, plain multiply).
+      if (/(input_layernorm|post_attention_layernorm|q_norm|k_norm|language_model\.norm)\.weight$/.test(name)) {
+        const t = new Float32Array(1), ti = new Uint32Array(t.buffer);
+        const f = new Float32Array(numel);
+        for (let i = 0; i < numel; i++) { ti[0] = u16[i] << 16; f[i] = t[0] + 1.0; }   // u16 is BF16 here
+        bits = E.f32ToF16(f);
+      }
       const buf = E.createBuffer(numel * 2, ST(), name);
       put(buf, bits);
       _weights[name] = { buf, shape: info.shape };
@@ -655,7 +683,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // ---- persistent quantized-weights cache (lfm25/qwen3 design; namespaced /gdn/).
   // GPU-ready bytes in fixed 64MiB chunks; manifest written LAST = commit point.
   const QC_NAME = 'sandpie-webgpu-quant';
-  const QC_VER = 1;
+  const QC_VER = 3;   // v3: zero-centered RMSNorm weights stored as (1+w); v2: q_proj split q/out_gate
   const QC_CHUNK = 64 * 1024 * 1024;
   const _qcUrl = (variant, part) => 'https://sandpie.quant/gdn/v' + QC_VER + '/' + variant + '/' + part;
   function _makeSink(variant) {
@@ -1349,11 +1377,430 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>, @builtin(num_workgroups) n
     return { ok: fails.length === 0, results: out };
   }
 
+  // ============================================================
+  // PHASE C — forward graph + generate (lfm25 structure).
+  // ============================================================
+  // Tiny f16-weight matvec for in_proj_b / in_proj_a ([16,1024] — kept f16 for
+  // exact decay/beta gates; the int4 GEMVs only serve quantized recs).
+  const MVF16_WGSL = `
+enable f16;
+struct D { T:u32, N:u32, K:u32, _p:u32 };
+@group(0) @binding(0) var<storage, read>       x : array<f32>;
+@group(0) @binding(1) var<storage, read>       W : array<f16>;
+@group(0) @binding(2) var<storage, read_write> y : array<f32>;
+@group(0) @binding(3) var<uniform>             d : D;
+var<workgroup> red : array<f32, 64>;
+@compute @workgroup_size(64,1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  let t = wg.x / d.N; let n = wg.x % d.N;
+  var acc = 0.0;
+  var k = lid.x;
+  loop { if (k >= d.K) { break; } acc = acc + f32(W[n*d.K + k]) * x[t*d.K + k]; k = k + 64u; }
+  red[lid.x] = acc; workgroupBarrier();
+  var s = 32u; loop { if (s==0u) { break; } if (lid.x < s) { red[lid.x] = red[lid.x] + red[lid.x+s]; } workgroupBarrier(); s = s/2u; }
+  if (lid.x == 0u) { y[t*d.N + n] = red[0]; }
+}`;
+  function mvF16(xBuf, wBuf, yBuf, T, N, K) {
+    const d = uniform(new Uint32Array([T, N, K, 0]));
+    return E.dispatch(E.getPipeline('gdn.mvf16', MVF16_WGSL), [xBuf, wBuf, yBuf, d], [T * N, 1, 1]);
+  }
+
+  // GPU argmax logits → tokHist[outPos] (lfm25 two-pass, verbatim).
+  const ARGMAX_WG = 256, AMAX_WGS = 64;
+  const AMAX_P1_WGSL = `
+struct P { n:u32, outPos:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       logits : array<f32>;
+@group(0) @binding(1) var<storage, read_write> pV : array<f32>;
+@group(0) @binding(2) var<storage, read_write> pI : array<u32>;
+@group(0) @binding(3) var<uniform>             p  : P;
+var<workgroup> sv : array<f32, ${ARGMAX_WG}>;
+var<workgroup> si : array<u32, ${ARGMAX_WG}>;
+@compute @workgroup_size(${ARGMAX_WG},1,1)
+fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:vec3<u32>){
+  var bv=-3.0e38; var bi=0u;
+  var i = wg.x*${ARGMAX_WG}u + lid.x;
+  loop { if (i>=p.n) {break;} let v=logits[i]; if (v>bv){bv=v;bi=i;} i=i+${AMAX_WGS * ARGMAX_WG}u; }
+  sv[lid.x]=bv; si[lid.x]=bi; workgroupBarrier();
+  var s=${ARGMAX_WG}u/2u;
+  loop { if(s==0u){break;} if(lid.x<s){ if(sv[lid.x+s]>sv[lid.x]){sv[lid.x]=sv[lid.x+s];si[lid.x]=si[lid.x+s];} } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u){ pV[wg.x]=sv[0]; pI[wg.x]=si[0]; }
+}`;
+  const AMAX_P2_WGSL = `
+struct P { n:u32, outPos:u32, _b:u32, _c:u32 };
+@group(0) @binding(0) var<storage, read>       pV : array<f32>;
+@group(0) @binding(1) var<storage, read>       pI : array<u32>;
+@group(0) @binding(2) var<storage, read_write> tok: array<u32>;
+@group(0) @binding(3) var<uniform>             p  : P;
+var<workgroup> sv : array<f32, ${AMAX_WGS}>;
+var<workgroup> si : array<u32, ${AMAX_WGS}>;
+@compute @workgroup_size(${AMAX_WGS},1,1)
+fn main(@builtin(local_invocation_id) lid:vec3<u32>){
+  sv[lid.x]=pV[lid.x]; si[lid.x]=pI[lid.x]; workgroupBarrier();
+  var s=${AMAX_WGS}u/2u;
+  loop { if(s==0u){break;} if(lid.x<s){ if(sv[lid.x+s]>sv[lid.x]){sv[lid.x]=sv[lid.x+s];si[lid.x]=si[lid.x+s];} } workgroupBarrier(); s=s/2u; }
+  if (lid.x==0u){ tok[p.outPos]=si[0]; }
+}`;
+  let _amaxV = null, _amaxI = null;
+  function argmaxKernel(logitsBuf, tokHistBuf, N, outPos) {
+    if (!_amaxV) { _amaxV = E.createBuffer(AMAX_WGS * 4, ST(), 'amV'); _amaxI = E.createBuffer(AMAX_WGS * 4, ST(), 'amI'); }
+    const p = uniform(new Uint32Array([N, outPos, 0, 0]));
+    E.dispatch(E.getPipeline('gdn.amaxP1', AMAX_P1_WGSL), [logitsBuf, _amaxV, _amaxI, p], [AMAX_WGS, 1, 1]);
+    return E.dispatch(E.getPipeline('gdn.amaxP2', AMAX_P2_WGSL), [_amaxV, _amaxI, tokHistBuf, p], [1, 1, 1]);
+  }
+
+  // ---- forward state ----------------------------------------------------
+  // KV only on the 6 attention layers; GDN layers carry (a) a conv tail
+  // [convDim, L-1] ×2 (double-buffered — carry readers/writer are in different
+  // workgroups) and (b) the delta state [16,128,128] f32, SINGLE-buffered:
+  // gdnDelta reads each element into a register once at entry and writes it
+  // once at exit, and each element is owned by exactly one thread → in-place
+  // is race-free (double-buffering would cost 8MB/layer for nothing).
+  let MAX_SEQ = 8192;
+  let PREFILL_T = 128;   // prefill chunk (DP4A GEMM path); GDN recurrence loops T inside its kernel
+  let _scr = null, _kv = null, _gdnState = null, _idsBuf = null;
+  function _ensureState() {
+    if (_scr) return;
+    const C = _cfg, H = C.hidden, T = Math.max(MATVEC_MAXT, PREFILL_T);
+    const G = C.gdn, CD = GDN_CONV_DIM, HV = G.nHeads * G.dv;   // 2048
+    const mk = (n, l) => E.createBuffer(n * 4, ST(), l);
+    _scr = {
+      x: mk(T * H, 'x'), normed: mk(T * H, 'nrm'),
+      qkv: mk(T * CD, 'qkv'), qkvc: mk(T * CD, 'qkvc'),
+      bproj: mk(T * G.nHeads, 'bp'), aproj: mk(T * G.nHeads, 'ap'),
+      beta: mk(T * G.nHeads, 'be'), gexp: mk(T * G.nHeads, 'ge'),
+      gdnO: mk(T * HV, 'go'), z: mk(T * HV, 'z'), gnorm: mk(T * HV, 'gn'),
+      q: mk(T * C.nHeads * C.headDim, 'q'), k: mk(T * C.nKvHeads * C.headDim, 'k'), v: mk(T * C.nKvHeads * C.headDim, 'v'),
+      qr: mk(T * C.nHeads * C.headDim, 'qr'), kr: mk(T * C.nKvHeads * C.headDim, 'kr'),
+      attn: mk(T * C.nHeads * C.headDim, 'at'), agate: mk(T * C.nHeads * C.headDim, 'ag'),
+      gate: mk(T * C.intermediate, 'g'), up: mk(T * C.intermediate, 'u'), swi: mk(T * C.intermediate, 's'),
+      last: mk(H, 'last'), logits: mk(C.vocab, 'lg'),
+      tokHist: E.createBuffer(MAX_SEQ * 4, U.STORAGE | U.COPY_DST | U.COPY_SRC, 'th'),
+    };
+    _kv = {}; _gdnState = {};
+    for (let l = 0; l < C.numLayers; l++) {
+      if (C.attnLayers.includes(l)) _kv[l] = { k: mk(MAX_SEQ * C.nKvHeads * C.headDim, 'k' + l), v: mk(MAX_SEQ * C.nKvHeads * C.headDim, 'v' + l) };
+      else _gdnState[l] = {
+        convA: mk(CD * (G.convL - 1), 'ca' + l), convB: mk(CD * (G.convL - 1), 'cb' + l), cur: 0,
+        S: mk(G.nHeads * G.dk * G.dv, 'S' + l),
+      };
+    }
+  }
+  function _freeState() {
+    const kill = (o) => { for (const k in o) { const v = o[k]; if (v && v.destroy) try { v.destroy(); } catch (_) {} else if (v && typeof v === 'object') kill(v); } };
+    if (_scr) kill(_scr); if (_kv) kill(_kv); if (_gdnState) kill(_gdnState);
+    if (_idsBuf) try { _idsBuf.destroy(); } catch (_) {}
+    try { if (_amaxV) { _amaxV.destroy(); _amaxI.destroy(); } } catch (_) {}
+    try { if (_dp4g) { _dp4g.xq.destroy(); _dp4g.xs.destroy(); } } catch (_) {}
+    _scr = null; _kv = null; _gdnState = null; _idsBuf = null; _amaxV = null; _amaxI = null; _dp4g = null;
+  }
+
+  // One forward over T tokens at absolute positions [posBase, posBase+T).
+  // opts.chain: embed reads tokHist[posBase] (GPU-resident decode chaining);
+  // opts.argmax: GPU-argmax final logits → tokHist[posBase+T]; opts.batched:
+  // caller owns beginBatch/endBatch.
+  async function forward(idsArr, posBase, opts) {
+    opts = opts || {};
+    const C = _cfg, H = C.hidden, T = opts.chain ? 1 : idsArr.length, S = posBase + T;
+    const G = C.gdn, CD = GDN_CONV_DIM, HV = G.nHeads * G.dv;
+    const W = (n) => _weights[n];
+    _ensureState();
+    const s = _scr;
+    if (!opts.chain) {
+      if (!_idsBuf) _idsBuf = E.createBuffer(Math.max(MATVEC_MAXT, PREFILL_T) * 4, U.STORAGE | U.COPY_DST, 'ids');
+      E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(idsArr));
+    }
+    uniformReset();
+    // (The earlier "flush>4 corrupts" finding was a red herring: a stale 7-arg
+    // gdnDelta call passed a GPUBuffer as T→0, freezing s.gdnO at whatever the
+    // last diagnostic probe left in it — run-order-dependent, mimicking a batching
+    // race. Default flush restored; __gdnFlush kept as a debug override.)
+    if (!opts.batched) E.beginBatch((globalThis.__gdnFlush | 0) || undefined);
+    const P = (l) => 'model.language_model.layers.' + l + '.';
+    if (opts.chain) await embedGather(s.tokHist, W(EMBED).buf, s.x, T, H, posBase);
+    else await embedGather(_idsBuf, W(EMBED).buf, s.x, T, H, 0);
+    const _stopL = opts.stopLayer !== undefined ? opts.stopLayer : C.numLayers;
+    for (let l = 0; l < _stopL; l++) {
+      const p = P(l);
+      await rmsnorm(s.x, W(p + 'input_layernorm.weight').buf, s.normed, T, H, C.rmsEps);
+      if (_gdnState[l]) {   // Gated DeltaNet block
+        const st = _gdnState[l];
+        await mv(s.normed, W(p + 'linear_attn.in_proj_qkv.weight'), s.qkv, T, CD, H);
+        const cIn = st.cur === 0 ? st.convA : st.convB, cOut = st.cur === 0 ? st.convB : st.convA;
+        await gdnConv(s.qkv, W(p + 'linear_attn.conv1d.weight').buf, cIn, cOut, s.qkvc, T, CD, G.convL, posBase > 0);
+        st.cur ^= 1;
+        await gdnQkNorm(s.qkvc, T, G.nHeads, G.dk, CD);
+        await mvF16(s.normed, W(p + 'linear_attn.in_proj_b.weight').buf, s.bproj, T, G.nHeads, H);
+        await mvF16(s.normed, W(p + 'linear_attn.in_proj_a.weight').buf, s.aproj, T, G.nHeads, H);
+        await gdnGates(s.bproj, s.aproj, W(p + 'linear_attn.A_log').buf, W(p + 'linear_attn.dt_bias').buf, s.beta, s.gexp, T, G.nHeads);
+        await gdnDelta(s.qkvc, s.beta, s.gexp, st.S, s.gdnO, T, G.nHeads, G.dk, posBase > 0);
+        await mv(s.normed, W(p + 'linear_attn.in_proj_z.weight'), s.z, T, HV, H);
+        await gatedRmsNorm(s.gdnO, s.z, W(p + 'linear_attn.norm.weight').buf, s.gnorm, T, G.nHeads, G.dv, C.rmsEps);
+        await mv(s.gnorm, W(p + 'linear_attn.out_proj.weight'), s.x, T, H, HV, true);   // + residual
+      } else {              // gated GQA attention
+        const nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim;
+        await mv(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+        await mv(s.normed, W(p + 'self_attn.out_gate.weight'), s.agate, T, nHq * hd, H);
+        await mv(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+        await mv(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+        await ropeQK(s.q, W(p + 'self_attn.q_norm.weight').buf, s.qr, T, nHq, hd, posBase, C.ropeTheta, C.rmsEps, C.rotDim);
+        await ropeQK(s.k, W(p + 'self_attn.k_norm.weight').buf, s.kr, T, nKv, hd, posBase, C.ropeTheta, C.rmsEps, C.rotDim);
+        E.copyBuffer(s.kr, 0, _kv[l].k, posBase * nKv * hd * 4, T * nKv * hd * 4);
+        E.copyBuffer(s.v, 0, _kv[l].v, posBase * nKv * hd * 4, T * nKv * hd * 4);
+        await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, S, nHq, nKv, hd);
+        await mulSigmoid(s.attn, s.agate, T * nHq * hd);
+        await mv(s.attn, W(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);   // + residual
+      }
+      await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight').buf, s.normed, T, H, C.rmsEps);
+      const I = C.intermediate;
+      await mv(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+      await mv(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+      await swiglu(s.gate, s.up, s.swi, T * I);
+      await mv(s.swi, W(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);                // + residual
+      if (opts.syncLayers) { await E.device().queue.onSubmittedWorkDone(); }             // debug knob
+    }
+    await rmsnorm(s.x, W('model.language_model.norm.weight').buf, s.normed, T, H, C.rmsEps);
+    E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
+    await mv(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
+    if (opts.argmax) await argmaxKernel(s.logits, s.tokHist, C.vocab, posBase + T);
+    if (!opts.batched) await E.endBatch();
+  }
+
+  async function readU32Range(buf, idx, count) {
+    const bytes = count * 4;
+    const staging = E.createBuffer(bytes, U.COPY_DST | U.MAP_READ, 'rd');
+    const enc = E.device().createCommandEncoder();
+    enc.copyBufferToBuffer(buf, idx * 4, staging, 0, bytes);
+    E.device().queue.submit([enc.finish()]);
+    await staging.mapAsync(GPUMapMode.READ);
+    const out = new Uint32Array(staging.getMappedRange().slice(0));
+    staging.unmap(); staging.destroy();
+    return out;
+  }
+
+  const GEN_BATCH = 8, PIPE_DEPTH = 3;
+  // Deep-pipelined greedy decode (lfm25 design): GEN_BATCH chained forwards per
+  // submit (GPU argmax → tokHist, no per-token readback), PIPE_DEPTH batches in
+  // flight so CPU-encode, GPU-compute and readback overlap.
+  async function _pipeDecode(startPos, maxTokens, emitTok, signal) {
+    let pos = startPos, submitted = 0;
+    const submitBatch = async () => {
+      if (signal && signal.aborted) return null;
+      const K = Math.min(GEN_BATCH, maxTokens - submitted, MAX_SEQ - 1 - pos);
+      if (K <= 0) return null;
+      const base = pos;
+      E.beginBatch((globalThis.__gdnFlush | 0) || undefined);
+      for (let k = 0; k < K; k++) await forward(null, base + k, { chain: true, argmax: true, batched: true });
+      E.endBatch();
+      pos += K; submitted += K;
+      return { read: readU32Range(_scr.tokHist, base + 1, K), K };
+    };
+    const inflight = [];
+    while (inflight.length < PIPE_DEPTH) { const b = await submitBatch(); if (!b) break; inflight.push(b); }
+    while (inflight.length) {
+      const cur = inflight.shift();
+      const toks = await cur.read;
+      let stop = false;
+      for (let k = 0; k < cur.K; k++) { if (!emitTok(toks[k])) { stop = true; break; } }
+      if (stop) break;
+      const b = await submitBatch(); if (b) inflight.push(b);
+    }
+  }
+
+  async function generate(prompt, { maxTokens = 64, onToken, signal } = {}) {
+    if (!_loaded) throw new Error('loadModel first');
+    const C = _cfg;
+    const ids = Array.isArray(prompt) ? TOK.encodeChat(prompt) : TOK.encodeChat([{ role: 'user', content: prompt }]);
+    if (ids.length + maxTokens + 2 > MAX_SEQ) throw new Error('prompt too long: ' + ids.length + ' + ' + maxTokens + ' > ' + MAX_SEQ);
+    _ensureState();
+    E.device().queue.writeBuffer(_scr.tokHist, 0, new Uint32Array(ids));
+    // NOTE: GDN state persists across calls — a fresh generation must start clean.
+    // posBase===0 tells gdnConv/gdnDelta useState=0 (zero-init), so no explicit clear needed.
+    let pos = 0;
+    const t0p = performance.now();
+    const CH = PREFILL_T;
+    for (let off = 0; off < ids.length; off += CH) {
+      if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
+      const chunk = ids.slice(off, Math.min(off + CH, ids.length));
+      await forward(chunk, pos, { argmax: off + CH >= ids.length });
+      pos += chunk.length;
+    }
+    const prefillMs = performance.now() - t0p;
+    const outIds = [], imEnd = TOK.imEnd();
+    const t0 = performance.now();
+    let stopped = false;
+    { const f = (await readU32Range(_scr.tokHist, ids.length, 1))[0];
+      if (f === C.eos || f === imEnd) stopped = true;
+      else { outIds.push(f); if (onToken) { try { onToken(TOK.decode([f]), f); } catch (_) {} } } }
+    if (!stopped) {
+      await _pipeDecode(pos, maxTokens, (t) => {
+        if (t === C.eos || t === imEnd) return false;
+        outIds.push(t); if (onToken) { try { onToken(TOK.decode(outIds.slice(-4)).slice(-24), t); } catch (_) {} }
+        return outIds.length < maxTokens;
+      }, signal);
+    }
+    _lastProf = {
+      prefillToks: ids.length, prefillTps: +(ids.length / Math.max(1e-3, prefillMs / 1000)).toFixed(1),
+      decodeToks: outIds.length, decodeTps: +(outIds.length / Math.max(1e-3, (performance.now() - t0) / 1000)).toFixed(2),
+    };
+    try { console.log('[gdn prof] ' + JSON.stringify(_lastProf)); } catch (_) {}
+    return TOK.decode(outIds);
+  }
+  let _lastProf = null;
+
+  // DIAGNOSTIC: run one non-chained forward over `text` tokens and report stats of
+  // s.x (residual stream) after embed and after EVERY layer, plus final logits stats.
+  // The all-"!" bisector: find the first stage where activations go zero/NaN/flat.
+  async function _stageProbe(text) {
+    if (!_loaded) throw new Error('loadModel first');
+    const C = _cfg, H = C.hidden;
+    const ids = TOK.encodeText(text || 'The capital of France is');
+    const T = ids.length;
+    _ensureState();
+    const stats = async (buf, n, label) => {
+      const a = await E.readF32(buf, n);
+      let mn = Infinity, mx = -Infinity, sum = 0, nan = 0, zero = 0;
+      for (let i = 0; i < n; i++) { const v = a[i]; if (Number.isNaN(v)) { nan++; continue; } if (v === 0) zero++; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+      return { label, min: +mn.toFixed(4), max: +mx.toFixed(4), mean: +(sum / n).toFixed(6), nan, zeroPct: +(zero / n * 100).toFixed(1) };
+    };
+    const out = [];
+    const s = _scr;
+    if (!_idsBuf) _idsBuf = E.createBuffer(Math.max(MATVEC_MAXT, PREFILL_T) * 4, U.STORAGE | U.COPY_DST, 'ids');
+    E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(ids));
+    uniformReset();
+    await embedGather(_idsBuf, _weights[EMBED].buf, s.x, T, H, 0);
+    out.push(await stats(s.x, T * H, 'embed'));
+    const G = C.gdn, CD = GDN_CONV_DIM, HV = G.nHeads * G.dv;
+    const W = (n) => _weights[n];
+    for (let l = 0; l < C.numLayers; l++) {
+      const p = 'model.language_model.layers.' + l + '.';
+      uniformReset();
+      E.beginBatch();
+      await rmsnorm(s.x, W(p + 'input_layernorm.weight').buf, s.normed, T, H, C.rmsEps);
+      if (_gdnState[l]) {
+        const st = _gdnState[l];
+        await mv(s.normed, W(p + 'linear_attn.in_proj_qkv.weight'), s.qkv, T, CD, H);
+        const cIn = st.cur === 0 ? st.convA : st.convB, cOut = st.cur === 0 ? st.convB : st.convA;
+        await gdnConv(s.qkv, W(p + 'linear_attn.conv1d.weight').buf, cIn, cOut, s.qkvc, T, CD, G.convL, false);
+        st.cur ^= 1;
+        await gdnQkNorm(s.qkvc, T, G.nHeads, G.dk, CD);
+        await mvF16(s.normed, W(p + 'linear_attn.in_proj_b.weight').buf, s.bproj, T, G.nHeads, H);
+        await mvF16(s.normed, W(p + 'linear_attn.in_proj_a.weight').buf, s.aproj, T, G.nHeads, H);
+        await gdnGates(s.bproj, s.aproj, W(p + 'linear_attn.A_log').buf, W(p + 'linear_attn.dt_bias').buf, s.beta, s.gexp, T, G.nHeads);
+        await gdnDelta(s.qkvc, s.beta, s.gexp, st.S, s.gdnO, T, G.nHeads, G.dk, false);
+        await mv(s.normed, W(p + 'linear_attn.in_proj_z.weight'), s.z, T, HV, H);
+        await gatedRmsNorm(s.gdnO, s.z, W(p + 'linear_attn.norm.weight').buf, s.gnorm, T, G.nHeads, G.dv, C.rmsEps);
+        await mv(s.gnorm, W(p + 'linear_attn.out_proj.weight'), s.x, T, H, HV, true);
+      } else {
+        const nHq = C.nHeads, nKv = C.nKvHeads, hd = C.headDim;
+        await mv(s.normed, W(p + 'self_attn.q_proj.weight'), s.q, T, nHq * hd, H);
+        await mv(s.normed, W(p + 'self_attn.out_gate.weight'), s.agate, T, nHq * hd, H);
+        await mv(s.normed, W(p + 'self_attn.k_proj.weight'), s.k, T, nKv * hd, H);
+        await mv(s.normed, W(p + 'self_attn.v_proj.weight'), s.v, T, nKv * hd, H);
+        await ropeQK(s.q, W(p + 'self_attn.q_norm.weight').buf, s.qr, T, nHq, hd, 0, C.ropeTheta, C.rmsEps, C.rotDim);
+        await ropeQK(s.k, W(p + 'self_attn.k_norm.weight').buf, s.kr, T, nKv, hd, 0, C.ropeTheta, C.rmsEps, C.rotDim);
+        E.copyBuffer(s.kr, 0, _kv[l].k, 0, T * nKv * hd * 4);
+        E.copyBuffer(s.v, 0, _kv[l].v, 0, T * nKv * hd * 4);
+        await attention(s.qr, _kv[l].k, _kv[l].v, s.attn, T, T, nHq, nKv, hd);
+        await mulSigmoid(s.attn, s.agate, T * nHq * hd);
+        await mv(s.attn, W(p + 'self_attn.o_proj.weight'), s.x, T, H, nHq * hd, true);
+      }
+      await rmsnorm(s.x, W(p + 'post_attention_layernorm.weight').buf, s.normed, T, H, C.rmsEps);
+      const I = C.intermediate;
+      await mv(s.normed, W(p + 'mlp.gate_proj.weight'), s.gate, T, I, H);
+      await mv(s.normed, W(p + 'mlp.up_proj.weight'), s.up, T, I, H);
+      await swiglu(s.gate, s.up, s.swi, T * I);
+      await mv(s.swi, W(p + 'mlp.down_proj.weight'), s.x, T, H, I, true);
+      await E.endBatch();
+      out.push(await stats(s.x, T * H, 'L' + l + (_gdnState[l] ? ' gdn' : ' attn')));
+    }
+    uniformReset();
+    E.beginBatch();
+    await rmsnorm(s.x, W('model.language_model.norm.weight').buf, s.normed, T, H, C.rmsEps);
+    E.copyBuffer(s.normed, (T - 1) * H * 4, s.last, 0, H * 4);
+    await mv(s.last, W('lm_head.weight'), s.logits, 1, C.vocab, H);
+    await E.endBatch();
+    out.push(await stats(s.logits, C.vocab, 'logits'));
+    const lg = await E.readF32(s.logits, C.vocab);
+    let best = 0, bv = -Infinity; for (let i = 0; i < C.vocab; i++) if (lg[i] > bv) { bv = lg[i]; best = i; }
+    return { T, ids: ids.slice(0, 8), argmax: best, argmaxTok: TOK.decode([best]), stages: out };
+  }
+
+  // Layer-0 GDN substage stats — mirror of the torch hf_l0.py dump.
+  async function _l0Probe(text) {
+    if (!_loaded) throw new Error('loadModel first');
+    const C = _cfg, H = C.hidden, G = C.gdn, CD = GDN_CONV_DIM, HV = G.nHeads * G.dv;
+    const ids = TOK.encodeText(text || 'The capital of France is');
+    const T = ids.length;
+    _ensureState();
+    const s = _scr, W = (n) => _weights[n], p = 'model.language_model.layers.0.';
+    const st = async (buf, n, label) => {
+      const a = await E.readF32(buf, n);
+      let mn = Infinity, mx = -Infinity, sum = 0;
+      for (let i = 0; i < n; i++) { const v = a[i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; }
+      return { label, min: +mn.toFixed(4), max: +mx.toFixed(4), mean: +(sum / n).toFixed(6) };
+    };
+    const out = [];
+    if (!_idsBuf) _idsBuf = E.createBuffer(Math.max(MATVEC_MAXT, PREFILL_T) * 4, U.STORAGE | U.COPY_DST, 'ids');
+    E.device().queue.writeBuffer(_idsBuf, 0, new Uint32Array(ids));
+    uniformReset();
+    await embedGather(_idsBuf, W(EMBED).buf, s.x, T, H, 0);
+    await rmsnorm(s.x, W(p + 'input_layernorm.weight').buf, s.normed, T, H, C.rmsEps);
+    out.push(await st(s.normed, T * H, 'normed'));
+    await mv(s.normed, W(p + 'linear_attn.in_proj_qkv.weight'), s.qkv, T, CD, H);
+    out.push(await st(s.qkv, T * CD, 'qkv_proj'));
+    const g0 = _gdnState[0];
+    await gdnConv(s.qkv, W(p + 'linear_attn.conv1d.weight').buf, g0.convA, g0.convB, s.qkvc, T, CD, G.convL, false);
+    out.push(await st(s.qkvc, T * CD, 'conv_silu'));
+    await gdnQkNorm(s.qkvc, T, G.nHeads, G.dk, CD);
+    // slice stats: q rows [0,2048), k [2048,4096), v [4096,6144) per token — read full and split on CPU
+    {
+      const a = await E.readF32(s.qkvc, T * CD);
+      const seg = (off, len, label) => { let mn = 1e9, mx = -1e9, sum = 0, n = 0; for (let t = 0; t < T; t++) for (let i = 0; i < len; i++) { const v = a[t * CD + off + i]; if (v < mn) mn = v; if (v > mx) mx = v; sum += v; n++; } return { label, min: +mn.toFixed(4), max: +mx.toFixed(4), mean: +(sum / n).toFixed(6) }; };
+      out.push(seg(0, 2048, 'q_normed_scaled'), seg(2048, 2048, 'k_normed'), seg(4096, 2048, 'v'));
+    }
+    await mvF16(s.normed, W(p + 'linear_attn.in_proj_b.weight').buf, s.bproj, T, G.nHeads, H);
+    await mvF16(s.normed, W(p + 'linear_attn.in_proj_a.weight').buf, s.aproj, T, G.nHeads, H);
+    await gdnGates(s.bproj, s.aproj, W(p + 'linear_attn.A_log').buf, W(p + 'linear_attn.dt_bias').buf, s.beta, s.gexp, T, G.nHeads);
+    out.push(await st(s.beta, T * G.nHeads, 'beta'), await st(s.gexp, T * G.nHeads, 'gexp'));
+    await gdnDelta(s.qkvc, s.beta, s.gexp, g0.S, s.gdnO, T, G.nHeads, G.dk, false);
+    out.push(await st(s.gdnO, T * HV, 'delta_o'));
+    await mv(s.normed, W(p + 'linear_attn.in_proj_z.weight'), s.z, T, HV, H);
+    await gatedRmsNorm(s.gdnO, s.z, W(p + 'linear_attn.norm.weight').buf, s.gnorm, T, G.nHeads, G.dv, C.rmsEps);
+    out.push(await st(s.gnorm, T * HV, 'gated_norm'));
+    // out_proj WITHOUT residual (separate buffer) then with
+    await mv(s.gnorm, W(p + 'linear_attn.out_proj.weight'), s.attn, T, H, HV, false);
+    out.push(await st(s.attn, T * H, 'out_proj'));
+    await axpy(s.x, s.attn, T * H, 1);
+    out.push(await st(s.x, T * H, 'after_residual'));
+    return out;
+  }
+
+  const _readTok = (idx, count) => readU32Range(_scr.tokHist, idx, count || 1);
+  const _writeTokHist = (ids) => { _ensureState(); E.device().queue.writeBuffer(_scr.tokHist, 0, new Uint32Array(ids)); };
+  const _readLast = () => E.readF32(_scr.last, _cfg.hidden);
+  const _readScr = (name, n) => E.readF32(_scr[name], n);
+  const _readLogits = (n) => E.readF32(_scr.logits, n || _cfg.vocab);
+  // Isolated argmax test: synthetic logits with a known peak → run the real kernel
+  // against the real tokHist → read back.
+  async function _testArgmax(peak) {
+    _ensureState();
+    const N = _cfg.vocab;
+    const lg = new Float32Array(N); for (let i = 0; i < N; i++) lg[i] = -10 + Math.sin(i * 0.1);
+    lg[peak] = 42;
+    E.device().queue.writeBuffer(_scr.logits, 0, lg);
+    uniformReset();
+    E.beginBatch();
+    await argmaxKernel(_scr.logits, _scr.tokHist, N, 3);
+    await E.endBatch();
+    return (await readU32Range(_scr.tokHist, 3, 1))[0];
+  }
+
   return {
-    CONFIG, GDN_CONV_DIM, MODELS,
+    CONFIG, GDN_CONV_DIM, MODELS, _stageProbe, _l0Probe, _readTok, _writeTokHist, _readLast, _readLogits, _readScr, _testArgmax,
     gdnConv, gdnGates, gdnQkNorm, gdnDelta, gatedRmsNorm,
-    loadModel, unload, TOK,
-    _fwd: { mv, matvecQ, gemvQ8, gemmDP4A, rmsnorm, embedGather, swiglu, axpy, ropeQK, attention, mulSigmoid },
+    loadModel, unload, TOK, generate, forward,
+    lastProf: () => _lastProf,
+    _fwd: { mv, matvecQ, gemvQ8, gemmDP4A, rmsnorm, embedGather, swiglu, axpy, ropeQK, attention, mulSigmoid, mvF16, argmaxKernel },
     _selfTest: selfTestKernels,
     _selfTestFwd: selfTestFwdPrims,
     _weightsInfo: () => { const o = {}; let bytes = 0; for (const k in (_weights || {})) { const w = _weights[k]; o[k] = { int4: !!w.int4, f32: !!w.f32, shape: w.shape }; } return { count: Object.keys(o).length, tensors: o }; },
