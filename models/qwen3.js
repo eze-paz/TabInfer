@@ -4091,7 +4091,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Driver: batched decode until '<tool_call>' appears in the emitted text, then the
   // constrained loop for the span, then back to batched — repeat until stop/budget.
   const GRAMMAR_TRIGGER = '<tool_call>';
-  async function decodeWithGrammar(L, maxTokens, pushTok, signal, count, grammar, getText, temp) {
+  // freeDecode lets the caller swap the batched loop for the serial logprob loop
+  // (confidence mode) while keeping tool-call spans grammar-constrained — turning
+  // the diagnostic on must not change WHAT the model can emit, only how we read it.
+  async function decodeWithGrammar(L, maxTokens, pushTok, signal, count, grammar, getText, temp, freeDecode) {
+    const free = freeDecode || decodeLoop;
     let trig = null, lastTrigLen = -1;
     const wrapped = (t) => {
       if (!pushTok(t)) return false;
@@ -4108,7 +4112,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     };
     while (count() < maxTokens) {
       trig = null;
-      await decodeLoop(L + count() - 1, maxTokens, wrapped, signal, count, temp);
+      await free(L + count() - 1, maxTokens, wrapped, signal, count, temp);
       if (trig == null) return;              // genuine stop (STOP token / budget / abort)
       if (grammar.reset(trig)) {
         const r = await _decodeConstrained(L + count() - 1, grammar, pushTok, signal, maxTokens - count(), temp);
@@ -4867,10 +4871,11 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       prevText = txt; return true;
     };
     if (!pushTok(tok0)) return prevText;
-    if (logprobs) {
-      await _decodeLogprobs(pos, maxTokens, pushTok, signal, () => outIds.length, temp, tokenEv);
-    } else if (grammar) {
-      await decodeWithGrammar(L, maxTokens, pushTok, signal, () => outIds.length, grammar, () => prevText, temp);
+    const lpFree = logprobs ? ((p, mt, pt, sg, cn, tp) => _decodeLogprobs(p, mt, pt, sg, cn, tp, tokenEv)) : null;
+    if (grammar) {
+      await decodeWithGrammar(L, maxTokens, pushTok, signal, () => outIds.length, grammar, () => prevText, temp, lpFree);
+    } else if (logprobs) {
+      await lpFree(pos, maxTokens, pushTok, signal, () => outIds.length, temp);
     } else {
       await decodeLoop(pos, maxTokens, pushTok, signal, () => outIds.length, temp);
     }
@@ -5051,7 +5056,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         // token-masked to be a VALID call to a REGISTERED tool — malformed JSON / made-up
         // tool names can't be generated at all. Built once per conversation, reused per round.
         if (toolList.length && _grammar === undefined) _grammar = makeToolGrammar(toolList.map(t => t.function && t.function.name).filter(Boolean));
-        await _streamIds(ids, { maxTokens, signal, grammar: (_wantLP ? null : (_grammar || null)), onToken: (p) => parser.push(p), logprobs: _wantLP, tokenEv: _wantLP ? (ev) => emit(ev) : null });
+        await _streamIds(ids, { maxTokens, signal, grammar: _grammar || null, onToken: (p) => parser.push(p), logprobs: _wantLP, tokenEv: _wantLP ? ((ev) => { clearInfo(); emit(ev); }) : null });
         if (round === 0) _sysCacheRecord(sys, variant);             // _kv[0..P_sys) now holds this system block
         parser.flush();
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
