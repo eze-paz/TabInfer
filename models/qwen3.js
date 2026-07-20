@@ -679,6 +679,7 @@ ${wgReduce2WGSL(NR, GEMV_WG)}
   }
 }`; }
   function gateUpSiluQ(xBuf, gRec, uRec, swiBuf, I, H) {
+    if (gRec.tern) { quantQ8(xBuf, H); return gateUpSiluDP4_only(gRec, uRec, swiBuf, I, H); }   // tern packs must NEVER hit the int4-format kernels
     if (globalThis.__noDp4) {
       const pipe = E.getPipeline('q3.gateupQ', GATEUPQ_WGSL);
       const d = uniform(new Uint32Array([I, H, 0, 0]));
@@ -1009,6 +1010,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // trusted f16 gemmQ/gemvQ on a tiny input and, on mismatch, sets __noDp4Gemm/__noDp4
   // so the forward path routes through the proven f32/f16-dequant kernels on THIS device.
   let _dp4Probed = false;
+  let _dp4DecodeOk = false;   // dot4I8Packed decode CORRECTNESS (not the perf heuristic) — gates ternary detection
   async function probeDp4() {
     if (_dp4Probed) return; _dp4Probed = true;
     let bufs = [];
@@ -1045,7 +1047,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
         let e = 0; for (let i = 0; i < N; i++) e = Math.max(e, Math.abs(g0[i] - y0[i]));
         const rel = e / m0;
         if (rel > 8e-2) { globalThis.__noDp4 = true; console.warn('[qwen3] DP4A decode GEMV WRONG on this GPU (rel ' + rel.toFixed(3) + ') — routing decode through gemvQ'); }
-        else console.log('[qwen3] DP4A decode GEMV verified (rel ' + rel.toExponential(1) + ')');
+        else { _dp4DecodeOk = true; console.log('[qwen3] DP4A decode GEMV verified (rel ' + rel.toExponential(1) + ')'); }
       }
       // PERF A/B: dot4I8Packed is HARDWARE on desktop but SOFTWARE-EMULATED on Adreno (measured
       // 19 vs 106 GFLOP/s — 5.5× slower than f16). Time gemmDP4A vs f16 gemmQ at a mid shape; if
@@ -3316,12 +3318,18 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     if (K % 64 !== 0) return null;
     const G = QGROUP, wpr = K / 16, gpr = K / G;
     // cheap pre-check on the first few rows before committing to the full pass
+    // Nonzero magnitudes may sit up to TOL ULPs below the group max: PrismML's f16 export
+    // has rare 1-ULP wobble within a scale group (measured 0.002% of elements on Bonsai-1.7B).
+    // Same-exponent bf16 bit patterns differ by mantissa ULPs, so a genuinely non-ternary
+    // (continuous) tensor still rejects at the first group — its magnitudes differ by whole
+    // exponent steps, far beyond TOL.
+    const TOL = 2;
     const preRows = Math.min(N, 4);
     for (let n = 0; n < preRows; n++) {
       for (let g = 0; g < gpr; g++) {
         let mx = 0;
         for (let j = 0; j < G; j++) { const m = u16[n*K + g*G + j] & 0x7FFF; if (m > mx) mx = m; }
-        for (let j = 0; j < G; j++) { const m = u16[n*K + g*G + j] & 0x7FFF; if (m !== 0 && m !== mx) return null; }
+        for (let j = 0; j < G; j++) { const m = u16[n*K + g*G + j] & 0x7FFF; if (m !== 0 && mx - m > TOL) return null; }
       }
     }
     const pack = new Uint32Array(N * wpr), scaleBf16 = new Uint16Array(N * gpr);
@@ -3333,8 +3341,8 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
         scaleBf16[rS + g] = mx;
         for (let j = 0; j < G; j++) {
           const k = g*G + j, bits = u16[rU + k], m = bits & 0x7FFF;
-          if (m !== 0 && m !== mx) return null;                      // not ternary after all → int4 fallback
-          const c = m === 0 ? 1 : ((bits & 0x8000) ? 0 : 2);         // {-1,0,+1} + 1
+          if (m !== 0 && mx - m > TOL) return null;                  // not ternary after all → int4 fallback
+          const c = m === 0 ? 1 : ((bits & 0x8000) ? 0 : 2);         // {-1,0,+1} + 1 (≤TOL-ULP wobble snaps to ±1)
           pack[rP + (k >> 4)] |= c << (((k & 3) << 3) + ((k >> 2) & 3) * 2);   // bits 8b+2s, b=k&3, s=(k>>2)&3
         }
       }
@@ -3381,8 +3389,12 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       const N = info.shape[0], K = info.shape[1];
       // Ternary fast path: lossless 2.125-bpw storage + dedicated kernels. Only when the
       // DP4A path is live (__noDp4 GPUs fall back to int4, which is also ternary-exact).
-      if (!globalThis.__noDp4 && !globalThis.__noTernary) {
+      // Gate on dot4I8Packed CORRECTNESS, not the __noDp4 perf heuristic: ternary at
+      // 2.125 bpw beats f16-dequant int4 (4.25 bpw) on bandwidth-bound decode even where
+      // DP4A is software-emulated (Adreno) — and the perf A/B is noisy under system load.
+      if (_dp4DecodeOk && !globalThis.__noTernary) {
         const tern = quantizeTernaryBf16(new Uint16Array(raw.buffer, raw.byteOffset, numel), N, K);
+        if (tern && !_ternAny) { try { console.log('[qwen3] ternary weights detected — using 2.125bpw kernels (first:', name + ')'); } catch (_) {} }
         if (tern) {
           const packBuf = E.createBuffer(tern.pack.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.tpack');
           const scBuf = E.createBuffer(tern.scales.byteLength, U.STORAGE | U.COPY_DST | U.COPY_SRC, name + '.tsc');
