@@ -16,7 +16,7 @@ const CPUEngineMT = (function () {
   const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, DONEBASE = 32, DONESTRIDE = 16;
   const CTRL_I32 = 32 + 16 * 16; // room for 16 workers
   const MAXCTX = 512; // KV positions held in the shared buffer
-  let Wn = 8, workers = [], ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKV, _kvStride = 0;
+  let Wn = 8, workers = [], ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur;
   let embedF16 = null; const nrm = {}, mats = {}; // name -> {mid,N,K}
   // MAIN-THREAD wasm instance (private memory) for the SIMD serial ops (quant + rmsnorm)
   // that otherwise run as scalar JS on the critical path, blocking every worker.
@@ -54,12 +54,14 @@ const CPUEngineMT = (function () {
     await initMainWasm();
     buildMainBufs();  // wasm-backed hot buffers + norm weights into main wasm memory
     // SAB: ctrl + act(i8) + xsum(i32) + out(f32) + q(f32 nH*hd) + attn(f32 nH*hd)
-    //      + KV(f32, L layers × {K,V} × MAXCTX × nKV*hd) — KV shared so workers can do attention.
+    //      + kcur/vcur (f32 nKV*hd) — ONLY the current token's k,v. The KV history now lives
+    //      as int8 in each worker's PRIVATE wasm memory (per head it owns), so no giant f32
+    //      KV in the SAB and attention dots run SIMD (see cpukern-fwd-worker.js).
     const maxK = CFG.I, maxN = CFG.vocab, H = CFG.H, hd = CFG.hd, nH = CFG.nH, nKV = CFG.nKV, L = CFG.L;
-    const kvStride = MAXCTX * nKV * hd;                 // floats per (layer, K or V)
     const CTRL = CTRL_I32 * 4, actOff = CTRL, xsumOff = actOff + maxK, outOff = xsumOff + (maxK / 64) * 4;
-    const qOff = outOff + maxN * 4, attnOff = qOff + nH * hd * 4, kvOff = attnOff + nH * hd * 4;
-    const sabBytes = kvOff + L * 2 * kvStride * 4;
+    const qOff = outOff + maxN * 4, attnOff = qOff + nH * hd * 4;
+    const kcurOff = attnOff + nH * hd * 4, vcurOff = kcurOff + nKV * hd * 4;
+    const sabBytes = vcurOff + nKV * hd * 4;
     const sab = new SharedArrayBuffer(sabBytes);
     ctrl = new Int32Array(sab, 0, CTRL_I32);
     Atomics.store(ctrl, SPIN, (globalThis.__SPIN | 0) || 400);
@@ -68,8 +70,8 @@ const CPUEngineMT = (function () {
     sabOut = new Float32Array(sab, outOff, maxN);
     sabQ = new Float32Array(sab, qOff, nH * hd);
     sabAttn = new Float32Array(sab, attnOff, nH * hd);
-    sabKV = new Float32Array(sab, kvOff, L * 2 * kvStride);
-    _kvStride = kvStride;
+    sabKcur = new Float32Array(sab, kcurOff, nKV * hd);
+    sabVcur = new Float32Array(sab, vcurOff, nKV * hd);
     // Build each worker's row-partition into its OWN small ArrayBuffer and TRANSFER it
     // (main fetches the 1.16GB binary once; workers never hold the whole thing → no 8×9GB OOM).
     const srcU8 = new Uint8Array(ab);
@@ -94,7 +96,7 @@ const CPUEngineMT = (function () {
       wk.onerror = e => { (globalThis.__wErr = globalThis.__wErr || []).push('onerror w' + wk.__wid + ': ' + (e.message || e)); };
       wk.__wid = w;
       readies.push(new Promise(res => { wk.onmessage = ev => { if (ev.data.workerError) (globalThis.__wErr = globalThis.__wErr || []).push('w' + wk.__wid + ': ' + ev.data.workerError); if (ev.data.ready) res(); }; }));
-      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, actOff, xsumOff, outOff, qOff, attnOff, kvOff, kvStride, nH, nKV, hd }, [part.buffer]);
+      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, actOff, xsumOff, outOff, qOff, attnOff, kcurOff, vcurOff, nH, nKV, hd, L: CFG.L }, [part.buffer]);
     }
     await Promise.all(readies);
   }
@@ -199,10 +201,11 @@ const CPUEngineMT = (function () {
       const qnw = nrm[p + 'self_attn.q_norm.weight'], knw = nrm[p + 'self_attn.k_norm.weight'];
       for (let h = 0; h < nH; h++) { const off = h * hd; rmsnorm(B.q.subarray(off, off + hd), qnw, hd, B.hn); for (let i = 0; i < hd; i++) B.q[off + i] = B.hn[i]; ropeC(B.q, off); }
       for (let h = 0; h < nKV; h++) { const off = h * hd; rmsnorm(B.k.subarray(off, off + hd), knw, hd, B.hn); for (let i = 0; i < hd; i++) B.k[off + i] = B.hn[i]; ropeC(B.k, off); }
-      // publish q (post norm+rope) and this token's K,V into the shared buffers, then thread attention
+      // publish q (post norm+rope) and this token's K,V (current position only); workers
+      // quantize + append to their private int8 KV, then run SIMD attention over it.
       sabQ.set(B.q);
-      const kBase = l * 2 * _kvStride + pos * nKV * hd, vBase = l * 2 * _kvStride + _kvStride + pos * nKV * hd;
-      for (let i = 0; i < nKV * hd; i++) { sabKV[kBase + i] = B.k[i]; sabKV[vBase + i] = B.v[i]; }
+      sabKcur.set(B.k);
+      sabVcur.set(B.v);
       attnThreaded(l, pos + 1, B.attn);
       mmT(p + 'self_attn.o_proj.weight', B.attn, B.o);
       for (let i = 0; i < H; i++) x[i] += B.o[i];

@@ -176,6 +176,91 @@ pub unsafe extern "C" fn rmsnorm(dst: *mut f32, x: *const f32, w: *const f32, n:
     }
 }
 
+// ─────────────────────────── int8 attention (SIMD) ───────────────────────────
+// Each worker keeps its heads' KV as int8 (per-vector absmax scale) in its OWN private
+// memory. These kernels do the O(T·hd) hot loops; softmax stays in JS (small, over T).
+// Full-int8 dot: widen i8→i16, i32x4_dot_i16x8 (i7 relaxed slot can't hold ±127).
+
+/// scores[t] = scale · qs · ks[t] · Σ_i q[i]·k[t·hd+i],  t in 0..t_len.  hd % 16 == 0.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn attn_scores(
+    scores: *mut f32, q: *const i8, qs: f32, k: *const i8, ks: *const f32, t_len: u32, hd: u32, scale: f32,
+) {
+    let hd = hd as usize;
+    let t_len = t_len as usize;
+    let mut t = 0usize;
+    while t < t_len {
+        let kr = k.add(t * hd);
+        let mut acc = i32x4_splat(0);
+        let mut i = 0usize;
+        while i < hd {
+            let a = v128_load(q.add(i) as *const v128);
+            let b = v128_load(kr.add(i) as *const v128);
+            acc = i32x4_add(acc, i32x4_dot_i16x8(i16x8_extend_low_i8x16(a), i16x8_extend_low_i8x16(b)));
+            acc = i32x4_add(acc, i32x4_dot_i16x8(i16x8_extend_high_i8x16(a), i16x8_extend_high_i8x16(b)));
+            i += 16;
+        }
+        *scores.add(t) = scale * qs * (*ks.add(t)) * (hsum_i32x4(acc) as f32);
+        t += 1;
+    }
+}
+
+/// out[i] = Σ_t (w[t]·vs[t]) · v[t·hd+i],  i in 0..hd.  hd % 16 == 0.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn attn_accv(
+    out: *mut f32, w: *const f32, v: *const i8, vs: *const f32, t_len: u32, hd: u32,
+) {
+    let hd = hd as usize;
+    let t_len = t_len as usize;
+    let mut i = 0usize;
+    while i < hd { v128_store(out.add(i) as *mut v128, f32x4_splat(0.0)); i += 4; }
+    let mut t = 0usize;
+    while t < t_len {
+        let vw = f32x4_splat((*w.add(t)) * (*vs.add(t)));
+        let vr = v.add(t * hd);
+        let mut i = 0usize;
+        while i < hd {
+            let b = v128_load(vr.add(i) as *const v128);      // 16 i8
+            let bl = i16x8_extend_low_i8x16(b);
+            let bh = i16x8_extend_high_i8x16(b);
+            let q0 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(bl));
+            let q1 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(bl));
+            let q2 = f32x4_convert_i32x4(i32x4_extend_low_i16x8(bh));
+            let q3 = f32x4_convert_i32x4(i32x4_extend_high_i16x8(bh));
+            v128_store(out.add(i) as *mut v128, f32x4_add(v128_load(out.add(i) as *const v128), f32x4_mul(vw, q0)));
+            v128_store(out.add(i + 4) as *mut v128, f32x4_add(v128_load(out.add(i + 4) as *const v128), f32x4_mul(vw, q1)));
+            v128_store(out.add(i + 8) as *mut v128, f32x4_add(v128_load(out.add(i + 8) as *const v128), f32x4_mul(vw, q2)));
+            v128_store(out.add(i + 12) as *mut v128, f32x4_add(v128_load(out.add(i + 12) as *const v128), f32x4_mul(vw, q3)));
+            i += 16;
+        }
+        t += 1;
+    }
+}
+
+/// Per-vector int8 quantize x[n] → dst with absmax scale; returns scale. n % 16 == 0.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn quant_vec(dst: *mut i8, x: *const f32, n: u32) -> f32 {
+    let n = n as usize;
+    let mut vmax = f32x4_splat(0.0);
+    let mut i = 0usize;
+    while i + 4 <= n { vmax = f32x4_max(vmax, f32x4_abs(v128_load(x.add(i) as *const v128))); i += 4; }
+    let amax = f32x4_extract_lane::<0>(vmax).max(f32x4_extract_lane::<1>(vmax))
+        .max(f32x4_extract_lane::<2>(vmax)).max(f32x4_extract_lane::<3>(vmax));
+    let asc = if amax > 0.0 { amax / 127.0 } else { 1e-9 };
+    let vinv = f32x4_splat(1.0 / asc);
+    i = 0;
+    while i < n {
+        let q0 = qi32(x, i, vinv); let q1 = qi32(x, i + 4, vinv);
+        let q2 = qi32(x, i + 8, vinv); let q3 = qi32(x, i + 12, vinv);
+        v128_store(dst.add(i) as *mut v128, i8x16_narrow_i16x8(i16x8_narrow_i32x4(q0, q1), i16x8_narrow_i32x4(q2, q3)));
+        i += 16;
+    }
+    asc
+}
+
 /// Start of usable linear memory above the module's static data + shadow stack.
 /// JS reads this, grows `memory` as needed, and lays out codes/scales/act/xsum/out
 /// from here on — no allocator in the wasm.

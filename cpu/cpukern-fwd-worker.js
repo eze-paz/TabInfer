@@ -5,9 +5,11 @@
 // ctrl slots: one cache line per contended word (see cpuengine-mt.js) — false sharing
 // in the packed v1 layout cost ~1ms/barrier.
 const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, DONEBASE = 32, DONESTRIDE = 16, CTRL_I32 = 32 + 16 * 16;
+const MAXCTX = 512;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
 let W = null, wid = 0, Wn = 1;
-let ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKV;
-let aNH, aNKV, aHD, aKVstride, aScale, aScores;   // attention params
+let ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur;
+let aNH, aNKV, aHD, aScale;                 // attention params
+let A = null;                               // int8-attention state (buffers, owned kvh KV stores)
 let sAct, sXsum, sOutLocal;                 // wasm scratch offsets
 const meta = [];                            // mid -> {oCodes,oScales,r0,rows,K}
 const _b = new ArrayBuffer(4), _bf = new Float32Array(_b), _bi = new Int32Array(_b);
@@ -36,9 +38,9 @@ async function setup(msg) {
   sabOut = new Float32Array(sab, OUT_OFF, msg.maxN);
   sabQ = new Float32Array(sab, msg.qOff, msg.nH * msg.hd);
   sabAttn = new Float32Array(sab, msg.attnOff, msg.nH * msg.hd);
-  sabKV = new Float32Array(sab, msg.kvOff, (msg.kvOff !== undefined) ? (sab.byteLength - msg.kvOff) / 4 : 0);
-  aNH = msg.nH; aNKV = msg.nKV; aHD = msg.hd; aKVstride = msg.kvStride; aScale = 1 / Math.sqrt(msg.hd);
-  aScores = new Float32Array(4096);
+  sabKcur = new Float32Array(sab, msg.kcurOff, msg.nKV * msg.hd);
+  sabVcur = new Float32Array(sab, msg.vcurOff, msg.nKV * msg.hd);
+  aNH = msg.nH; aNKV = msg.nKV; aHD = msg.hd; aScale = 1 / Math.sqrt(msg.hd);
   await initWasm();
   heapTop = align16(W.heap_base());
   // receive my pre-extracted row-partition (transferred ArrayBuffer) + layout
@@ -51,9 +53,23 @@ async function setup(msg) {
     }
     meta[e.mid] = { oCodes, oScales, r0: e.r0, rows: e.rows, K: e.K };
   }
-  // scratch
+  // gemv scratch
   sAct = gr0(msg.maxK); sXsum = gr0((msg.maxK / 64) * 4);
   sOutLocal = gr0(Math.ceil(msg.maxN / Wn + 64) * 4);
+  // ── int8 attention state: scratch + a private int8 KV store per (layer, owned kvh) ──
+  // KV is PER-LAYER (each layer has its own K/V history) — key = l*nKV + kvh.
+  const nH = aNH, nKV = aNKV, hd = aHD, L = msg.L, qpk = nH / nKV;
+  const h0 = Math.floor(wid * nH / Wn), h1 = Math.floor((wid + 1) * nH / Wn);
+  const qbufOff = gr0(hd), qfOff = gr0(hd * 4), kfOff = gr0(hd * 4), vfOff = gr0(hd * 4);
+  const scoreOff = gr0(MAXCTX * 4), wOff = gr0(MAXCTX * 4), outOff = gr0(hd * 4);
+  const ownedKvh = []; { const seen = {}; for (let h = h0; h < h1; h++) { const kvh = (h / qpk) | 0; if (!seen[kvh]) { seen[kvh] = 1; ownedKvh.push(kvh); } } }
+  const kv = {};   // (l*nKV+kvh) -> {ki8,ks,vi8,vs} offsets
+  for (let l = 0; l < L; l++) for (const kvh of ownedKvh) kv[l * nKV + kvh] = { ki8: gr0(MAXCTX * hd), ks: gr0(MAXCTX * 4), vi8: gr0(MAXCTX * hd), vs: gr0(MAXCTX * 4) };
+  const buf = W.memory.buffer;   // memory stable after here (no more gr0)
+  for (const k in kv) { kv[k].ksV = new Float32Array(buf, kv[k].ks, MAXCTX); kv[k].vsV = new Float32Array(buf, kv[k].vs, MAXCTX); }
+  A = { h0, h1, qpk, hd, nKV, qbufOff, qfOff, kfOff, vfOff, scoreOff, wOff, outOff, kv,
+    qfV: new Float32Array(buf, qfOff, hd), kfV: new Float32Array(buf, kfOff, hd), vfV: new Float32Array(buf, vfOff, hd),
+    scoreV: new Float32Array(buf, scoreOff, MAXCTX), wV: new Float32Array(buf, wOff, MAXCTX), outV: new Float32Array(buf, outOff, hd) };
   postMessage({ ready: true });
   // barrier loop — SPIN briefly (hot path: next matmul arrives within ~100µs), then PARK
   // via Atomics.wait. Pure spin made orphaned pools burn 100% CPU forever (the bug that
@@ -84,18 +100,30 @@ async function setup(msg) {
     const nmat = Atomics.load(ctrl, NMAT);
     if (nmat < 0) return;
     if (Atomics.load(ctrl, JOBTYPE) === 1) {
-      // THREADED GQA ATTENTION: split heads across workers.
-      const l = Atomics.load(ctrl, LAYER), T = Atomics.load(ctrl, TLEN);
-      const nH = aNH, hd = aHD, nKV = aNKV, qpk = nH / nKV, scale = aScale;
-      const kBase = l * 2 * aKVstride, vBase = l * 2 * aKVstride + aKVstride, row = nKV * hd;
-      const h0 = Math.floor(wid * nH / Wn), h1 = Math.floor((wid + 1) * nH / Wn), sc = aScores;
-      for (let h = h0; h < h1; h++) {
-        const kvh = (h / qpk) | 0, qo = h * hd, ko = kvh * hd; let mx = -Infinity;
-        for (let t = 0; t < T; t++) { const kb = kBase + t * row + ko; let d = 0; for (let i = 0; i < hd; i++) d += sabQ[qo + i] * sabKV[kb + i]; d *= scale; sc[t] = d; if (d > mx) mx = d; }
-        let sum = 0; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); sc[t] = e; sum += e; }
-        const isum = 1 / sum;
-        for (let i = 0; i < hd; i++) sabAttn[qo + i] = 0;
-        for (let t = 0; t < T; t++) { const w = sc[t] * isum, vb = vBase + t * row + ko; for (let i = 0; i < hd; i++) sabAttn[qo + i] += w * sabKV[vb + i]; }
+      // int8 GQA ATTENTION: workers split heads; each keeps its heads' KV as int8 in PRIVATE
+      // wasm memory and runs the O(T·hd) score/accumulate loops via SIMD wasm kernels.
+      const l = Atomics.load(ctrl, LAYER), T = Atomics.load(ctrl, TLEN), pos = T - 1, hd = aHD, nKV = A.nKV, qpk = A.qpk, scale = aScale;
+      // 1) append this token's k,v (for the kvh's I own) to my per-layer int8 KV store at `pos`
+      if (pos < MAXCTX) {
+        const seen = {};
+        for (let h = A.h0; h < A.h1; h++) {
+          const kvh = (h / qpk) | 0; if (seen[kvh]) continue; seen[kvh] = 1;
+          const st = A.kv[l * nKV + kvh], o = kvh * hd;
+          A.kfV.set(sabKcur.subarray(o, o + hd)); st.ksV[pos] = W.quant_vec(st.ki8 + pos * hd, A.kfOff, hd);
+          A.vfV.set(sabVcur.subarray(o, o + hd)); st.vsV[pos] = W.quant_vec(st.vi8 + pos * hd, A.vfOff, hd);
+        }
+      }
+      // 2) per owned head: quantize q → int8, SIMD scores, JS softmax, SIMD weighted-V
+      for (let h = A.h0; h < A.h1; h++) {
+        const kvh = (h / qpk) | 0, st = A.kv[l * nKV + kvh], qo = h * hd;
+        A.qfV.set(sabQ.subarray(qo, qo + hd));
+        const qs = W.quant_vec(A.qbufOff, A.qfOff, hd);
+        W.attn_scores(A.scoreOff, A.qbufOff, qs, st.ki8, st.ks, T, hd, scale);
+        const sc = A.scoreV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
+        let sum = 0; const wv = A.wV; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); wv[t] = e; sum += e; }
+        const isum = 1 / sum; for (let t = 0; t < T; t++) wv[t] *= isum;
+        W.attn_accv(A.outOff, A.wOff, st.vi8, st.vs, T, hd);
+        sabAttn.set(A.outV.subarray(0, hd), qo);
       }
       Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
       continue;
