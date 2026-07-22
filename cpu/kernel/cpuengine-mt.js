@@ -16,7 +16,7 @@ const CPUEngineMT = (function () {
   const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, DONEBASE = 32, DONESTRIDE = 16;
   const CTRL_I32 = 32 + 16 * 16; // room for 16 workers
   const MAXCTX = 512; // KV positions held in the shared buffer
-  let Wn = 8, workers = [], ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur;
+  let Wn = 8, workers = [], ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin;
   let embedF16 = null; const nrm = {}, mats = {}; // name -> {mid,N,K}
   // MAIN-THREAD wasm instance (private memory) for the SIMD serial ops (quant + rmsnorm)
   // that otherwise run as scalar JS on the critical path, blocking every worker.
@@ -61,7 +61,8 @@ const CPUEngineMT = (function () {
     const CTRL = CTRL_I32 * 4, actOff = CTRL, xsumOff = actOff + maxK, outOff = xsumOff + (maxK / 64) * 4;
     const qOff = outOff + maxN * 4, attnOff = qOff + nH * hd * 4;
     const kcurOff = attnOff + nH * hd * 4, vcurOff = kcurOff + nKV * hd * 4;
-    const sabBytes = vcurOff + nKV * hd * 4;
+    const cosOff = vcurOff + nKV * hd * 4, sinOff = cosOff + (hd / 2) * 4;
+    const sabBytes = sinOff + (hd / 2) * 4;
     const sab = new SharedArrayBuffer(sabBytes);
     ctrl = new Int32Array(sab, 0, CTRL_I32);
     Atomics.store(ctrl, SPIN, (globalThis.__SPIN | 0) || 400);
@@ -72,6 +73,11 @@ const CPUEngineMT = (function () {
     sabAttn = new Float32Array(sab, attnOff, nH * hd);
     sabKcur = new Float32Array(sab, kcurOff, nKV * hd);
     sabVcur = new Float32Array(sab, vcurOff, nKV * hd);
+    sabCos = new Float32Array(sab, cosOff, hd / 2);
+    sabSin = new Float32Array(sab, sinOff, hd / 2);
+    // qk-norm weights for ALL layers, concatenated → workers apply qk-norm on their heads
+    const qNormAll = new Float32Array(L * hd), kNormAll = new Float32Array(L * hd);
+    for (let l = 0; l < L; l++) { qNormAll.set(nrm[`model.layers.${l}.self_attn.q_norm.weight`], l * hd); kNormAll.set(nrm[`model.layers.${l}.self_attn.k_norm.weight`], l * hd); }
     // Build each worker's row-partition into its OWN small ArrayBuffer and TRANSFER it
     // (main fetches the 1.16GB binary once; workers never hold the whole thing → no 8×9GB OOM).
     const srcU8 = new Uint8Array(ab);
@@ -96,7 +102,7 @@ const CPUEngineMT = (function () {
       wk.onerror = e => { (globalThis.__wErr = globalThis.__wErr || []).push('onerror w' + wk.__wid + ': ' + (e.message || e)); };
       wk.__wid = w;
       readies.push(new Promise(res => { wk.onmessage = ev => { if (ev.data.workerError) (globalThis.__wErr = globalThis.__wErr || []).push('w' + wk.__wid + ': ' + ev.data.workerError); if (ev.data.ready) res(); }; }));
-      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, actOff, xsumOff, outOff, qOff, attnOff, kcurOff, vcurOff, nH, nKV, hd, L: CFG.L }, [part.buffer]);
+      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, actOff, xsumOff, outOff, qOff, attnOff, kcurOff, vcurOff, cosOff, sinOff, nH, nKV, hd, L: CFG.L, eps: CFG.eps, qNormAll, kNormAll }, [part.buffer]);
     }
     await Promise.all(readies);
   }
@@ -191,18 +197,17 @@ const CPUEngineMT = (function () {
   function forward(tokenId, pos, kv) {
     const { H, hd, nH, nKV, L, I, eps, theta } = CFG; ensureBufs(); const x = B.x;
     for (let i = 0; i < H; i++) x[i] = f16f(embedF16[tokenId * H + i]);
-    // precompute rope cos/sin for this position (shared by all heads)
+    // precompute rope cos/sin for this position (shared by all heads); publish to SAB so
+    // workers can apply qk-norm + rope on their own heads.
     { const half = hd / 2; for (let i = 0; i < half; i++) { const a = pos * Math.pow(theta, -(2 * i) / hd); B.cosT[i] = Math.cos(a); B.sinT[i] = Math.sin(a); } }
+    sabCos.set(B.cosT); sabSin.set(B.sinT);
     for (let l = 0; l < L; l++) {
       const p = `model.layers.${l}.`;
       MW.rmsnorm(B.xn.__off, x.__off, nrmOff[p + 'input_layernorm.weight'], H, eps);
       if (globalThis.__noBatch) { mmT(p + 'self_attn.q_proj.weight', B.xn, B.q); mmT(p + 'self_attn.k_proj.weight', B.xn, B.k); mmT(p + 'self_attn.v_proj.weight', B.xn, B.v); }
       else mmBatch([p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'], B.xn, [B.q, B.k, B.v]);
-      const qnw = nrm[p + 'self_attn.q_norm.weight'], knw = nrm[p + 'self_attn.k_norm.weight'];
-      for (let h = 0; h < nH; h++) { const off = h * hd; rmsnorm(B.q.subarray(off, off + hd), qnw, hd, B.hn); for (let i = 0; i < hd; i++) B.q[off + i] = B.hn[i]; ropeC(B.q, off); }
-      for (let h = 0; h < nKV; h++) { const off = h * hd; rmsnorm(B.k.subarray(off, off + hd), knw, hd, B.hn); for (let i = 0; i < hd; i++) B.k[off + i] = B.hn[i]; ropeC(B.k, off); }
-      // publish q (post norm+rope) and this token's K,V (current position only); workers
-      // quantize + append to their private int8 KV, then run SIMD attention over it.
+      // publish RAW q,k,v; workers apply qk-norm + rope on their own heads, then quantize +
+      // append k,v to their private int8 KV, then run SIMD attention.
       sabQ.set(B.q);
       sabKcur.set(B.k);
       sabVcur.set(B.v);

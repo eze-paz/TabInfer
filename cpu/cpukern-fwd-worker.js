@@ -7,8 +7,8 @@
 const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, DONEBASE = 32, DONESTRIDE = 16, CTRL_I32 = 32 + 16 * 16;
 const MAXCTX = 512;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
 let W = null, wid = 0, Wn = 1;
-let ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur;
-let aNH, aNKV, aHD, aScale;                 // attention params
+let ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin;
+let aNH, aNKV, aHD, aScale, aEps;           // attention params
 let A = null;                               // int8-attention state (buffers, owned kvh KV stores)
 let sAct, sXsum, sOutLocal;                 // wasm scratch offsets
 const meta = [];                            // mid -> {oCodes,oScales,r0,rows,K}
@@ -16,6 +16,8 @@ const _b = new ArrayBuffer(4), _bf = new Float32Array(_b), _bi = new Int32Array(
 const i32f = (v) => { _bi[0] = v; return _bf[0]; };
 
 const align16 = x => (x + 15) & ~15;
+// rope in-place on an hd-length wasm f32 view, using the SAB cos/sin (precomputed by coordinator)
+function ropeV(v) { const half = aHD >> 1; for (let i = 0; i < half; i++) { const c = sabCos[i], s = sabSin[i], x0 = v[i], x1 = v[i + half]; v[i] = x0 * c - x1 * s; v[i + half] = x1 * c + x0 * s; } }
 async function initWasm() {
   const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
   W = (await WebAssembly.instantiate(buf, {})).instance.exports;
@@ -40,7 +42,9 @@ async function setup(msg) {
   sabAttn = new Float32Array(sab, msg.attnOff, msg.nH * msg.hd);
   sabKcur = new Float32Array(sab, msg.kcurOff, msg.nKV * msg.hd);
   sabVcur = new Float32Array(sab, msg.vcurOff, msg.nKV * msg.hd);
-  aNH = msg.nH; aNKV = msg.nKV; aHD = msg.hd; aScale = 1 / Math.sqrt(msg.hd);
+  sabCos = new Float32Array(sab, msg.cosOff, msg.hd / 2);
+  sabSin = new Float32Array(sab, msg.sinOff, msg.hd / 2);
+  aNH = msg.nH; aNKV = msg.nKV; aHD = msg.hd; aScale = 1 / Math.sqrt(msg.hd); aEps = msg.eps;
   await initWasm();
   heapTop = align16(W.heap_base());
   // receive my pre-extracted row-partition (transferred ArrayBuffer) + layout
@@ -62,12 +66,15 @@ async function setup(msg) {
   const h0 = Math.floor(wid * nH / Wn), h1 = Math.floor((wid + 1) * nH / Wn);
   const qbufOff = gr0(hd), qfOff = gr0(hd * 4), kfOff = gr0(hd * 4), vfOff = gr0(hd * 4);
   const scoreOff = gr0(MAXCTX * 4), wOff = gr0(MAXCTX * 4), outOff = gr0(hd * 4);
+  const qnOff = gr0(L * hd * 4), knOff = gr0(L * hd * 4);   // qk-norm weights (all layers)
   const ownedKvh = []; { const seen = {}; for (let h = h0; h < h1; h++) { const kvh = (h / qpk) | 0; if (!seen[kvh]) { seen[kvh] = 1; ownedKvh.push(kvh); } } }
   const kv = {};   // (l*nKV+kvh) -> {ki8,ks,vi8,vs} offsets
   for (let l = 0; l < L; l++) for (const kvh of ownedKvh) kv[l * nKV + kvh] = { ki8: gr0(MAXCTX * hd), ks: gr0(MAXCTX * 4), vi8: gr0(MAXCTX * hd), vs: gr0(MAXCTX * 4) };
   const buf = W.memory.buffer;   // memory stable after here (no more gr0)
+  new Float32Array(buf, qnOff, L * hd).set(msg.qNormAll);
+  new Float32Array(buf, knOff, L * hd).set(msg.kNormAll);
   for (const k in kv) { kv[k].ksV = new Float32Array(buf, kv[k].ks, MAXCTX); kv[k].vsV = new Float32Array(buf, kv[k].vs, MAXCTX); }
-  A = { h0, h1, qpk, hd, nKV, qbufOff, qfOff, kfOff, vfOff, scoreOff, wOff, outOff, kv,
+  A = { h0, h1, qpk, hd, nKV, qbufOff, qfOff, kfOff, vfOff, scoreOff, wOff, outOff, qnOff, knOff, kv,
     qfV: new Float32Array(buf, qfOff, hd), kfV: new Float32Array(buf, kfOff, hd), vfV: new Float32Array(buf, vfOff, hd),
     scoreV: new Float32Array(buf, scoreOff, MAXCTX), wV: new Float32Array(buf, wOff, MAXCTX), outV: new Float32Array(buf, outOff, hd) };
   postMessage({ ready: true });
@@ -103,20 +110,25 @@ async function setup(msg) {
       // int8 GQA ATTENTION: workers split heads; each keeps its heads' KV as int8 in PRIVATE
       // wasm memory and runs the O(T·hd) score/accumulate loops via SIMD wasm kernels.
       const l = Atomics.load(ctrl, LAYER), T = Atomics.load(ctrl, TLEN), pos = T - 1, hd = aHD, nKV = A.nKV, qpk = A.qpk, scale = aScale;
-      // 1) append this token's k,v (for the kvh's I own) to my per-layer int8 KV store at `pos`
+      const lqn = A.qnOff + l * hd * 4, lkn = A.knOff + l * hd * 4;   // this layer's qk-norm weights
+      // 1) k-norm + rope the current k, then append k,v (for the kvh's I own) to my per-layer
+      //    int8 KV at `pos`. V is stored raw (no norm/rope), only quantized.
       if (pos < MAXCTX) {
         const seen = {};
         for (let h = A.h0; h < A.h1; h++) {
           const kvh = (h / qpk) | 0; if (seen[kvh]) continue; seen[kvh] = 1;
           const st = A.kv[l * nKV + kvh], o = kvh * hd;
-          A.kfV.set(sabKcur.subarray(o, o + hd)); st.ksV[pos] = W.quant_vec(st.ki8 + pos * hd, A.kfOff, hd);
+          A.kfV.set(sabKcur.subarray(o, o + hd));
+          W.rmsnorm(A.kfOff, A.kfOff, lkn, hd, aEps); ropeV(A.kfV);
+          st.ksV[pos] = W.quant_vec(st.ki8 + pos * hd, A.kfOff, hd);
           A.vfV.set(sabVcur.subarray(o, o + hd)); st.vsV[pos] = W.quant_vec(st.vi8 + pos * hd, A.vfOff, hd);
         }
       }
-      // 2) per owned head: quantize q → int8, SIMD scores, JS softmax, SIMD weighted-V
+      // 2) per owned head: q-norm + rope, quantize q → int8, SIMD scores, JS softmax, SIMD weighted-V
       for (let h = A.h0; h < A.h1; h++) {
         const kvh = (h / qpk) | 0, st = A.kv[l * nKV + kvh], qo = h * hd;
         A.qfV.set(sabQ.subarray(qo, qo + hd));
+        W.rmsnorm(A.qfOff, A.qfOff, lqn, hd, aEps); ropeV(A.qfV);
         const qs = W.quant_vec(A.qbufOff, A.qfOff, hd);
         W.attn_scores(A.scoreOff, A.qbufOff, qs, st.ki8, st.ks, T, hd, scale);
         const sc = A.scoreV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
