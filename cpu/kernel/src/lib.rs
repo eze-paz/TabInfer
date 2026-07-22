@@ -17,6 +17,114 @@
 
 use core::arch::wasm32::*;
 
+// ───────────── swizzle-LUT binary gemv PROTOTYPE v2 (1-swizzle + int16 accumulation) ─────────────
+// The FAST variant: int8 table (16 entries per 4-activation group), ONE i8x16_swizzle per group
+// × 16 output rows, accumulate partials in int16 with periodic flush to int32. Table entries fit
+// int8 by rounding-requantizing activations to int6 (4×31 = 124 <= 127). ~7 instr / 64 MACs vs
+// relaxed-dot's ~18/64 → ~2.6× fewer instructions on paper. Binary weights {-1,+1}.
+
+/// Build 16-entry int8 LUTs from int8 act, rounding-requantized to int6 (±31). tbl: (k/4)*16 bytes.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn build_lut_bin(tbl: *mut i8, act: *const i8, k: u32) {
+    let ng = (k / 4) as usize;
+    // round-requantize i8 (±127) → i6 (±31): round(a*31/127)
+    let rq = |a: i8| -> i32 { let v = (a as i32) * 31; (if v >= 0 { v + 63 } else { v - 63 }) / 127 };
+    for g in 0..ng {
+        let a0 = rq(*act.add(4 * g)); let a1 = rq(*act.add(4 * g + 1));
+        let a2 = rq(*act.add(4 * g + 2)); let a3 = rq(*act.add(4 * g + 3));
+        let base = tbl.add(g * 16);
+        let mut idx = 0i32;
+        while idx < 16 {
+            let s = (if idx & 1 != 0 { a0 } else { -a0 }) + (if idx & 2 != 0 { a1 } else { -a1 })
+                + (if idx & 4 != 0 { a2 } else { -a2 }) + (if idx & 8 != 0 { a3 } else { -a3 });
+            *base.add(idx as usize) = s as i8; // |s| <= 124
+            idx += 1;
+        }
+    }
+}
+
+/// TERNARY g=2 LUT: index = 2 ternary codes {0,1,2} packed (c1<<2)|c0. int7-requant acts so a
+/// 2-group sum fits int8. Keeps the ternary model (no binary downgrade). tbl: (k/2)*16 bytes.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn build_lut_tern(tbl: *mut i8, act: *const i8, k: u32) {
+    let ng = (k / 2) as usize;
+    let rq = |a: i8| -> i32 { let v = (a as i32) * 63; (if v >= 0 { v + 63 } else { v - 63 }) / 127 }; // →int7 ±63
+    for g in 0..ng {
+        let a0 = rq(*act.add(2 * g)); let a1 = rq(*act.add(2 * g + 1));
+        let base = tbl.add(g * 16);
+        let mut idx = 0i32;
+        while idx < 16 {
+            let c0 = idx & 3; let c1 = (idx >> 2) & 3;
+            let s = if c0 == 3 || c1 == 3 { 0 } else { (c0 - 1) * a0 + (c1 - 1) * a1 };
+            *base.add(idx as usize) = s as i8; // |s| <= 126
+            idx += 1;
+        }
+    }
+}
+
+/// out[N] i32 = Σ (code-1)·a_i7 via 1-swizzle + int16 accum, ternary g=2. n%16==0.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn gemv_lut_tern(out: *mut i32, widx: *const u8, tbl: *const i8, n: u32, k: u32) {
+    let ng = (k / 2) as usize;
+    let nb = (n / 16) as usize;
+    for b in 0..nb {
+        let mut c0v = i32x4_splat(0); let mut c1v = i32x4_splat(0); let mut c2v = i32x4_splat(0); let mut c3v = i32x4_splat(0);
+        let mut lo = i16x8_splat(0); let mut hi = i16x8_splat(0);
+        let wb = widx.add(b * ng * 16);
+        let mut g = 0usize; let mut cnt = 0u32;
+        while g < ng {
+            let p = i8x16_swizzle(v128_load(tbl.add(g * 16) as *const v128), v128_load(wb.add(g * 16) as *const v128));
+            lo = i16x8_add(lo, i16x8_extend_low_i8x16(p));
+            hi = i16x8_add(hi, i16x8_extend_high_i8x16(p));
+            cnt += 1;
+            if cnt == 256 {
+                c0v = i32x4_add(c0v, i32x4_extend_low_i16x8(lo)); c1v = i32x4_add(c1v, i32x4_extend_high_i16x8(lo));
+                c2v = i32x4_add(c2v, i32x4_extend_low_i16x8(hi)); c3v = i32x4_add(c3v, i32x4_extend_high_i16x8(hi));
+                lo = i16x8_splat(0); hi = i16x8_splat(0); cnt = 0;
+            }
+            g += 1;
+        }
+        c0v = i32x4_add(c0v, i32x4_extend_low_i16x8(lo)); c1v = i32x4_add(c1v, i32x4_extend_high_i16x8(lo));
+        c2v = i32x4_add(c2v, i32x4_extend_low_i16x8(hi)); c3v = i32x4_add(c3v, i32x4_extend_high_i16x8(hi));
+        v128_store(out.add(b * 16) as *mut v128, c0v); v128_store(out.add(b * 16 + 4) as *mut v128, c1v);
+        v128_store(out.add(b * 16 + 8) as *mut v128, c2v); v128_store(out.add(b * 16 + 12) as *mut v128, c3v);
+    }
+}
+
+/// out[N] i32 = Σ w·a_i6 via 1-swizzle + int16 accumulation (flush every 256 groups). n%16==0.
+/// Result is in int6-activation units; caller scales by (127/31)*act_scale.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn gemv_lut_bin_fast(out: *mut i32, widx: *const u8, tbl: *const i8, n: u32, k: u32) {
+    let ng = (k / 4) as usize;
+    let nb = (n / 16) as usize;
+    for b in 0..nb {
+        let mut c0 = i32x4_splat(0); let mut c1 = i32x4_splat(0); let mut c2 = i32x4_splat(0); let mut c3 = i32x4_splat(0);
+        let mut lo = i16x8_splat(0); let mut hi = i16x8_splat(0); // int16 accumulators (16 rows)
+        let wb = widx.add(b * ng * 16);
+        let mut g = 0usize; let mut cnt = 0u32;
+        while g < ng {
+            let p = i8x16_swizzle(v128_load(tbl.add(g * 16) as *const v128), v128_load(wb.add(g * 16) as *const v128));
+            lo = i16x8_add(lo, i16x8_extend_low_i8x16(p));
+            hi = i16x8_add(hi, i16x8_extend_high_i8x16(p));
+            cnt += 1;
+            if cnt == 256 { // flush int16 → int32 before overflow
+                c0 = i32x4_add(c0, i32x4_extend_low_i16x8(lo)); c1 = i32x4_add(c1, i32x4_extend_high_i16x8(lo));
+                c2 = i32x4_add(c2, i32x4_extend_low_i16x8(hi)); c3 = i32x4_add(c3, i32x4_extend_high_i16x8(hi));
+                lo = i16x8_splat(0); hi = i16x8_splat(0); cnt = 0;
+            }
+            g += 1;
+        }
+        c0 = i32x4_add(c0, i32x4_extend_low_i16x8(lo)); c1 = i32x4_add(c1, i32x4_extend_high_i16x8(lo));
+        c2 = i32x4_add(c2, i32x4_extend_low_i16x8(hi)); c3 = i32x4_add(c3, i32x4_extend_high_i16x8(hi));
+        v128_store(out.add(b * 16) as *mut v128, c0); v128_store(out.add(b * 16 + 4) as *mut v128, c1);
+        v128_store(out.add(b * 16 + 8) as *mut v128, c2); v128_store(out.add(b * 16 + 12) as *mut v128, c3);
+    }
+}
+
 #[panic_handler]
 fn ph(_: &core::panic::PanicInfo) -> ! {
     loop {}

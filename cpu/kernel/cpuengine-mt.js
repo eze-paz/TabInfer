@@ -191,6 +191,13 @@ const CPUEngineMT = (function () {
       sabAct.set(qDstI8.subarray(0, K));            // int8 activation → SAB (small memcpy)
       sabXsum.set(qXsumI32.subarray(0, K / 64));    // per-group sums → SAB
     }
+    if (globalThis.__act6) {  // TEST: requantize activation to int6 (±31) to gauge LUT-precision quality
+      const K64 = K / 64;
+      for (let k = 0; k < K; k++) { let q = Math.round(sabAct[k] * 31 / 127); q = q < -31 ? -31 : q > 31 ? 31 : q; sabAct[k] = q; }
+      for (let g = 0; g < K64; g++) { let t = 0, b0 = g * 64; for (let j = 0; j < 64; j++) t += sabAct[b0 + j]; sabXsum[g] = t; }
+      asc *= 127 / 31;
+      if (mainOn) { qDstI8.set(sabAct.subarray(0, K)); qXsumI32.set(sabXsum.subarray(0, K64)); }
+    }
     sabAsc[0] = asc;
     const t1 = P ? _now() : 0;
     const offs = dispatchMM(names, 1);
