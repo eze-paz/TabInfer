@@ -88,6 +88,94 @@ pub unsafe extern "C" fn gemv_tern(
     }
 }
 
+// ─────────────────────────── main-thread serial ops (SIMD) ───────────────────────────
+// These run on the COORDINATOR's own wasm instance (private memory). They replace the
+// scalar-JS quant / rmsnorm on the critical path (blocking all workers). K is always a
+// multiple of 64 here (H=2048, I=6144), so no scalar tail.
+
+#[inline(always)]
+unsafe fn hsum_i32x4(v: v128) -> i32 {
+    i32x4_extract_lane::<0>(v) + i32x4_extract_lane::<1>(v)
+        + i32x4_extract_lane::<2>(v) + i32x4_extract_lane::<3>(v)
+}
+
+#[inline(always)]
+unsafe fn qi32(x: *const f32, i: usize, vinv: v128) -> v128 {
+    // round-to-nearest(x*inv) → i32, clamped to [-127,127] (matches JS Math.round+clamp
+    // closely; half-to-even vs half-up differs only on exact .5 = quant noise).
+    let v = f32x4_mul(v128_load(x.add(i) as *const v128), vinv);
+    let q = i32x4_trunc_sat_f32x4(f32x4_nearest(v));
+    i32x4_min(i32x4_max(q, i32x4_splat(-127)), i32x4_splat(127))
+}
+
+/// Per-tensor int8 quantize of x[k] → dst (i8) + per-group(64) sums xsum (i32).
+/// Returns the activation scale asc = amax/127 (JS multiplies gemv output by it).
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn quantize(dst: *mut i8, xsum: *mut i32, x: *const f32, k: u32) -> f32 {
+    let k = k as usize;
+    // pass 1: amax(|x|)
+    let mut vmax = f32x4_splat(0.0);
+    let mut i = 0usize;
+    while i + 4 <= k {
+        vmax = f32x4_max(vmax, f32x4_abs(v128_load(x.add(i) as *const v128)));
+        i += 4;
+    }
+    let amax = f32x4_extract_lane::<0>(vmax)
+        .max(f32x4_extract_lane::<1>(vmax))
+        .max(f32x4_extract_lane::<2>(vmax))
+        .max(f32x4_extract_lane::<3>(vmax));
+    let asc = if amax > 0.0 { amax / 127.0 } else { 1e-9 };
+    let vinv = f32x4_splat(1.0 / asc);
+    // pass 2: quantize 16/iter, 64/group; narrow i32→i16→i8 (saturating, already clamped)
+    let mut b = 0usize; // block (group) index
+    i = 0;
+    while i < k {
+        let mut gsum = i32x4_splat(0);
+        let mut j = 0usize;
+        while j < 64 {
+            let q0 = qi32(x, i + j, vinv);
+            let q1 = qi32(x, i + j + 4, vinv);
+            let q2 = qi32(x, i + j + 8, vinv);
+            let q3 = qi32(x, i + j + 12, vinv);
+            gsum = i32x4_add(gsum, i32x4_add(i32x4_add(q0, q1), i32x4_add(q2, q3)));
+            let i8v = i8x16_narrow_i16x8(i16x8_narrow_i32x4(q0, q1), i16x8_narrow_i32x4(q2, q3));
+            v128_store(dst.add(i + j) as *mut v128, i8v);
+            j += 16;
+        }
+        *xsum.add(b) = hsum_i32x4(gsum);
+        b += 1;
+        i += 64;
+    }
+    asc
+}
+
+/// out = (x / sqrt(mean(x²) + eps)) * w, over n (multiple of 4).
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn rmsnorm(dst: *mut f32, x: *const f32, w: *const f32, n: u32, eps: f32) {
+    let n = n as usize;
+    let mut vs = f32x4_splat(0.0);
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let v = v128_load(x.add(i) as *const v128);
+        vs = f32x4_add(vs, f32x4_mul(v, v));
+        i += 4;
+    }
+    let ss = f32x4_extract_lane::<0>(vs) + f32x4_extract_lane::<1>(vs)
+        + f32x4_extract_lane::<2>(vs) + f32x4_extract_lane::<3>(vs);
+    // inv = 1/sqrt(ss/n + eps) via the SIMD sqrt intrinsic (no std in no_std).
+    let root = f32x4_extract_lane::<0>(f32x4_sqrt(f32x4_splat(ss / (n as f32) + eps)));
+    let vinv = f32x4_splat(1.0 / root);
+    i = 0;
+    while i + 4 <= n {
+        let xv = v128_load(x.add(i) as *const v128);
+        let wv = v128_load(w.add(i) as *const v128);
+        v128_store(dst.add(i) as *mut v128, f32x4_mul(f32x4_mul(xv, vinv), wv));
+        i += 4;
+    }
+}
+
 /// Start of usable linear memory above the module's static data + shadow stack.
 /// JS reads this, grows `memory` as needed, and lays out codes/scales/act/xsum/out
 /// from here on — no allocator in the wasm.

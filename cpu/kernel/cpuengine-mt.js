@@ -18,6 +18,17 @@ const CPUEngineMT = (function () {
   const MAXCTX = 512; // KV positions held in the shared buffer
   let Wn = 8, workers = [], ctrl, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKV, _kvStride = 0;
   let embedF16 = null; const nrm = {}, mats = {}; // name -> {mid,N,K}
+  // MAIN-THREAD wasm instance (private memory) for the SIMD serial ops (quant + rmsnorm)
+  // that otherwise run as scalar JS on the critical path, blocking every worker.
+  let MW = null, mheap = 0, qDstOff = 0, qXsumOff = 0; const nrmOff = {}; // norm-weight → wasm offset
+  async function initMainWasm() {
+    const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
+    MW = (await WebAssembly.instantiate(buf, {})).instance.exports;
+  }
+  const align16 = x => (x + 15) & ~15;
+  function mgrowTo(topBytes) { const have = MW.memory.buffer.byteLength; if (topBytes > have) MW.memory.grow(Math.ceil((topBytes - have) / 65536) + 1); }
+  function malloc(bytes) { const off = align16(mheap); mheap = off + bytes; mgrowTo(mheap); return off; }
+  const f32view = off => new Float32Array(MW.memory.buffer, off, undefined); // caller slices
   const _b = new ArrayBuffer(4), _bf = new Float32Array(_b), _bi = new Int32Array(_b);
   const f2i = (v) => { _bf[0] = v; return _bi[0]; };
   function f16f(h) { const s = (h & 0x8000) >> 15, e = (h & 0x7c00) >> 10, f = h & 0x3ff;
@@ -40,6 +51,8 @@ const CPUEngineMT = (function () {
       if (t.kind === 'embed_f16') embedF16 = new Uint16Array(ab.slice(dataBase + t.off, dataBase + t.off + t.len));
       else if (t.kind === 'f32') nrm[name] = new Float32Array(ab.slice(dataBase + t.off, dataBase + t.off + t.len));
     }
+    await initMainWasm();
+    buildMainBufs();  // wasm-backed hot buffers + norm weights into main wasm memory
     // SAB: ctrl + act(i8) + xsum(i32) + out(f32) + q(f32 nH*hd) + attn(f32 nH*hd)
     //      + KV(f32, L layers × {K,V} × MAXCTX × nKV*hd) — KV shared so workers can do attention.
     const maxK = CFG.I, maxN = CFG.vocab, H = CFG.H, hd = CFG.hd, nH = CFG.nH, nKV = CFG.nKV, L = CFG.L;
@@ -86,6 +99,31 @@ const CPUEngineMT = (function () {
     await Promise.all(readies);
   }
 
+  // cached scratch views into main-wasm memory (stable — no malloc after buildMainBufs)
+  let qDstI8 = null, qXsumI32 = null, qXinF32 = null, qXinOff = 0;
+  // Allocate every main-wasm buffer FIRST (malloc only grows + records offsets), THEN create
+  // all views against the final buffer — growing detaches earlier views, so views come last.
+  function buildMainBufs() {
+    const { H, hd, nH, nKV, I, vocab } = CFG, maxK = CFG.I;
+    mheap = MW.heap_base();
+    const oDst = malloc(maxK), oXsum = malloc((maxK / 64) * 4), oXin = malloc(maxK * 4);
+    const oX = malloc(H * 4), oXn = malloc(H * 4), oXn2 = malloc(H * 4), oXf = malloc(H * 4),
+      oAttn = malloc(nH * hd * 4), oSwi = malloc(I * 4);
+    const normNames = Object.keys(nrm), nO = {};
+    for (const nm of normNames) nO[nm] = malloc(nrm[nm].length * 4);
+    const buf = MW.memory.buffer;   // final buffer — no more mallocs past here
+    qDstI8 = new Int8Array(buf, oDst, maxK); qXsumI32 = new Int32Array(buf, oXsum, maxK / 64);
+    qXinF32 = new Float32Array(buf, oXin, maxK); qXinOff = oXin; qDstOff = oDst; qXsumOff = oXsum;
+    const wv = (off, n, key) => { const a = new Float32Array(buf, off, n); a.__off = off; return a; };
+    B = {
+      x: wv(oX, H), xn: wv(oXn, H), xn2: wv(oXn2, H), xf: wv(oXf, H), attn: wv(oAttn, nH * hd), swi: wv(oSwi, I),
+      q: new Float32Array(nH * hd), k: new Float32Array(nKV * hd), v: new Float32Array(nKV * hd),
+      gate: new Float32Array(I), up: new Float32Array(I), o: new Float32Array(H), logits: new Float32Array(vocab),
+      hn: new Float32Array(hd), cosT: new Float32Array(hd / 2), sinT: new Float32Array(hd / 2),
+    };
+    for (const nm of normNames) { new Float32Array(buf, nO[nm], nrm[nm].length).set(nrm[nm]); nrmOff[nm] = nO[nm]; }
+  }
+
   let P = null; // {quant, barrier, gather, n}
   function profReset() { P = { quant: 0, barrier: 0, gather: 0, n: 0 }; }
   function profGet() { return P; }
@@ -96,16 +134,20 @@ const CPUEngineMT = (function () {
   // Batched threaded matmul: `names` (1..3) all consume the SAME input x → quantize x ONCE,
   // dispatch all of them in one barrier, gather each into outs[i]. Workers loop over the batch.
   function mmBatch(names, x, outs) {
-    const K = mats[names[0]].K, ng = K / CFG.G;
+    const K = mats[names[0]].K;
     const t0 = P ? _now() : 0;
-    let amax = 0; for (let k = 0; k < K; k++) { const a = x[k] < 0 ? -x[k] : x[k]; if (a > amax) amax = a; }
-    const asc = amax / 127 || 1e-9, inv = 1 / asc;
-    // quantize + per-group sum in ONE pass (was a separate xsum pass over K)
-    const G = CFG.G; let gi = 0, gs = 0;
-    for (let k = 0; k < K; k++) {
-      let q = Math.round(x[k] * inv); q = q < -127 ? -127 : q > 127 ? 127 : q;
-      sabAct[k] = q; gs += q;
-      if ((k + 1) % G === 0) { sabXsum[gi++] = gs; gs = 0; }
+    let asc;
+    if (globalThis.__jsQuant) { // A/B: legacy scalar-JS quant (fused xsum)
+      let amax = 0; for (let k = 0; k < K; k++) { const a = x[k] < 0 ? -x[k] : x[k]; if (a > amax) amax = a; }
+      asc = amax / 127 || 1e-9; const inv = 1 / asc; const G = CFG.G; let gi = 0, gs = 0;
+      for (let k = 0; k < K; k++) { let q = Math.round(x[k] * inv); q = q < -127 ? -127 : q > 127 ? 127 : q; sabAct[k] = q; gs += q; if ((k + 1) % G === 0) { sabXsum[gi++] = gs; gs = 0; } }
+    } else {
+      // SIMD quant in the main wasm instance (was scalar JS on the critical path). x must live
+      // in wasm memory (all matmul inputs are wasm-backed and carry __off); guard-copy otherwise.
+      let xo = x.__off; if (xo === undefined) { qXinF32.set(x.subarray(0, K)); xo = qXinOff; }
+      asc = MW.quantize(qDstOff, qXsumOff, xo, K);
+      sabAct.set(qDstI8.subarray(0, K));            // int8 activation → SAB (small memcpy)
+      sabXsum.set(qXsumI32.subarray(0, K / 64));    // per-group sums → SAB
     }
     let off = 0; const offs = [];
     for (let i = 0; i < names.length; i++) { offs.push(off); Atomics.store(ctrl, MATID0 + i, mats[names[i]].mid); Atomics.store(ctrl, OUTOFF0 + i, off); off += mats[names[i]].N; }
@@ -134,24 +176,29 @@ const CPUEngineMT = (function () {
     return out;
   }
 
+  // JS rmsnorm — used only for the small per-head qk-norm (over hd=128, on the non-wasm B.q/B.k).
+  // The big H-sized norms go through MW.rmsnorm (SIMD).
   function rmsnorm(x, w, n, out) { let s = 0; for (let i = 0; i < n; i++) s += x[i] * x[i]; const inv = 1 / Math.sqrt(s / n + CFG.eps); for (let i = 0; i < n; i++) out[i] = x[i] * inv * w[i]; return out; }
-  function rope(v, off, pos) { const hd = CFG.hd, half = hd / 2; for (let i = 0; i < half; i++) { const fr = Math.pow(CFG.theta, -(2 * i) / hd), a = pos * fr, c = Math.cos(a), s = Math.sin(a); const x0 = v[off + i], x1 = v[off + i + half]; v[off + i] = x0 * c - x1 * s; v[off + i + half] = x1 * c + x0 * s; } }
+  // rope with cos/sin PRECOMPUTED once per token (B.cosT/B.sinT) — they depend only on (pos,i),
+  // identical across all 24 q/k heads, so computing them once kills 23/24 of the transcendentals.
+  function ropeC(v, off) { const hd = CFG.hd, half = hd / 2, cT = B.cosT, sT = B.sinT; for (let i = 0; i < half; i++) { const c = cT[i], s = sT[i], x0 = v[off + i], x1 = v[off + i + half]; v[off + i] = x0 * c - x1 * s; v[off + i + half] = x1 * c + x0 * s; } }
 
   let B = null;
-  function ensureBufs() { if (B) return; const { H, hd, nH, nKV, I, vocab } = CFG;
-    B = { x: new Float32Array(H), xn: new Float32Array(H), xn2: new Float32Array(H), q: new Float32Array(nH * hd), k: new Float32Array(nKV * hd), v: new Float32Array(nKV * hd), attn: new Float32Array(nH * hd), gate: new Float32Array(I), up: new Float32Array(I), swi: new Float32Array(I), o: new Float32Array(H), xf: new Float32Array(H), logits: new Float32Array(vocab), hn: new Float32Array(hd), scores: new Float32Array(16384) }; }
+  function ensureBufs() { if (!B) throw new Error('CPUEngineMT: call load() before forward()'); }
 
   function forward(tokenId, pos, kv) {
-    const { H, hd, nH, nKV, L, I } = CFG; ensureBufs(); const x = B.x;
+    const { H, hd, nH, nKV, L, I, eps, theta } = CFG; ensureBufs(); const x = B.x;
     for (let i = 0; i < H; i++) x[i] = f16f(embedF16[tokenId * H + i]);
+    // precompute rope cos/sin for this position (shared by all heads)
+    { const half = hd / 2; for (let i = 0; i < half; i++) { const a = pos * Math.pow(theta, -(2 * i) / hd); B.cosT[i] = Math.cos(a); B.sinT[i] = Math.sin(a); } }
     for (let l = 0; l < L; l++) {
       const p = `model.layers.${l}.`;
-      rmsnorm(x, nrm[p + 'input_layernorm.weight'], H, B.xn);
+      MW.rmsnorm(B.xn.__off, x.__off, nrmOff[p + 'input_layernorm.weight'], H, eps);
       if (globalThis.__noBatch) { mmT(p + 'self_attn.q_proj.weight', B.xn, B.q); mmT(p + 'self_attn.k_proj.weight', B.xn, B.k); mmT(p + 'self_attn.v_proj.weight', B.xn, B.v); }
       else mmBatch([p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'], B.xn, [B.q, B.k, B.v]);
       const qnw = nrm[p + 'self_attn.q_norm.weight'], knw = nrm[p + 'self_attn.k_norm.weight'];
-      for (let h = 0; h < nH; h++) { const off = h * hd; rmsnorm(B.q.subarray(off, off + hd), qnw, hd, B.hn); for (let i = 0; i < hd; i++) B.q[off + i] = B.hn[i]; rope(B.q, off, pos); }
-      for (let h = 0; h < nKV; h++) { const off = h * hd; rmsnorm(B.k.subarray(off, off + hd), knw, hd, B.hn); for (let i = 0; i < hd; i++) B.k[off + i] = B.hn[i]; rope(B.k, off, pos); }
+      for (let h = 0; h < nH; h++) { const off = h * hd; rmsnorm(B.q.subarray(off, off + hd), qnw, hd, B.hn); for (let i = 0; i < hd; i++) B.q[off + i] = B.hn[i]; ropeC(B.q, off); }
+      for (let h = 0; h < nKV; h++) { const off = h * hd; rmsnorm(B.k.subarray(off, off + hd), knw, hd, B.hn); for (let i = 0; i < hd; i++) B.k[off + i] = B.hn[i]; ropeC(B.k, off); }
       // publish q (post norm+rope) and this token's K,V into the shared buffers, then thread attention
       sabQ.set(B.q);
       const kBase = l * 2 * _kvStride + pos * nKV * hd, vBase = l * 2 * _kvStride + _kvStride + pos * nKV * hd;
@@ -159,14 +206,14 @@ const CPUEngineMT = (function () {
       attnThreaded(l, pos + 1, B.attn);
       mmT(p + 'self_attn.o_proj.weight', B.attn, B.o);
       for (let i = 0; i < H; i++) x[i] += B.o[i];
-      rmsnorm(x, nrm[p + 'post_attention_layernorm.weight'], H, B.xn2);
+      MW.rmsnorm(B.xn2.__off, x.__off, nrmOff[p + 'post_attention_layernorm.weight'], H, eps);
       if (globalThis.__noBatch) { mmT(p + 'mlp.gate_proj.weight', B.xn2, B.gate); mmT(p + 'mlp.up_proj.weight', B.xn2, B.up); }
       else mmBatch([p + 'mlp.gate_proj.weight', p + 'mlp.up_proj.weight'], B.xn2, [B.gate, B.up]);
       for (let i = 0; i < I; i++) { const g = B.gate[i]; B.swi[i] = (g / (1 + Math.exp(-g))) * B.up[i]; }
       mmT(p + 'mlp.down_proj.weight', B.swi, B.o);
       for (let i = 0; i < H; i++) x[i] += B.o[i];
     }
-    rmsnorm(x, nrm['model.norm.weight'], H, B.xf);
+    MW.rmsnorm(B.xf.__off, x.__off, nrmOff['model.norm.weight'], H, eps);
     mmT('lm_head.weight', B.xf, B.logits);
     return B.logits;
   }
