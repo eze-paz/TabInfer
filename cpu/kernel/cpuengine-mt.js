@@ -21,6 +21,10 @@ const CPUEngineMT = (function () {
   // MAIN-THREAD wasm instance (private memory) for the SIMD serial ops (quant + rmsnorm)
   // that otherwise run as scalar JS on the critical path, blocking every worker.
   let MW = null, mheap = 0, qDstOff = 0, qXsumOff = 0; const nrmOff = {}; // norm-weight → wasm offset
+  // main-thread gemv PARTICIPATION: main holds its own row-slice of every matrix in MW memory
+  // and computes it (via MW.gemv_tern) while the workers compute theirs — using the P-core it
+  // otherwise burns spin-waiting in waitBarrier. mainMeta[mid] = {codesOff,scalesOff,r0,rows,K}.
+  let mainOn = true, mainOutOff = 0, mainOutV = null; const mainMeta = {};
   async function initMainWasm() {
     const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
     MW = (await WebAssembly.instantiate(buf, {})).instance.exports;
@@ -39,6 +43,8 @@ const CPUEngineMT = (function () {
   async function load(binUrl, nWorkers) {
     if (workers.length) { try { Atomics.store(ctrl, NMAT, -1); Atomics.add(ctrl, GEN, 1); workers.forEach(w => w.terminate()); } catch (_) {} workers = []; }
     Wn = nWorkers || 8;
+    mainOn = globalThis.__mainCompute !== false;
+    const parts = Wn + (mainOn ? 1 : 0);   // main participates as a (Wn+1)-th gemv slice
     const ab = await (await fetch(binUrl)).arrayBuffer();
     const dv = new DataView(ab), hlen = dv.getUint32(0, true);
     const header = JSON.parse(new TextDecoder().decode(new Uint8Array(ab, 4, hlen)));
@@ -52,7 +58,7 @@ const CPUEngineMT = (function () {
       else if (t.kind === 'f32') nrm[name] = new Float32Array(ab.slice(dataBase + t.off, dataBase + t.off + t.len));
     }
     await initMainWasm();
-    buildMainBufs();  // wasm-backed hot buffers + norm weights into main wasm memory
+    buildMainBufs(ab, dataBase, ternNames, T, parts);  // wasm buffers + norm weights + main's weight slice
     // SAB: ctrl + act(i8) + xsum(i32) + out(f32) + q(f32 nH*hd) + attn(f32 nH*hd)
     //      + kcur/vcur (f32 nKV*hd) — ONLY the current token's k,v. The KV history now lives
     //      as int8 in each worker's PRIVATE wasm memory (per head it owns), so no giant f32
@@ -87,7 +93,7 @@ const CPUEngineMT = (function () {
       let bytes = 0; const ents = [];
       for (const name of ternNames) {
         const t = T[name], N = t.N, K = t.K, ng = K / 64, bpr = K / 4;
-        const r0 = Math.floor(w * N / Wn), r1 = Math.floor((w + 1) * N / Wn), rows = r1 - r0;
+        const r0 = Math.floor(w * N / parts), r1 = Math.floor((w + 1) * N / parts), rows = r1 - r0;
         const cl = rows * bpr, sl = rows * ng * 4;
         ents.push({ mid: mats[name].mid, r0, rows, K, cl, sl, csrc: dataBase + t.codesOff + r0 * bpr, ssrc: dataBase + t.scalesOff + r0 * ng * 4 });
         bytes += cl + sl;
@@ -111,18 +117,28 @@ const CPUEngineMT = (function () {
   let qDstI8 = null, qXsumI32 = null, qXinF32 = null, qXinOff = 0;
   // Allocate every main-wasm buffer FIRST (malloc only grows + records offsets), THEN create
   // all views against the final buffer — growing detaches earlier views, so views come last.
-  function buildMainBufs() {
+  function buildMainBufs(ab, dataBase, ternNames, T, parts) {
     const { H, hd, nH, nKV, I, vocab } = CFG, maxK = CFG.I;
     mheap = MW.heap_base();
     const oDst = malloc(maxK), oXsum = malloc((maxK / 64) * 4), oXin = malloc(maxK * 4);
+    const oOut = malloc((Math.ceil(vocab / parts) + 64) * 4);   // main's gemv output slice
     const oX = malloc(H * 4), oXn = malloc(H * 4), oXn2 = malloc(H * 4), oXf = malloc(H * 4),
       oAttn = malloc(nH * hd * 4), oSwi = malloc(I * 4);
     const normNames = Object.keys(nrm), nO = {};
     for (const nm of normNames) nO[nm] = malloc(nrm[nm].length * 4);
+    // main's weight slice: rows [Wn*N/parts, N) of every matrix (mainOn only; else parts==Wn)
+    const srcU8 = new Uint8Array(ab); const mEnt = [];
+    if (mainOn) for (const name of ternNames) {
+      const t = T[name], N = t.N, K = t.K, ng = K / 64, bpr = K / 4;
+      const r0 = Math.floor((parts - 1) * N / parts), rows = N - r0;
+      const oc = malloc(rows * bpr), os = malloc(rows * ng * 4);
+      mEnt.push({ mid: mats[name].mid, r0, rows, K, oc, os, csrc: dataBase + t.codesOff + r0 * bpr, ssrc: dataBase + t.scalesOff + r0 * ng * 4, cl: rows * bpr, sl: rows * ng * 4 });
+    }
     const buf = MW.memory.buffer;   // final buffer — no more mallocs past here
     qDstI8 = new Int8Array(buf, oDst, maxK); qXsumI32 = new Int32Array(buf, oXsum, maxK / 64);
     qXinF32 = new Float32Array(buf, oXin, maxK); qXinOff = oXin; qDstOff = oDst; qXsumOff = oXsum;
-    const wv = (off, n, key) => { const a = new Float32Array(buf, off, n); a.__off = off; return a; };
+    mainOutOff = oOut; mainOutV = new Float32Array(buf, oOut, Math.ceil(vocab / parts) + 64);
+    const wv = (off, n) => { const a = new Float32Array(buf, off, n); a.__off = off; return a; };
     B = {
       x: wv(oX, H), xn: wv(oXn, H), xn2: wv(oXn2, H), xf: wv(oXf, H), attn: wv(oAttn, nH * hd), swi: wv(oSwi, I),
       q: new Float32Array(nH * hd), k: new Float32Array(nKV * hd), v: new Float32Array(nKV * hd),
@@ -130,6 +146,11 @@ const CPUEngineMT = (function () {
       hn: new Float32Array(hd), cosT: new Float32Array(hd / 2), sinT: new Float32Array(hd / 2),
     };
     for (const nm of normNames) { new Float32Array(buf, nO[nm], nrm[nm].length).set(nrm[nm]); nrmOff[nm] = nO[nm]; }
+    for (const e of mEnt) {   // copy main's weight slice into MW memory
+      new Uint8Array(buf, e.oc, e.cl).set(srcU8.subarray(e.csrc, e.csrc + e.cl));
+      new Uint8Array(buf, e.os, e.sl).set(srcU8.subarray(e.ssrc, e.ssrc + e.sl));
+      mainMeta[e.mid] = { codesOff: e.oc, scalesOff: e.os, r0: e.r0, rows: e.rows, K: e.K };
+    }
   }
 
   let P = null; // {quant, barrier, gather, n}
@@ -149,6 +170,7 @@ const CPUEngineMT = (function () {
       let amax = 0; for (let k = 0; k < K; k++) { const a = x[k] < 0 ? -x[k] : x[k]; if (a > amax) amax = a; }
       asc = amax / 127 || 1e-9; const inv = 1 / asc; const G = CFG.G; let gi = 0, gs = 0;
       for (let k = 0; k < K; k++) { let q = Math.round(x[k] * inv); q = q < -127 ? -127 : q > 127 ? 127 : q; sabAct[k] = q; gs += q; if ((k + 1) % G === 0) { sabXsum[gi++] = gs; gs = 0; } }
+      if (mainOn) { qDstI8.set(sabAct.subarray(0, K)); qXsumI32.set(sabXsum.subarray(0, K / 64)); }  // keep main's copy valid
     } else {
       // SIMD quant in the main wasm instance (was scalar JS on the critical path). x must live
       // in wasm memory (all matmul inputs are wasm-backed and carry __off); guard-copy otherwise.
@@ -164,6 +186,15 @@ const CPUEngineMT = (function () {
     const t1 = P ? _now() : 0;
     const g = Atomics.add(ctrl, GEN, 1) + 1;
     Atomics.notify(ctrl, GEN);
+    // MAIN computes its own row-slice (in MW memory) WHILE the workers compute theirs — the
+    // P-core that used to just spin-wait in waitBarrier now does ~1/(Wn+1) of the gemv.
+    if (mainOn) {
+      for (let i = 0; i < names.length; i++) {
+        const m = mainMeta[mats[names[i]].mid]; if (!m || m.rows <= 0) continue;
+        MW.gemv_tern(mainOutOff, m.codesOff, m.scalesOff, qDstOff, qXsumOff, m.rows, m.K);
+        const base = offs[i] + m.r0; for (let j = 0; j < m.rows; j++) sabOut[base + j] = mainOutV[j] * asc;
+      }
+    }
     waitBarrier(g);
     const t2 = P ? _now() : 0;
     for (let i = 0; i < names.length; i++) outs[i].set(sabOut.subarray(offs[i], offs[i] + mats[names[i]].N));
