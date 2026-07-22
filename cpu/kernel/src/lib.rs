@@ -23,6 +23,69 @@ use core::arch::wasm32::*;
 // int8 by rounding-requantizing activations to int6 (4×31 = 124 <= 127). ~7 instr / 64 MACs vs
 // relaxed-dot's ~18/64 → ~2.6× fewer instructions on paper. Binary weights {-1,+1}.
 
+// ── scale-aware LUT gemv (matches gemv_tern's per-G=64 f32 scale contract) ──
+// widx layout: [rowBlock][group][16 rows], byte = code index. scalesB layout: [scaleGroup][rowBlock][16].
+// Accumulate int16 within a G=64 scale-group (safe: 32×126 or 16×124 << 32767), then convert→f32,
+// ×per-row scale, into f32 accumulators. Output f32[nrows] (nrows padded to %16). Caller ×act-scale.
+
+/// TERNARY g=2 scale-aware. tbl from build_lut_tern (int7 acts). 32 lut-groups per scale-group.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn gemv_lut_tern_s(out: *mut f32, widx: *const u8, scalesB: *const f32, tbl: *const i8, nrows: u32, k: u32) {
+    let ng2 = (k / 2) as usize; let nb = (nrows / 16) as usize; let nsg = (k / 64) as usize;
+    for b in 0..nb {
+        let mut f0 = f32x4_splat(0.0); let mut f1 = f32x4_splat(0.0); let mut f2 = f32x4_splat(0.0); let mut f3 = f32x4_splat(0.0);
+        for sg in 0..nsg {
+            let mut lo = i16x8_splat(0); let mut hi = i16x8_splat(0);
+            let g0 = sg * 32;
+            let mut j = 0usize;
+            while j < 32 {
+                let g = g0 + j;
+                let p = i8x16_swizzle(v128_load(tbl.add(g * 16) as *const v128), v128_load(widx.add((b * ng2 + g) * 16) as *const v128));
+                lo = i16x8_add(lo, i16x8_extend_low_i8x16(p));
+                hi = i16x8_add(hi, i16x8_extend_high_i8x16(p));
+                j += 1;
+            }
+            let sc = scalesB.add((sg * nb + b) * 16);
+            f0 = f32x4_add(f0, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_low_i16x8(lo)), v128_load(sc as *const v128)));
+            f1 = f32x4_add(f1, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_high_i16x8(lo)), v128_load(sc.add(4) as *const v128)));
+            f2 = f32x4_add(f2, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_low_i16x8(hi)), v128_load(sc.add(8) as *const v128)));
+            f3 = f32x4_add(f3, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_high_i16x8(hi)), v128_load(sc.add(12) as *const v128)));
+        }
+        v128_store(out.add(b * 16) as *mut v128, f0); v128_store(out.add(b * 16 + 4) as *mut v128, f1);
+        v128_store(out.add(b * 16 + 8) as *mut v128, f2); v128_store(out.add(b * 16 + 12) as *mut v128, f3);
+    }
+}
+
+/// BINARY g=4 scale-aware. tbl from build_lut_bin (int6 acts). 16 lut-groups per scale-group.
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn gemv_lut_bin_s(out: *mut f32, widx: *const u8, scalesB: *const f32, tbl: *const i8, nrows: u32, k: u32) {
+    let ng4 = (k / 4) as usize; let nb = (nrows / 16) as usize; let nsg = (k / 64) as usize;
+    for b in 0..nb {
+        let mut f0 = f32x4_splat(0.0); let mut f1 = f32x4_splat(0.0); let mut f2 = f32x4_splat(0.0); let mut f3 = f32x4_splat(0.0);
+        for sg in 0..nsg {
+            let mut lo = i16x8_splat(0); let mut hi = i16x8_splat(0);
+            let g0 = sg * 16;
+            let mut j = 0usize;
+            while j < 16 {
+                let g = g0 + j;
+                let p = i8x16_swizzle(v128_load(tbl.add(g * 16) as *const v128), v128_load(widx.add((b * ng4 + g) * 16) as *const v128));
+                lo = i16x8_add(lo, i16x8_extend_low_i8x16(p));
+                hi = i16x8_add(hi, i16x8_extend_high_i8x16(p));
+                j += 1;
+            }
+            let sc = scalesB.add((sg * nb + b) * 16);
+            f0 = f32x4_add(f0, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_low_i16x8(lo)), v128_load(sc as *const v128)));
+            f1 = f32x4_add(f1, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_high_i16x8(lo)), v128_load(sc.add(4) as *const v128)));
+            f2 = f32x4_add(f2, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_low_i16x8(hi)), v128_load(sc.add(8) as *const v128)));
+            f3 = f32x4_add(f3, f32x4_mul(f32x4_convert_i32x4(i32x4_extend_high_i16x8(hi)), v128_load(sc.add(12) as *const v128)));
+        }
+        v128_store(out.add(b * 16) as *mut v128, f0); v128_store(out.add(b * 16 + 4) as *mut v128, f1);
+        v128_store(out.add(b * 16 + 8) as *mut v128, f2); v128_store(out.add(b * 16 + 12) as *mut v128, f3);
+    }
+}
+
 /// Build 16-entry int8 LUTs from int8 act, rounding-requantized to int6 (±31). tbl: (k/4)*16 bytes.
 #[target_feature(enable = "simd128")]
 #[no_mangle]
