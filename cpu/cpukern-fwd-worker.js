@@ -101,6 +101,7 @@ async function setup(msg) {
       continue;
     }
     const K = Atomics.load(ctrl, KK), asc = i32f(Atomics.load(ctrl, ASC));
+    const _t0 = performance.now();
     // shared int8 activation → my wasm mem, once for the whole batch
     new Int8Array(W.memory.buffer, sAct, K).set(sabAct.subarray(0, K));
     new Int32Array(W.memory.buffer, sXsum, K / 64).set(sabXsum.subarray(0, K / 64));
@@ -112,6 +113,8 @@ async function setup(msg) {
         for (let i = 0; i < m.rows; i++) sabOut[outOff + m.r0 + i] = lo[i] * asc;
       }
     }
+    // accumulate this worker's total gemv busy-µs (slot+1) for load-balance profiling
+    Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 1, ((performance.now() - _t0) * 1000) | 0);
     Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);   // own cache line — no false sharing
   }
 }

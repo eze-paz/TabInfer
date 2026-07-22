@@ -175,6 +175,9 @@ const CPUEngineMT = (function () {
   function stop() { Atomics.store(ctrl, NMAT, -1); Atomics.add(ctrl, GEN, 1); Atomics.notify(ctrl, GEN); setTimeout(() => workers.forEach(w => w.terminate()), 50); }
 
   const setSpin = (v) => { if (ctrl) Atomics.store(ctrl, SPIN, v | 0); };
-  return { load, forward, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin };
+  // per-worker gemv busy-µs accumulators (slot DONEBASE+w*STRIDE+1) — load-balance probe
+  const busyReset = () => { for (let w = 0; w < Wn; w++) Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 1, 0); };
+  const busyTimes = () => { const a = []; for (let w = 0; w < Wn; w++) a.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 1)); return a; };
+  return { load, forward, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes };
 })();
 if (typeof window !== 'undefined') window.CPUEngineMT = CPUEngineMT;
