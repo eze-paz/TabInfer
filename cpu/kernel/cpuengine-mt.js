@@ -13,7 +13,7 @@ const CPUEngineMT = (function () {
   // Batched barrier: one dispatch computes up to 3 matmuls sharing ONE input activation
   // (q/k/v share xn; gate/up share xn2). Cuts barriers 197→~113 AND quantizes each shared
   // input once instead of per-matmul. Line 0: GEN. Line 1 (slots 16..31): batch spec.
-  const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, DONEBASE = 32, DONESTRIDE = 16;
+  const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16;
   const CTRL_I32 = 32 + 16 * 16; // room for 16 workers
   const MAXCTX = 512; // KV positions held in the shared buffer
   const BMAX = 6;     // max tokens verified per batched (speculative) forward
@@ -113,7 +113,7 @@ const CPUEngineMT = (function () {
       wk.onerror = e => { (globalThis.__wErr = globalThis.__wErr || []).push('onerror w' + wk.__wid + ': ' + (e.message || e)); };
       wk.__wid = w;
       readies.push(new Promise(res => { wk.onmessage = ev => { if (ev.data.workerError) (globalThis.__wErr = globalThis.__wErr || []).push('w' + wk.__wid + ': ' + ev.data.workerError); if (ev.data.ready) res(); }; }));
-      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, BMAX, ascOff, actOff, xsumOff, outOff, qOff, attnOff, kcurOff, vcurOff, cosOff, sinOff, nH, nKV, hd, L: CFG.L, eps: CFG.eps, qNormAll, kNormAll }, [part.buffer]);
+      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, BMAX, ascOff, actOff, xsumOff, outOff, qOff, attnOff, kcurOff, vcurOff, cosOff, sinOff, nH, nKV, hd, L: CFG.L, eps: CFG.eps, qNormAll, kNormAll, mainOn }, [part.buffer]);
     }
     await Promise.all(readies);
   }
@@ -233,6 +233,34 @@ const CPUEngineMT = (function () {
   const mmT = (name, x, out) => mmBatch([name], x, [out])[0];
   // Threaded GQA attention: q (post qk-norm+rope) is in sabQ, K/V history in sabKV[layer];
   // workers split the nH heads, each computes score·softmax·(Σ w·V) → sabAttn. Read into `out`.
+  // FUSED qkv-gemv + attention in ONE dispatch (JOBTYPE=2, single-token). Quantizes B.xn, workers
+  // compute their q/k/v row-slices → sabOut, hit a WORKER-SIDE spin-barrier (PHASE, no main
+  // round-trip), then read q/k/v straight from sabOut and run attention → sabAttn → B.attn.
+  // Removes one main↔worker round-trip (28 wakes/token) + the q/k/v gather/scatter.
+  function qkvAttnFused(l, pos) {
+    const p = `model.layers.${l}.`;
+    const names = [p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'];
+    const K = mats[names[0]].K;
+    const t0 = P ? _now() : 0;
+    const asc = MW.quantize(qDstOff, qXsumOff, B.xn.__off, K);
+    sabAct.set(qDstI8.subarray(0, K)); sabXsum.set(qXsumI32.subarray(0, K / 64)); sabAsc[0] = asc;
+    let off = 0; const offs = [];
+    for (let i = 0; i < 3; i++) { offs.push(off); Atomics.store(ctrl, MATID0 + i, mats[names[i]].mid); Atomics.store(ctrl, OUTOFF0 + i, off); off += mats[names[i]].N; }
+    Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, 3); Atomics.store(ctrl, JOBTYPE, 2);
+    Atomics.store(ctrl, LAYER, l); Atomics.store(ctrl, BASEPOS, pos); Atomics.store(ctrl, BATCH, 1); Atomics.store(ctrl, PHASE, 0);
+    const t1 = P ? _now() : 0;
+    const g = Atomics.add(ctrl, GEN, 1) + 1;
+    Atomics.notify(ctrl, GEN);
+    if (mainOn) {   // phase 1: main computes its qkv row-slices, then signals the worker-side barrier
+      for (let i = 0; i < 3; i++) { const m = mainMeta[mats[names[i]].mid]; if (!m || m.rows <= 0) continue;
+        MW.gemv_tern(mainOutOff, m.codesOff, m.scalesOff, qDstOff, qXsumOff, m.rows, m.K);
+        const base = offs[i] + m.r0; for (let j = 0; j < m.rows; j++) sabOut[base + j] = mainOutV[j] * asc; }
+      Atomics.add(ctrl, PHASE, 1);
+    }
+    waitBarrier(g);
+    B.attn.set(sabAttn.subarray(0, CFG.nH * CFG.hd));
+    if (P) { P.quant += t1 - t0; P.barrier += (_now() - t1); P.attn = (P.attn || 0) + 0; P.n++; }
+  }
   // Batched over B columns at base position p0 (single-token: p0=pos, B=1). Workers store B k/v
   // and compute B causal queries. Outputs B columns into sabAttn (col-strided nH*hd).
   function attnThreaded(l, p0, B) {
@@ -313,15 +341,18 @@ const CPUEngineMT = (function () {
     for (let l = 0; l < L; l++) {
       const p = `model.layers.${l}.`;
       MW.rmsnorm(B.xn.__off, x.__off, nrmOff[p + 'input_layernorm.weight'], H, eps);
-      if (globalThis.__noBatch) { mmT(p + 'self_attn.q_proj.weight', B.xn, B.q); mmT(p + 'self_attn.k_proj.weight', B.xn, B.k); mmT(p + 'self_attn.v_proj.weight', B.xn, B.v); }
-      else mmBatch([p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'], B.xn, [B.q, B.k, B.v]);
-      // publish RAW q,k,v; workers apply qk-norm + rope on their own heads, then quantize +
-      // append k,v to their private int8 KV, then run SIMD attention.
-      sabQ.set(B.q);
-      sabKcur.set(B.k);
-      sabVcur.set(B.v);
-      attnThreaded(l, pos, 1);
-      B.attn.set(sabAttn.subarray(0, nH * hd));
+      if (globalThis.__fuse) {
+        // OPT-IN (default OFF): fused qkv+attn via worker-side spin-barrier. MEASURED SLOWER
+        // (8.7 vs 11.8 tps) — the spin-barrier hot-spins and kills P-core turbo, costing more
+        // than the round-trip it saves. Kept only as the documented negative result.
+        qkvAttnFused(l, pos);
+      } else {
+        // DEFAULT: separate qkv-gemv + attention dispatches — each parks (turbo recovers).
+        mmBatch([p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'], B.xn, [B.q, B.k, B.v]);
+        sabQ.set(B.q); sabKcur.set(B.k); sabVcur.set(B.v);
+        attnThreaded(l, pos, 1);
+        B.attn.set(sabAttn.subarray(0, nH * hd));
+      }
       mmT(p + 'self_attn.o_proj.weight', B.attn, B.o);
       for (let i = 0; i < H; i++) x[i] += B.o[i];
       MW.rmsnorm(B.xn2.__off, x.__off, nrmOff[p + 'post_attention_layernorm.weight'], H, eps);

@@ -4,9 +4,9 @@
 // output rows (×asc) into the shared output buffer. Weights partitioned → no dup.
 // ctrl slots: one cache line per contended word (see cpuengine-mt.js) — false sharing
 // in the packed v1 layout cost ~1ms/barrier.
-const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, DONEBASE = 32, DONESTRIDE = 16, CTRL_I32 = 32 + 16 * 16;
+const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, CTRL_I32 = 32 + 16 * 16;
 const MAXCTX = 512;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
-let W = null, wid = 0, Wn = 1;
+let W = null, wid = 0, Wn = 1, aParts = 1;   // aParts = phase-barrier participants (Wn + main)
 let ctrl, sabAsc, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin;
 let aNH, aNKV, aHD, aScale, aEps, aMaxK, aMaxN, aBMAX;   // attention/batch params
 let A = null;                               // int8-attention state (buffers, owned kvh KV stores)
@@ -18,6 +18,41 @@ const i32f = (v) => { _bi[0] = v; return _bf[0]; };
 const align16 = x => (x + 15) & ~15;
 // rope in-place on an hd-length wasm f32 view, using column `cb`'s cos/sin (cb=col*hd/2)
 function ropeV(v, cb) { const half = aHD >> 1; for (let i = 0; i < half; i++) { const c = sabCos[cb + i], s = sabSin[cb + i], x0 = v[i], x1 = v[i + half]; v[i] = x0 * c - x1 * s; v[i + half] = x1 * c + x0 * s; } }
+// int8 GQA attention over B columns. q read from qA[qBase + c*(nH*hd) + h*hd]; k/v from
+// {k,v}A[{k,v}Base + c*(nKV*hd) + kvh*hd]. Applies qk-norm+rope, appends k/v to per-(layer,kvh)
+// int8 KV, SIMD scores/softmax/weighted-V → sabAttn[c*nH*hd + h*hd]. Shared by JOBTYPE 1 & 2.
+function doAttn(qA, qBase, kA, kBase, vA, vBase) {
+  const l = Atomics.load(ctrl, LAYER), B = Atomics.load(ctrl, BATCH) || 1, p0 = Atomics.load(ctrl, BASEPOS);
+  const hd = aHD, half = hd >> 1, nH = aNH, nKV = aNKV, qpk = A.qpk, scale = aScale, qcs = nH * hd, kcs = nKV * hd;
+  const lqn = A.qnOff + l * hd * 4, lkn = A.knOff + l * hd * 4;
+  const seen = {};
+  for (let h = A.h0; h < A.h1; h++) {
+    const kvh = (h / qpk) | 0; if (seen[kvh]) continue; seen[kvh] = 1;
+    const st = A.kv[l * nKV + kvh];
+    for (let c = 0; c < B; c++) {
+      const pos = p0 + c; if (pos >= MAXCTX) break;
+      const ko = kBase + c * kcs + kvh * hd;
+      A.kfV.set(kA.subarray(ko, ko + hd)); W.rmsnorm(A.kfOff, A.kfOff, lkn, hd, aEps); ropeV(A.kfV, c * half);
+      st.ksV[pos] = W.quant_vec(st.ki8 + pos * hd, A.kfOff, hd);
+      const vo = vBase + c * kcs + kvh * hd;
+      A.vfV.set(vA.subarray(vo, vo + hd)); st.vsV[pos] = W.quant_vec(st.vi8 + pos * hd, A.vfOff, hd);
+    }
+  }
+  for (let h = A.h0; h < A.h1; h++) {
+    const kvh = (h / qpk) | 0, st = A.kv[l * nKV + kvh];
+    for (let c = 0; c < B; c++) {
+      const T = p0 + c + 1, qo = qBase + c * qcs + h * hd;
+      A.qfV.set(qA.subarray(qo, qo + hd)); W.rmsnorm(A.qfOff, A.qfOff, lqn, hd, aEps); ropeV(A.qfV, c * half);
+      const qs = W.quant_vec(A.qbufOff, A.qfOff, hd);
+      W.attn_scores(A.scoreOff, A.qbufOff, qs, st.ki8, st.ks, T, hd, scale);
+      const sc = A.scoreV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
+      let sum = 0; const wv = A.wV; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); wv[t] = e; sum += e; }
+      const isum = 1 / sum; for (let t = 0; t < T; t++) wv[t] *= isum;
+      W.attn_accv(A.outOff, A.wOff, st.vi8, st.vs, T, hd);
+      sabAttn.set(A.outV.subarray(0, hd), c * nH * hd + h * hd);
+    }
+  }
+}
 async function initWasm() {
   const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
   W = (await WebAssembly.instantiate(buf, {})).instance.exports;
@@ -46,6 +81,7 @@ async function setup(msg) {
   sabCos = new Float32Array(sab, msg.cosOff, B * (hd / 2));
   sabSin = new Float32Array(sab, msg.sinOff, B * (hd / 2));
   aNH = nH; aNKV = nKV; aHD = hd; aScale = 1 / Math.sqrt(hd); aEps = msg.eps; aMaxK = msg.maxK; aMaxN = msg.maxN; aBMAX = B;
+  aParts = Wn + (msg.mainOn ? 1 : 0);   // fused-job worker-side barrier participant count
   await initWasm();
   heapTop = align16(W.heap_base());
   // receive my pre-extracted row-partition (transferred ArrayBuffer) + layout
@@ -107,43 +143,26 @@ async function setup(msg) {
     gen = Atomics.load(ctrl, GEN);
     const nmat = Atomics.load(ctrl, NMAT);
     if (nmat < 0) return;
-    if (Atomics.load(ctrl, JOBTYPE) === 1) {
-      // int8 GQA ATTENTION (batched over B columns): workers split heads; each keeps its heads'
-      // KV as int8 in PRIVATE wasm memory and runs the O(T·hd) loops via SIMD wasm kernels.
-      const l = Atomics.load(ctrl, LAYER), B = Atomics.load(ctrl, BATCH) || 1, p0 = Atomics.load(ctrl, BASEPOS);
-      const hd = aHD, half = hd >> 1, nKV = A.nKV, qpk = A.qpk, scale = aScale;
-      const lqn = A.qnOff + l * hd * 4, lkn = A.knOff + l * hd * 4;
-      // 1) store ALL B columns' k,v (k-norm+rope per column position; v raw) at pos p0+c
-      const seen = {};
-      for (let h = A.h0; h < A.h1; h++) {
-        const kvh = (h / qpk) | 0; if (seen[kvh]) continue; seen[kvh] = 1;
-        const st = A.kv[l * nKV + kvh];
-        for (let c = 0; c < B; c++) {
-          const pos = p0 + c; if (pos >= MAXCTX) break;
-          const o = c * nKV * hd + kvh * hd;
-          A.kfV.set(sabKcur.subarray(o, o + hd));
-          W.rmsnorm(A.kfOff, A.kfOff, lkn, hd, aEps); ropeV(A.kfV, c * half);
-          st.ksV[pos] = W.quant_vec(st.ki8 + pos * hd, A.kfOff, hd);
-          A.vfV.set(sabVcur.subarray(o, o + hd)); st.vsV[pos] = W.quant_vec(st.vi8 + pos * hd, A.vfOff, hd);
-        }
+    const jt = Atomics.load(ctrl, JOBTYPE);
+    if (jt === 1) {  // standalone attention (used by batched forwardN): q←sabQ, k←sabKcur, v←sabVcur
+      doAttn(sabQ, 0, sabKcur, 0, sabVcur, 0);
+      Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
+      continue;
+    }
+    if (jt === 2) {  // FUSED qkv-gemv + attention (single-token). Phase 1 gemv → sabOut; worker-side
+      // spin-barrier (no main round-trip); phase 2 attention reads q/k/v directly from sabOut.
+      const K = Atomics.load(ctrl, KK), nmat2 = Atomics.load(ctrl, NMAT), asc = sabAsc[0];
+      const sActV = new Int8Array(W.memory.buffer, sAct, K), sXsumV = new Int32Array(W.memory.buffer, sXsum, K / 64);
+      const loV = new Float32Array(W.memory.buffer, sOutLocal, Math.ceil(aMaxN / Wn) + 64);
+      sActV.set(sabAct.subarray(0, K)); sXsumV.set(sabXsum.subarray(0, K / 64));
+      for (let b = 0; b < nmat2; b++) {
+        const m = meta[Atomics.load(ctrl, MATID0 + b)], outOff = Atomics.load(ctrl, OUTOFF0 + b);
+        if (m.rows > 0) { W.gemv_tern(sOutLocal, m.oCodes, m.oScales, sAct, sXsum, m.rows, m.K); for (let i = 0; i < m.rows; i++) sabOut[outOff + m.r0 + i] = loV[i] * asc; }
       }
-      // 2) per owned head, per column: q-norm+rope, quantize, SIMD scores over causal T=p0+c+1,
-      //    JS softmax, SIMD weighted-V → sabAttn[column]
-      for (let h = A.h0; h < A.h1; h++) {
-        const kvh = (h / qpk) | 0, st = A.kv[l * nKV + kvh];
-        for (let c = 0; c < B; c++) {
-          const T = p0 + c + 1, qo = c * aNH * hd + h * hd;
-          A.qfV.set(sabQ.subarray(qo, qo + hd));
-          W.rmsnorm(A.qfOff, A.qfOff, lqn, hd, aEps); ropeV(A.qfV, c * half);
-          const qs = W.quant_vec(A.qbufOff, A.qfOff, hd);
-          W.attn_scores(A.scoreOff, A.qbufOff, qs, st.ki8, st.ks, T, hd, scale);
-          const sc = A.scoreV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
-          let sum = 0; const wv = A.wV; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); wv[t] = e; sum += e; }
-          const isum = 1 / sum; for (let t = 0; t < T; t++) wv[t] *= isum;
-          W.attn_accv(A.outOff, A.wOff, st.vi8, st.vs, T, hd);
-          sabAttn.set(A.outV.subarray(0, hd), qo);
-        }
-      }
+      Atomics.add(ctrl, PHASE, 1);
+      while (Atomics.load(ctrl, PHASE) < aParts) { /* cheap: all workers hot */ }
+      const Nq = aNH * aHD, Nk = aNKV * aHD;   // q at sabOut[0..Nq), k at [Nq..), v at [Nq+Nk..)
+      doAttn(sabOut, 0, sabOut, Nq, sabOut, Nq + Nk);
       Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
       continue;
     }
