@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Pure-CPU Bonsai — MULTI-THREAD (UNTRACKED)</title>
+<style>:root{color-scheme:dark}body{font:14px/1.5 ui-monospace,Menlo,monospace;background:#0d1117;color:#c9d1d9;margin:0;padding:1.5rem}
+button{font:inherit;background:#21262d;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:.4rem .9rem;cursor:pointer;margin-right:.4rem}
+pre{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;white-space:pre-wrap}.hi{color:#d29922}</style></head>
+<body>
+<h1 style="font-size:1.05rem;color:#58a6ff">Pure-CPU Bonsai-1.7B — threaded (worker pool + Atomics barrier)</h1>
+<label>workers <input id="nw" type="number" value="8" style="width:3rem;background:#161b22;color:#c9d1d9;border:1px solid #30363d"></label>
+<button id="load">Load + spawn pool</button><button id="run" disabled>Generate + time</button>
+<span id="stat" class="hi"></span>
+<pre id="out">—</pre>
+<script src="modules/webgpu-engine.js?v=3"></script>
+<script src="modules/webgpu-qwen3.js?v=8"></script>
+<script src="_cpukern/cpuengine-mt.js?v=15"></script>
+<script>
+const $=id=>document.getElementById(id), E=window.CPUEngineMT, TOK=window.SandpieQwen3.TOK;
+const EOS=new Set([151645,151643]);
+$('load').addEventListener('click',async()=>{
+  $('load').disabled=true; $('stat').textContent='loading + spawning…';
+  try{
+    if(!self.crossOriginIsolated){$('stat').textContent='NOT crossOriginIsolated';return;}
+    await TOK.load('_bonsai17/');
+    const t0=performance.now();
+    await E.load('bonsai17.cpu.bin', +$('nw').value);
+    $('stat').textContent=`ready in ${((performance.now()-t0)/1000).toFixed(1)}s (${$('nw').value} workers)`;
+    $('run').disabled=false;
+  }catch(e){$('stat').textContent='ERR '+(e&&e.message);console.error(e);}
+});
+$('run').addEventListener('click',async()=>{
+  $('run').disabled=true; $('out').textContent=''; $('stat').textContent='generating…';
+  try{
+    const ids=TOK.encodeChat([{role:'user',content:'What is 47 * 23? Think briefly, then give the final answer.'}]);
+    const kv=E.newKV(); let pos=0,last=0;
+    const tp=performance.now();
+    for(let i=0;i<ids.length;i++){const lg=await E.forward(ids[i],pos++,kv);if(i===ids.length-1)last=E.argmax(lg);}
+    const prefillMs=(performance.now()-tp)/ids.length;
+    const outIds=[last]; const t0=performance.now(); let n=0;
+    for(let t=1;t<120;t++){ if(EOS.has(last))break; const lg=await E.forward(last,pos++,kv); last=E.argmax(lg); outIds.push(last); n++; }
+    const decMs=(performance.now()-t0)/n;
+    const clean=[];for(const t of outIds){if(EOS.has(t))break;clean.push(t);}
+    $('out').textContent=TOK.decode(clean);
+    $('stat').textContent=`decode ${decMs.toFixed(1)} ms/tok = ${(1000/decMs).toFixed(2)} tok/s | prefill ${prefillMs.toFixed(0)} ms/tok | firstTok="${TOK.decode([outIds[0]])}"`;
+  }catch(e){$('stat').textContent='GEN ERR '+(e&&e.message);console.error(e);}
+  $('run').disabled=false;
+});
+</script></body></html>

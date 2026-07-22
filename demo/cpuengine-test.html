@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Pure-CPU Bonsai-1.7B engine — end-to-end (UNTRACKED)</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.5 ui-monospace, Menlo, monospace; background:#0d1117; color:#c9d1d9; margin:0; padding:1.5rem; }
+  h1 { font-size:1.05rem; color:#58a6ff; margin:0 0 .25rem; }
+  .sub { color:#8b949e; margin:0 0 1rem; }
+  button { font:inherit; background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:6px; padding:.4rem .9rem; cursor:pointer; margin:0 .4rem .4rem 0; }
+  button:disabled { opacity:.5; }
+  pre { background:#161b22; border:1px solid #30363d; border-radius:8px; padding:1rem; overflow:auto; white-space:pre-wrap; word-break:break-word; }
+  .hi { color:#d29922; } .ok { color:#3fb950; }
+</style>
+</head>
+<body>
+<h1>Pure-CPU Bonsai-1.7B — full forward on the ternary WASM kernel</h1>
+<p class="sub">No WebGPU. Ternary matmuls in cpukern.wasm; norm/RoPE/GQA-attention/SwiGLU/argmax in JS.
+Tokenizer reused from the existing module. Single-thread correctness run.</p>
+<button id="load">Load Bonsai-1.7B (CPU)</button>
+<button id="gen" disabled>Generate</button>
+<button id="probes" disabled>4-probe battery</button>
+<span id="stat" class="hi"></span> <span id="tps" class="ok"></span>
+<pre id="out">—</pre>
+
+<script src="modules/webgpu-engine.js?v=3"></script>
+<script src="modules/webgpu-qwen3.js?v=8"></script>
+<script src="_cpukern/cpuengine.js?v=2"></script>
+<script>
+const $ = id => document.getElementById(id), log = t => { $('out').textContent += t; };
+const TOK = window.SandpieQwen3.TOK, E = window.CPUEngine;
+const EOS = new Set([151645, 151643]);   // <|im_end|>, <|endoftext|>
+
+async function load() {
+  $('load').disabled = true; $('stat').textContent = 'init wasm…';
+  try {
+    await E.initWasm();
+    await TOK.load('_bonsai17/');
+    $('stat').textContent = 'loading pre-packed binary…';
+    await new Promise(r => setTimeout(r, 30));
+    const t0 = performance.now();
+    await E.loadBin('bonsai17.cpu.bin', () => {});
+    $('stat').textContent = `loaded in ${((performance.now()-t0)/1000).toFixed(1)}s`;
+    $('gen').disabled = $('probes').disabled = false;
+  } catch (e) { $('stat').textContent = 'LOAD ERR: ' + (e && e.message || e); console.error(e); $('load').disabled = false; }
+}
+
+async function genOne(prompt, maxTok) {
+  const ids = TOK.encodeChat([{ role: 'user', content: prompt }]);
+  const out = []; let t0 = 0, n = 0;
+  await E.generate(ids, maxTok, tok => {
+    if (EOS.has(tok)) return;
+    if (n === 0) t0 = performance.now();
+    n++; out.push(tok);
+  });
+  const secs = (performance.now() - t0) / 1000;
+  // trim at EOS
+  const clean = []; for (const t of out) { if (EOS.has(t)) break; clean.push(t); }
+  return { text: TOK.decode(clean), n: clean.length, tps: clean.length > 1 ? clean.length / secs : 0 };
+}
+
+$('load').addEventListener('click', load);
+$('gen').addEventListener('click', async () => {
+  $('gen').disabled = true; $('out').textContent = ''; $('stat').textContent = 'generating…'; $('tps').textContent = '';
+  try {
+    const r = await genOne('What is 47 * 23? Think briefly, then give the final answer.', 200);
+    $('out').textContent = r.text; $('tps').textContent = `${r.tps.toFixed(2)} tok/s (${r.n} tok)`;
+    $('stat').textContent = 'done';
+  } catch (e) { $('stat').textContent = 'GEN ERR: ' + (e && e.message || e); console.error(e); }
+  $('gen').disabled = false;
+});
+$('probes').addEventListener('click', async () => {
+  $('probes').disabled = true; $('out').textContent = '';
+  const PROBES = [
+    'What is 47 * 23? Think briefly, then give the final answer.',
+    'Reply with ONLY a JSON object, no prose: {"tool":"web_search","query":"..."} for: weather in Paris tomorrow',
+    'What is the capital of Australia? One sentence.',
+    'Extract emails as a comma list: Contact bob@acme.com or alice.smith@example.org; CC devs@acme.com.',
+  ];
+  try {
+    for (let i = 0; i < PROBES.length; i++) {
+      $('stat').textContent = `probe ${i+1}/${PROBES.length}…`;
+      const r = await genOne(PROBES[i], 160);
+      log(`=== PROBE ${i+1}: ${PROBES[i]}\n${r.text}\n[${r.tps.toFixed(2)} tok/s, ${r.n} tok]\n\n`);
+      await new Promise(r => setTimeout(r, 10));
+    }
+    $('stat').textContent = 'probes done';
+  } catch (e) { $('stat').textContent = 'PROBE ERR: ' + (e && e.message || e); console.error(e); }
+  $('probes').disabled = false;
+});
+</script>
+</body>
+</html>
