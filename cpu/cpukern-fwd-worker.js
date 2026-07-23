@@ -306,7 +306,8 @@ async function setup(msg) {
         if (c >= tot) break;
         let b = 0, rem = c; while (rem >= nchs[b]) { rem -= nchs[b]; b++; }
         const Lw = swLayout[mids[b]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
-        SW.gemv_tern(swOutOff + (offs4[b] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+        if (SH.lut) SW.gemv_lut_tern_s(swOutOff + (offs4[b] + row0) * 4, Lw.widxOff + rem * Lw.cw, Lw.scalesBOff + rem * Lw.cs, SH.tblOff, rows, Lw.K);
+        else SW.gemv_tern(swOutOff + (offs4[b] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
         const ob = offs4[b] + row0;
         if (resid) { for (let i = 0; i < rows; i++) sxV[ob + i] += swOutV[ob + i] * asc; }
         else if (amax) { for (let i = 0; i < rows; i++) { const v = swOutV[ob + i] * asc; swOutV[ob + i] = v; if (v > bv) { bv = v; bi = ob + i; } } }

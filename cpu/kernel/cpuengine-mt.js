@@ -30,7 +30,7 @@ const CPUEngineMT = (function () {
   // CHUNKED shared-weights mode: ONE WebAssembly.Memory({shared}) holds ALL weights; workers +
   // main claim CH-row chunks dynamically (CURSOR) → per-phase straggler ≈ one chunk. Set by
   // load() when globalThis.__chunkMode is true.
-  let chunkOn = false, SWmem = null, MS = null, swLayout = null;
+  let chunkOn = false, lutOn = false, SWmem = null, MS = null, swLayout = null;
   let swActOff = 0, swXsumOff = 0, swOutOff = 0, swActI8 = null, swXsumI32 = null, swOutV = null;
   // increment 1+2 shared regions (glue on the shared instance + shared-KV attention)
   let SG = null;   // {sxOff,sxnOff,sswiOff,nrmIn,nrmPost,nrmFin,qknQ,qknK,kvOff,kvStride,kvKS,kvVI,kvVS,attnOff2,pscrBase,pscrStride}
@@ -53,7 +53,8 @@ const CPUEngineMT = (function () {
   async function load(binUrl, nWorkers) {
     if (workers.length) { try { Atomics.store(ctrl, NMAT, -1); Atomics.add(ctrl, GEN, 1); workers.forEach(w => w.terminate()); } catch (_) {} workers = []; }
     Wn = nWorkers || 8;
-    chunkOn = !!globalThis.__chunkMode;
+    chunkOn = !!globalThis.__chunkMode || !!globalThis.__lutMode;
+    lutOn = !!globalThis.__lutMode;   // LUT implies chunked; widx layout REPLACES packed codes
     mainOn = !chunkOn && globalThis.__mainCompute !== false;   // chunked: main participates via chunk-claim instead
     const parts = Wn + (mainOn ? 1 : 0);   // main participates as a (Wn+1)-th gemv slice
     const ab = await (await fetch(binUrl)).arrayBuffer();
@@ -79,10 +80,17 @@ const CPUEngineMT = (function () {
       swLayout = {};
       for (const name of ternNames) {
         const t = T[name], ng2 = t.K / 64;
-        const codesOff = align16b(top); top = codesOff + t.N * (t.K / 4);
-        const scalesOff = align16b(top); top = scalesOff + t.N * ng2 * 4;
-        swLayout[mats[name].mid] = { codesOff, scalesOff, N: t.N, K: t.K };
+        if (lutOn) {   // chunk-major LUT layouts (widx = 2× codes bytes — the DRAM-side cost)
+          const widxOff = align16b(top); top = widxOff + t.N * (t.K / 2);
+          const scalesBOff = align16b(top); top = scalesBOff + t.N * ng2 * 4;
+          swLayout[mats[name].mid] = { widxOff, scalesBOff, N: t.N, K: t.K, cw: CH * (t.K / 2), cs: CH * ng2 * 4 };
+        } else {
+          const codesOff = align16b(top); top = codesOff + t.N * (t.K / 4);
+          const scalesOff = align16b(top); top = scalesOff + t.N * ng2 * 4;
+          swLayout[mats[name].mid] = { codesOff, scalesOff, N: t.N, K: t.K };
+        }
       }
+      const tblOff0 = align16b(top); top = tblOff0 + 65536;   // LUT table (K/2×16 B, ≤48KB @K=6144)
       swActOff = align16b(top); top = swActOff + CFG.I;
       swXsumOff = align16b(top); top = swXsumOff + (CFG.I / 64) * 4;
       swOutOff = align16b(top); top = swOutOff + CFG.vocab * 4;
@@ -101,16 +109,42 @@ const CPUEngineMT = (function () {
       const kvOff2 = align16b(top); top = kvOff2 + L2 * nKV2 * kvStride;
       const attnOff2 = align16b(top); top = attnOff2 + nH2 * hd2 * 4;
       const pscrStride = 8192, pscrBase = align16b(top); top = pscrBase + (Wn + 1) * pscrStride;
-      SG = { sxOff, sxnOff, sswiOff, nrmIn: nrmInOff, nrmPost: nrmPostOff, nrmFin: nrmFinOff, qknQ: qknQOff, qknK: qknKOff, kvOff: kvOff2, kvStride, kvKS, kvVI, kvVS, attnOff2, pscrBase, pscrStride };
+      SG = { sxOff, sxnOff, sswiOff, nrmIn: nrmInOff, nrmPost: nrmPostOff, nrmFin: nrmFinOff, qknQ: qknQOff, qknK: qknKOff, kvOff: kvOff2, kvStride, kvKS, kvVI, kvVS, attnOff2, pscrBase, pscrStride, tblOff: tblOff0, lut: lutOn };
       const stacksBase = align16b(top);
       top = stacksBase + (Wn + 1) * STACK;                 // one stack region per worker + main
       const pages = Math.ceil(top / PAGE) + 4;
       SWmem = new WebAssembly.Memory({ initial: pages, maximum: 24576, shared: true });
       const swU8 = new Uint8Array(SWmem.buffer), srcAll = new Uint8Array(ab);
-      for (const name of ternNames) {                       // copy ALL weights ONCE
+      for (const name of ternNames) {                       // copy (or LUT-repack) ALL weights ONCE
         const t = T[name], Lw = swLayout[mats[name].mid], ng2 = t.K / 64;
-        swU8.set(srcAll.subarray(dataBase + t.codesOff, dataBase + t.codesOff + t.N * (t.K / 4)), Lw.codesOff);
-        swU8.set(srcAll.subarray(dataBase + t.scalesOff, dataBase + t.scalesOff + t.N * ng2 * 4), Lw.scalesOff);
+        if (lutOn) {
+          // chunk-major widx: [chunk][localBlock b<8][group g<K/2][16 lanes]; index byte =
+          // lo/hi nibble of the packed 2-bit code byte ((c1<<2)|c0 == nibble, by construction).
+          const K2 = t.K, bpr = K2 / 4, ng = K2 / 2, sgN = K2 / 64;
+          const cBase = dataBase + t.codesOff, sBase = dataBase + t.scalesOff;
+          const srcF = new Float32Array(ab.slice(sBase, sBase + t.N * sgN * 4));   // alignment-safe copy
+          const dstF = new Float32Array(SWmem.buffer, Lw.scalesBOff, t.N * sgN);
+          for (let c0 = 0; c0 < t.N / CH; c0++) {
+            const wBase = Lw.widxOff + c0 * Lw.cw, sBBase = c0 * (CH * sgN);
+            for (let b2 = 0; b2 < CH / 16; b2++) {
+              for (let lane = 0; lane < 16; lane++) {
+                const row = c0 * CH + b2 * 16 + lane, rB = cBase + row * bpr, wRow = wBase + (b2 * ng) * 16 + lane;
+                // source codes are INTERLEAVED per 64-block (code c → byte c&15, bits 2·(c>>4))
+                for (let g = 0; g < ng; g++) {
+                  const c0i = 2 * g, w0 = c0i & 63, w1 = (c0i + 1) & 63, bB = rB + (c0i >> 6) * 16;
+                  const v0 = (srcAll[bB + (w0 & 15)] >> (2 * (w0 >> 4))) & 3;
+                  const v1 = (srcAll[bB + (w1 & 15)] >> (2 * (w1 >> 4))) & 3;
+                  swU8[wRow + g * 16] = (v1 << 2) | v0;
+                }
+              }
+              for (let sg = 0; sg < sgN; sg++) for (let lane = 0; lane < 16; lane++)
+                dstF[sBBase + (sg * (CH / 16) + b2) * 16 + lane] = srcF[(c0 * CH + b2 * 16 + lane) * sgN + sg];
+            }
+          }
+        } else {
+          swU8.set(srcAll.subarray(dataBase + t.codesOff, dataBase + t.codesOff + t.N * (t.K / 4)), Lw.codesOff);
+          swU8.set(srcAll.subarray(dataBase + t.scalesOff, dataBase + t.scalesOff + t.N * ng2 * 4), Lw.scalesOff);
+        }
       }
       const smod = await WebAssembly.compile(await (await fetch('cpukern-shared.wasm')).arrayBuffer());
       const mi = await WebAssembly.instantiate(smod, { env: { memory: SWmem } });
@@ -375,7 +409,8 @@ const CPUEngineMT = (function () {
       if (c >= tot) break;
       let b2 = 0, rem = c; while (rem >= nchs[b2]) { rem -= nchs[b2]; b2++; }
       const Lw = swLayout[mids[b2]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
-      MS.gemv_tern(swOutOff + (offs[b2] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+      if (lutOn) MS.gemv_lut_tern_s(swOutOff + (offs[b2] + row0) * 4, Lw.widxOff + rem * Lw.cw, Lw.scalesBOff + rem * Lw.cs, SG.tblOff, rows, Lw.K);
+      else MS.gemv_tern(swOutOff + (offs[b2] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
       const ob = offs[b2] + row0;
       if (resid) { for (let i = 0; i < rows; i++) sxV[ob + i] += swOutV[ob + i] * asc; }
       else if (amax) { for (let i = 0; i < rows; i++) { const v = swOutV[ob + i] * asc; swOutV[ob + i] = v; if (v > bv) { bv = v; bi = ob + i; } } }
@@ -419,6 +454,11 @@ const CPUEngineMT = (function () {
   }
   // rope on a shared f32 view using this token's cos/sin (col 0)
   function ropeS(v) { const half = CFG.hd >> 1; for (let i = 0; i < half; i++) { const c = sabCos[i], s = sabSin[i], x0 = v[i], x1 = v[i + half]; v[i] = x0 * c - x1 * s; v[i + half] = x1 * c + x0 * s; } }
+  function quantForGemv(srcOff, K2) {
+    let a = MS.quantize(swActOff, swXsumOff, srcOff, K2);
+    if (lutOn) { MS.build_lut_tern(SG.tblOff, swActOff, K2); a *= 127 / 63; }  // int7-act units
+    sabAsc[0] = a;
+  }
   // Chunked-mode token forward: glue on the MS shared instance (zero copies), chunk-stolen
   // gemv with residual fold + distributed argmax, work-stolen shared-KV attention.
   function forwardChunk(tokenId, pos) {
@@ -429,22 +469,22 @@ const CPUEngineMT = (function () {
     for (let l = 0; l < L; l++) {
       const p = `model.layers.${l}.`;
       MS.rmsnorm(SG.sxnOff, SG.sxOff, SG.nrmIn + l * H * 4, H, eps);
-      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+      quantForGemv(SG.sxnOff, H);
       dispatchChunk([p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'], [0, Nq, Nq + Nk], 0, 0);
       attnChunk(l, pos);
       sxnV.set(swAttnV);   // attn (shared) → xn slot as o_proj quant input
-      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+      quantForGemv(SG.sxnOff, H);
       dispatchChunk([p + 'self_attn.o_proj.weight'], [0], 1, 0);
       MS.rmsnorm(SG.sxnOff, SG.sxOff, SG.nrmPost + l * H * 4, H, eps);
-      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+      quantForGemv(SG.sxnOff, H);
       dispatchChunk([p + 'mlp.gate_proj.weight', p + 'mlp.up_proj.weight'], [0, I], 0, 0);
       if (globalThis.__jsSwiglu) { for (let i = 0; i < I; i++) { const g2 = swSwiGV[i]; swF32[(SG.sswiOff >> 2) + i] = (g2 / (1 + Math.exp(-g2))) * swSwiUV[i]; } }
       else MS.swiglu(SG.sswiOff, swOutOff, swOutOff + I * 4, I);
-      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sswiOff, I);
+      quantForGemv(SG.sswiOff, I);
       dispatchChunk([p + 'mlp.down_proj.weight'], [0], 1, 0);
     }
     MS.rmsnorm(SG.sxnOff, SG.sxOff, SG.nrmFin, H, eps);
-    sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+    quantForGemv(SG.sxnOff, H);
     dispatchChunk(['lm_head.weight'], [0], 0, 1);
     let bi = 0, bv = -Infinity;
     for (let w = 0; w <= Wn; w++) { const v = argValV[w]; if (v > bv) { bv = v; bi = argIdxV[w]; } }
