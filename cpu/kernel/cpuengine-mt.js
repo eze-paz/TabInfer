@@ -13,7 +13,7 @@ const CPUEngineMT = (function () {
   // Batched barrier: one dispatch computes up to 3 matmuls sharing ONE input activation
   // (q/k/v share xn; gate/up share xn2). Cuts barriers 197→~113 AND quantizes each shared
   // input once instead of per-matmul. Line 0: GEN. Line 1 (slots 16..31): batch spec.
-  const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320;
+  const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, RESID = 336, AMAX = 337;
   const CTRL_I32 = 32 + 16 * 16 + 64; // 16 workers + mega/chunk sync words (own cache lines)
   const CH = 128; // work-stealing chunk rows (shared-weights mode)
   const MAXCTX = 512; // KV positions held in the shared buffer
@@ -32,6 +32,9 @@ const CPUEngineMT = (function () {
   // load() when globalThis.__chunkMode is true.
   let chunkOn = false, SWmem = null, MS = null, swLayout = null;
   let swActOff = 0, swXsumOff = 0, swOutOff = 0, swActI8 = null, swXsumI32 = null, swOutV = null;
+  // increment 1+2 shared regions (glue on the shared instance + shared-KV attention)
+  let SG = null;   // {sxOff,sxnOff,sswiOff,nrmIn,nrmPost,nrmFin,qknQ,qknK,kvOff,kvStride,kvKS,kvVI,kvVS,attnOff2,pscrBase,pscrStride}
+  let sxV = null, sxnV = null, swAttnV = null, swSwiGV = null, swSwiUV = null, swF32 = null, MSP = null;
   async function initMainWasm() {
     const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
     MW = (await WebAssembly.instantiate(buf, {})).instance.exports;
@@ -83,6 +86,22 @@ const CPUEngineMT = (function () {
       swActOff = align16b(top); top = swActOff + CFG.I;
       swXsumOff = align16b(top); top = swXsumOff + (CFG.I / 64) * 4;
       swOutOff = align16b(top); top = swOutOff + CFG.vocab * 4;
+      // glue + shared-KV attention regions (increments 1+2)
+      const H2 = CFG.H, L2 = CFG.L, hd2 = CFG.hd, nKV2 = CFG.nKV, nH2 = CFG.nH;
+      const sxOff = align16b(top); top = sxOff + H2 * 4;
+      const sxnOff = align16b(top); top = sxnOff + H2 * 4;
+      const sswiOff = align16b(top); top = sswiOff + CFG.I * 4;
+      const nrmInOff = align16b(top); top = nrmInOff + L2 * H2 * 4;
+      const nrmPostOff = align16b(top); top = nrmPostOff + L2 * H2 * 4;
+      const nrmFinOff = align16b(top); top = nrmFinOff + H2 * 4;
+      const qknQOff = align16b(top); top = qknQOff + L2 * hd2 * 4;
+      const qknKOff = align16b(top); top = qknKOff + L2 * hd2 * 4;
+      const kvKS = MAXCTX * hd2, kvVI = kvKS + MAXCTX * 4, kvVS = kvVI + MAXCTX * hd2;
+      const kvStride = kvVS + MAXCTX * 4;                  // ki8 | ks | vi8 | vs per (l,kvh)
+      const kvOff2 = align16b(top); top = kvOff2 + L2 * nKV2 * kvStride;
+      const attnOff2 = align16b(top); top = attnOff2 + nH2 * hd2 * 4;
+      const pscrStride = 8192, pscrBase = align16b(top); top = pscrBase + (Wn + 1) * pscrStride;
+      SG = { sxOff, sxnOff, sswiOff, nrmIn: nrmInOff, nrmPost: nrmPostOff, nrmFin: nrmFinOff, qknQ: qknQOff, qknK: qknKOff, kvOff: kvOff2, kvStride, kvKS, kvVI, kvVS, attnOff2, pscrBase, pscrStride };
       const stacksBase = align16b(top);
       top = stacksBase + (Wn + 1) * STACK;                 // one stack region per worker + main
       const pages = Math.ceil(top / PAGE) + 4;
@@ -100,7 +119,16 @@ const CPUEngineMT = (function () {
       swActI8 = new Int8Array(SWmem.buffer, swActOff, CFG.I);
       swXsumI32 = new Int32Array(SWmem.buffer, swXsumOff, CFG.I / 64);
       swOutV = new Float32Array(SWmem.buffer, swOutOff, CFG.vocab);
-      sharedInit = (w) => ({ mem: SWmem, layout: swLayout, stackTop: stacksBase + (w + 1) * STACK, actOff: swActOff, xsumOff: swXsumOff, outOff: swOutOff, outLen: CFG.vocab });
+      sxV = new Float32Array(SWmem.buffer, SG.sxOff, H2);
+      sxnV = new Float32Array(SWmem.buffer, SG.sxnOff, H2);
+      swAttnV = new Float32Array(SWmem.buffer, SG.attnOff2, nH2 * hd2);
+      swSwiGV = new Float32Array(SWmem.buffer, swOutOff, CFG.I);                 // gate at OUT[0..I)
+      swSwiUV = new Float32Array(SWmem.buffer, swOutOff + CFG.I * 4, CFG.I);     // up at OUT[I..2I)
+      swF32 = new Float32Array(SWmem.buffer, 0, SWmem.buffer.byteLength >> 2);
+      const mps = SG.pscrBase + Wn * SG.pscrStride;   // main = participant index Wn
+      MSP = { kfOff: mps, qfOff: mps + 512, qi8Off: mps + 1024, scOff: mps + 4096,
+        kfV: new Float32Array(SWmem.buffer, mps, hd2), qfV: new Float32Array(SWmem.buffer, mps + 512, hd2), scV: new Float32Array(SWmem.buffer, mps + 4096, MAXCTX) };
+      sharedInit = (w) => ({ mem: SWmem, layout: swLayout, stackTop: stacksBase + (w + 1) * STACK, actOff: swActOff, xsumOff: swXsumOff, outOff: swOutOff, outLen: CFG.vocab, ...SG });
     }
     // SAB: ctrl + act(i8) + xsum(i32) + out(f32) + q(f32 nH*hd) + attn(f32 nH*hd)
     //      + kcur/vcur (f32 nKV*hd) — ONLY the current token's k,v. The KV history now lives
@@ -152,6 +180,15 @@ const CPUEngineMT = (function () {
         o: mats[p + 'self_attn.o_proj.weight'].mid, gate: mats[p + 'mlp.gate_proj.weight'].mid, up: mats[p + 'mlp.up_proj.weight'].mid, down: mats[p + 'mlp.down_proj.weight'].mid });
     }
     const mega = { H, I: CFG.I, layers: megaLayers, lm: mats['lm_head.weight'].mid };
+    if (chunkOn) {   // norm weights → shared memory (used by MS glue + jt===6 attention on both sides)
+      for (let l = 0; l < L; l++) {
+        swF32.set(nrm[`model.layers.${l}.input_layernorm.weight`], (SG.nrmIn >> 2) + l * H);
+        swF32.set(nrm[`model.layers.${l}.post_attention_layernorm.weight`], (SG.nrmPost >> 2) + l * H);
+      }
+      swF32.set(nrm['model.norm.weight'], SG.nrmFin >> 2);
+      swF32.set(qNormAll, SG.qknQ >> 2);
+      swF32.set(kNormAll, SG.qknK >> 2);
+    }
     // Build each worker's row-partition into its OWN small ArrayBuffer and TRANSFER it
     // (main fetches the 1.16GB binary once; workers never hold the whole thing → no 8×9GB OOM).
     const srcU8 = new Uint8Array(ab);
@@ -235,6 +272,21 @@ const CPUEngineMT = (function () {
   // Synchronous spin barrier: workers run on their own cores while main polls ARRIVED
   // (~µs vs main-thread waitAsync's ~1.8ms macrotask latency — the whole ballgame at 197/tok).
   function waitBarrier(g) { for (let w = 0; w < Wn; w++) { const s = DONEBASE + w * DONESTRIDE; while (Atomics.load(ctrl, s) !== g) { /* spin */ } } }
+  // bounded variant for the chunked paths: a stalled/crashed worker throws diagnostics
+  // instead of freezing the page (worker errors can't surface while main spins).
+  function waitBarrierTO(g, label) {
+    const t0 = performance.now();
+    let it = 0;
+    for (let w = 0; w < Wn; w++) {
+      const s = DONEBASE + w * DONESTRIDE;
+      while (Atomics.load(ctrl, s) !== g) {
+        if ((++it & 4095) === 0 && performance.now() - t0 > 6000) {
+          const done = []; for (let x2 = 0; x2 < Wn; x2++) done.push(Atomics.load(ctrl, DONEBASE + x2 * DONESTRIDE));
+          throw new Error('stall@' + label + ' gen=' + g + ' done=' + JSON.stringify(done) + ' cursor=' + Atomics.load(ctrl, CURSOR) + ' jt=' + Atomics.load(ctrl, JOBTYPE));
+        }
+      }
+    }
+  }
   // Batched threaded matmul: `names` (1..3) all consume the SAME input x → quantize x ONCE,
   // dispatch all of them in one barrier, gather each into outs[i]. Workers loop over the batch.
   function mmBatch(names, x, outs) {
@@ -283,25 +335,8 @@ const CPUEngineMT = (function () {
     let off = 0; const offs = [];
     for (let i = 0; i < names.length; i++) { offs.push(off); Atomics.store(ctrl, MATID0 + i, mats[names[i]].mid); Atomics.store(ctrl, OUTOFF0 + i, off); off += mats[names[i]].N; }
     if (chunkOn) {
-      // CHUNKED dispatch: workers + main claim CH-row chunks off the shared CURSOR.
       if (B !== 1) throw new Error('chunked mode: batched forwardN unsupported');
-      const asc = sabAsc[0];
-      const mids = names.map(n => mats[n].mid), nchs = mids.map(m => Math.ceil(swLayout[m].N / CH));
-      const tot = nchs.reduce((a, b2) => a + b2, 0);
-      Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, names.length); Atomics.store(ctrl, JOBTYPE, 4); Atomics.store(ctrl, BATCH, 1);
-      Atomics.store(ctrl, CURSOR, 0);
-      const g2 = Atomics.add(ctrl, GEN, 1) + 1;
-      Atomics.notify(ctrl, GEN);
-      for (;;) {   // main claims chunks too (its P-core would otherwise idle-spin)
-        const c = Atomics.add(ctrl, CURSOR, 1);
-        if (c >= tot) break;
-        let b2 = 0, rem = c; while (rem >= nchs[b2]) { rem -= nchs[b2]; b2++; }
-        const Lw = swLayout[mids[b2]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
-        MS.gemv_tern(swOutOff + (offs[b2] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
-        const ob = offs[b2] + row0;
-        for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc;
-      }
-      waitBarrier(g2);
+      dispatchChunk(names, offs, 0, 0);
       return offs;
     }
     Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, names.length); Atomics.store(ctrl, JOBTYPE, 0); Atomics.store(ctrl, BATCH, B);
@@ -322,6 +357,99 @@ const CPUEngineMT = (function () {
     return offs;
   }
   const mmT = (name, x, out) => mmBatch([name], x, [out])[0];
+  // Chunked dispatch core: workers + main claim CH-row chunks; resid folds ×asc into shared x
+  // (o/down), amax tracks per-participant argmax candidates (lm_head). Act must already be in
+  // the shared act region and sabAsc[0] set. `offs` = per-matrix output bases in OUT.
+  function dispatchChunk(names, offs, resid, amax) {
+    const K = mats[names[0]].K, asc = sabAsc[0];
+    const mids = names.map(n => mats[n].mid), nchs = mids.map(m => Math.ceil(swLayout[m].N / CH));
+    const tot = nchs.reduce((a, b2) => a + b2, 0);
+    for (let i = 0; i < names.length; i++) { Atomics.store(ctrl, MATID0 + i, mids[i]); Atomics.store(ctrl, OUTOFF0 + i, offs[i]); }
+    Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, names.length); Atomics.store(ctrl, JOBTYPE, 4); Atomics.store(ctrl, BATCH, 1);
+    Atomics.store(ctrl, RESID, resid); Atomics.store(ctrl, AMAX, amax); Atomics.store(ctrl, CURSOR, 0);
+    const g = Atomics.add(ctrl, GEN, 1) + 1;
+    Atomics.notify(ctrl, GEN);
+    let bv = -Infinity, bi = 0;
+    for (;;) {   // main claims chunks too (its P-core would otherwise idle-spin)
+      const c = Atomics.add(ctrl, CURSOR, 1);
+      if (c >= tot) break;
+      let b2 = 0, rem = c; while (rem >= nchs[b2]) { rem -= nchs[b2]; b2++; }
+      const Lw = swLayout[mids[b2]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
+      MS.gemv_tern(swOutOff + (offs[b2] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+      const ob = offs[b2] + row0;
+      if (resid) { for (let i = 0; i < rows; i++) sxV[ob + i] += swOutV[ob + i] * asc; }
+      else if (amax) { for (let i = 0; i < rows; i++) { const v = swOutV[ob + i] * asc; swOutV[ob + i] = v; if (v > bv) { bv = v; bi = ob + i; } } }
+      else { for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc; }
+    }
+    if (amax) { argValV[Wn] = bv; argIdxV[Wn] = bi; }
+    waitBarrierTO(g, 'chunk');
+  }
+  // Main-side mirror of the jt===6 shared-KV attention unit loop (main = participant Wn).
+  function attnChunk(l, pos) {
+    const { hd, nKV, nH } = CFG, qpk = nH / nKV, scale = 1 / Math.sqrt(hd), T = pos + 1;
+    const Nq = nH * hd, Nk = nKV * hd, eps = CFG.eps;
+    Atomics.store(ctrl, JOBTYPE, 6); Atomics.store(ctrl, LAYER, l); Atomics.store(ctrl, BASEPOS, pos);
+    Atomics.store(ctrl, NMAT, 1); Atomics.store(ctrl, CURSOR, 0);
+    const g = Atomics.add(ctrl, GEN, 1) + 1;
+    Atomics.notify(ctrl, GEN);
+    for (;;) {
+      const kvh = Atomics.add(ctrl, CURSOR, 1);
+      if (kvh >= nKV) break;
+      const kb = SG.kvOff + (l * nKV + kvh) * SG.kvStride;
+      const ki8 = kb, ks = kb + SG.kvKS, vi8 = kb + SG.kvVI, vs = kb + SG.kvVS;
+      if (pos < MAXCTX) {
+        MSP.kfV.set(swOutV.subarray(Nq + kvh * hd, Nq + kvh * hd + hd));
+        MS.rmsnorm(MSP.kfOff, MSP.kfOff, SG.qknK + l * hd * 4, hd, eps); ropeS(MSP.kfV);
+        swF32[(ks >> 2) + pos] = MS.quant_vec(ki8 + pos * hd, MSP.kfOff, hd);
+        MSP.kfV.set(swOutV.subarray(Nq + Nk + kvh * hd, Nq + Nk + kvh * hd + hd));
+        swF32[(vs >> 2) + pos] = MS.quant_vec(vi8 + pos * hd, MSP.kfOff, hd);
+      }
+      for (let h = kvh * qpk; h < (kvh + 1) * qpk; h++) {
+        MSP.qfV.set(swOutV.subarray(h * hd, h * hd + hd));
+        MS.rmsnorm(MSP.qfOff, MSP.qfOff, SG.qknQ + l * hd * 4, hd, eps); ropeS(MSP.qfV);
+        const qs = MS.quant_vec(MSP.qi8Off, MSP.qfOff, hd);
+        MS.attn_scores(MSP.scOff, MSP.qi8Off, qs, ki8, ks, T, hd, scale);
+        const sc = MSP.scV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
+        let sum = 0; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); sc[t] = e; sum += e; }
+        const isum = 1 / sum; for (let t = 0; t < T; t++) sc[t] *= isum;
+        MS.attn_accv(SG.attnOff2 + h * hd * 4, MSP.scOff, vi8, vs, T, hd);
+      }
+    }
+    waitBarrierTO(g, 'attn6');
+  }
+  // rope on a shared f32 view using this token's cos/sin (col 0)
+  function ropeS(v) { const half = CFG.hd >> 1; for (let i = 0; i < half; i++) { const c = sabCos[i], s = sabSin[i], x0 = v[i], x1 = v[i + half]; v[i] = x0 * c - x1 * s; v[i + half] = x1 * c + x0 * s; } }
+  // Chunked-mode token forward: glue on the MS shared instance (zero copies), chunk-stolen
+  // gemv with residual fold + distributed argmax, work-stolen shared-KV attention.
+  function forwardChunk(tokenId, pos) {
+    const { H, hd, nH, nKV, L, I, eps, theta } = CFG, half = hd / 2;
+    for (let i = 0; i < H; i++) sxV[i] = f16f(embedF16[tokenId * H + i]);
+    for (let i = 0; i < half; i++) { const a = pos * Math.pow(theta, -(2 * i) / hd); sabCos[i] = Math.cos(a); sabSin[i] = Math.sin(a); }
+    const Nq = nH * hd, Nk = nKV * hd;
+    for (let l = 0; l < L; l++) {
+      const p = `model.layers.${l}.`;
+      MS.rmsnorm(SG.sxnOff, SG.sxOff, SG.nrmIn + l * H * 4, H, eps);
+      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+      dispatchChunk([p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'], [0, Nq, Nq + Nk], 0, 0);
+      attnChunk(l, pos);
+      sxnV.set(swAttnV);   // attn (shared) → xn slot as o_proj quant input
+      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+      dispatchChunk([p + 'self_attn.o_proj.weight'], [0], 1, 0);
+      MS.rmsnorm(SG.sxnOff, SG.sxOff, SG.nrmPost + l * H * 4, H, eps);
+      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+      dispatchChunk([p + 'mlp.gate_proj.weight', p + 'mlp.up_proj.weight'], [0, I], 0, 0);
+      if (globalThis.__jsSwiglu) { for (let i = 0; i < I; i++) { const g2 = swSwiGV[i]; swF32[(SG.sswiOff >> 2) + i] = (g2 / (1 + Math.exp(-g2))) * swSwiUV[i]; } }
+      else MS.swiglu(SG.sswiOff, swOutOff, swOutOff + I * 4, I);
+      sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sswiOff, I);
+      dispatchChunk([p + 'mlp.down_proj.weight'], [0], 1, 0);
+    }
+    MS.rmsnorm(SG.sxnOff, SG.sxOff, SG.nrmFin, H, eps);
+    sabAsc[0] = MS.quantize(swActOff, swXsumOff, SG.sxnOff, H);
+    dispatchChunk(['lm_head.weight'], [0], 0, 1);
+    let bi = 0, bv = -Infinity;
+    for (let w = 0; w <= Wn; w++) { const v = argValV[w]; if (v > bv) { bv = v; bi = argIdxV[w]; } }
+    return bi;
+  }
   // Threaded GQA attention: q (post qk-norm+rope) is in sabQ, K/V history in sabKV[layer];
   // workers split the nH heads, each computes score·softmax·(Σ w·V) → sabAttn. Read into `out`.
   // FUSED qkv-gemv + attention in ONE dispatch (JOBTYPE=2, single-token). Quantizes B.xn, workers
@@ -465,6 +593,7 @@ const CPUEngineMT = (function () {
   // hold ALL matrix rows — main's T4 slice would otherwise be missing from the forward).
   function forwardTok(tokenId, pos) {
     ensureBufs();
+    if (chunkOn) return forwardChunk(tokenId, pos);
     if (mainOn) throw new Error('forwardTok requires load with __mainCompute=false');
     const { H, hd, theta } = CFG, half = hd / 2;
     for (let i = 0; i < H; i++) sabX[i] = f16f(embedF16[tokenId * H + i]);

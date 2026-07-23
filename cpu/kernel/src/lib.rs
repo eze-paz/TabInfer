@@ -432,6 +432,45 @@ pub unsafe extern "C" fn quant_vec(dst: *mut i8, x: *const f32, n: u32) -> f32 {
     asc
 }
 
+// ─────────────── SwiGLU (SIMD, Cephes-style expf) ───────────────
+// dst[i] = gate[i]·sigmoid(gate[i])·up[i]. Poly expf is ~1-2ulp — far below the int8
+// activation-quant noise floor, but NOT bit-identical to JS Math.exp (validate tokens).
+#[inline(always)]
+unsafe fn exp_ps(x: v128) -> v128 {
+    let x = f32x4_min(x, f32x4_splat(87.0));
+    let x = f32x4_max(x, f32x4_splat(-87.0));
+    let kf = f32x4_nearest(f32x4_mul(x, f32x4_splat(1.442695040)));
+    let r = f32x4_sub(x, f32x4_mul(kf, f32x4_splat(0.693359375)));
+    let r = f32x4_sub(r, f32x4_mul(kf, f32x4_splat(-2.12194440e-4)));
+    let mut p = f32x4_splat(1.9875691500e-4);
+    p = f32x4_add(f32x4_mul(p, r), f32x4_splat(1.3981999507e-3));
+    p = f32x4_add(f32x4_mul(p, r), f32x4_splat(8.3334519073e-3));
+    p = f32x4_add(f32x4_mul(p, r), f32x4_splat(4.1665795894e-2));
+    p = f32x4_add(f32x4_mul(p, r), f32x4_splat(1.6666665459e-1));
+    p = f32x4_add(f32x4_mul(p, r), f32x4_splat(5.0000001201e-1));
+    let r2 = f32x4_mul(r, r);
+    let e = f32x4_add(f32x4_add(f32x4_splat(1.0), r), f32x4_mul(r2, p));
+    let ki = i32x4_trunc_sat_f32x4(kf);
+    let pow2k = i32x4_shl(i32x4_add(ki, i32x4_splat(127)), 23); // bits reinterpret as f32
+    f32x4_mul(e, pow2k)
+}
+
+#[target_feature(enable = "simd128")]
+#[no_mangle]
+pub unsafe extern "C" fn swiglu(dst: *mut f32, gate: *const f32, up: *const f32, n: u32) {
+    let n = n as usize;
+    let one = f32x4_splat(1.0);
+    let mut i = 0usize;
+    while i < n {
+        let g = v128_load(gate.add(i) as *const v128);
+        let u = v128_load(up.add(i) as *const v128);
+        let e = exp_ps(f32x4_neg(g));
+        let s = f32x4_div(one, f32x4_add(one, e));
+        v128_store(dst.add(i) as *mut v128, f32x4_mul(f32x4_mul(g, s), u));
+        i += 4;
+    }
+}
+
 /// Start of usable linear memory above the module's static data + shadow stack.
 /// JS reads this, grows `memory` as needed, and lays out codes/scales/act/xsum/out
 /// from here on — no allocator in the wasm.

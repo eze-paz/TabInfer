@@ -4,7 +4,7 @@
 // output rows (×asc) into the shared output buffer. Weights partitioned → no dup.
 // ctrl slots: one cache line per contended word (see cpuengine-mt.js) — false sharing
 // in the packed v1 layout cost ~1ms/barrier.
-const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, CTRL_I32 = 32 + 16 * 16 + 64;
+const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, RESID = 336, AMAX = 337, CTRL_I32 = 32 + 16 * 16 + 64;
 const CH = 128; // work-stealing chunk rows (shared-weights mode)
 const MAXCTX = 512;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
 let W = null, wid = 0, Wn = 1, aParts = 1;   // aParts = phase-barrier participants (Wn + main)
@@ -17,6 +17,8 @@ let MEGA = null, pXOff = 0, pSwiOff = 0, pXv = null, pSwiV = null, sActV = null,
 // CHUNKED shared-weights mode: second wasm instance bound to the SHARED memory holding ALL
 // weights; gemv rows are claimed dynamically (CURSOR) so fast cores take more chunks.
 let SW = null, swLayout = null, swActOff = 0, swXsumOff = 0, swOutOff = 0, swOutV = null;
+// increment-2 shared regions: residual x, shared-KV attention, per-participant scratch
+let sxV = null, swAttnV = null, swF32 = null, SH = null, SP = null;
 const meta = [];                            // mid -> {oCodes,oScales,r0,rows,K}
 const _b = new ArrayBuffer(4), _bf = new Float32Array(_b), _bi = new Int32Array(_b);
 const i32f = (v) => { _bi[0] = v; return _bf[0]; };
@@ -168,7 +170,15 @@ async function setup(msg) {
     SW = inst.exports;
     swLayout = msg.shared.layout;
     swActOff = msg.shared.actOff; swXsumOff = msg.shared.xsumOff; swOutOff = msg.shared.outOff;
-    swOutV = new Float32Array(msg.shared.mem.buffer, swOutOff, msg.shared.outLen);
+    const sbuf = msg.shared.mem.buffer;
+    swOutV = new Float32Array(sbuf, swOutOff, msg.shared.outLen);
+    SH = msg.shared;   // {sxOff, attnOff2, kvOff, kvStride, pscrBase, pscrStride, qknQ, qknK, ...}
+    sxV = new Float32Array(sbuf, SH.sxOff, msg.mega.H);
+    swAttnV = new Float32Array(sbuf, SH.attnOff2, nH * hd);
+    swF32 = new Float32Array(sbuf, 0, sbuf.byteLength >> 2);
+    const ps = SH.pscrBase + wid * SH.pscrStride;
+    SP = { kfOff: ps, qfOff: ps + 512, qi8Off: ps + 1024, scOff: ps + 4096,
+      kfV: new Float32Array(sbuf, ps, hd), qfV: new Float32Array(sbuf, ps + 512, hd), scV: new Float32Array(sbuf, ps + 4096, MAXCTX) };
   }
   postMessage({ ready: true });
   // barrier loop — SPIN briefly (hot path: next matmul arrives within ~100µs), then PARK
@@ -283,10 +293,14 @@ async function setup(msg) {
     if (jt === 4) {
       // CHUNKED gemv over SHARED weights: claim CH-row chunks off the CURSOR until dry.
       // Fast cores naturally take more chunks → per-phase straggler collapses to ~one chunk.
+      // RESID: add ×asc into shared x rows (o/down projections) instead of writing OUT.
+      // AMAX: track this participant's argmax candidate over its chunks (lm_head).
       const nmat4 = Atomics.load(ctrl, NMAT), asc = sabAsc[0];
+      const resid = Atomics.load(ctrl, RESID) === 1, amax = Atomics.load(ctrl, AMAX) === 1;
       const _t4 = performance.now();
       const mids = [], offs4 = [], nchs = []; let tot = 0;
       for (let b = 0; b < nmat4; b++) { const mid = Atomics.load(ctrl, MATID0 + b); mids.push(mid); offs4.push(Atomics.load(ctrl, OUTOFF0 + b)); const nch = Math.ceil(swLayout[mid].N / CH); nchs.push(nch); tot += nch; }
+      let bv = -Infinity, bi = 0;
       for (;;) {
         const c = Atomics.add(ctrl, CURSOR, 1);
         if (c >= tot) break;
@@ -294,9 +308,45 @@ async function setup(msg) {
         const Lw = swLayout[mids[b]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
         SW.gemv_tern(swOutOff + (offs4[b] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
         const ob = offs4[b] + row0;
-        for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc;
+        if (resid) { for (let i = 0; i < rows; i++) sxV[ob + i] += swOutV[ob + i] * asc; }
+        else if (amax) { for (let i = 0; i < rows; i++) { const v = swOutV[ob + i] * asc; swOutV[ob + i] = v; if (v > bv) { bv = v; bi = ob + i; } } }
+        else { for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc; }
       }
+      if (amax) { argValV[wid] = bv; argIdxV[wid] = bi; }
       Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 1, ((performance.now() - _t4) * 1000) | 0);
+      Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
+      continue;
+    }
+    if (jt === 6) {
+      // SHARED-KV ATTENTION, work-stolen by kvh unit: each unit appends k/v for its kvh
+      // (norm+rope+int8-quant into the SHARED KV) then computes its qpk heads' attention,
+      // reading q/k/v straight from the shared OUT region and writing swAttn. Main claims too.
+      const l = Atomics.load(ctrl, LAYER), pos = Atomics.load(ctrl, BASEPOS), T = pos + 1;
+      const hd = aHD, nKV = aNKV, qpk = aNH / nKV, scale = aScale;
+      const Nq = aNH * hd, Nk = nKV * hd;
+      for (;;) {
+        const kvh = Atomics.add(ctrl, CURSOR, 1);
+        if (kvh >= nKV) break;
+        const kb = SH.kvOff + (l * nKV + kvh) * SH.kvStride;
+        const ki8 = kb, ks = kb + SH.kvKS, vi8 = kb + SH.kvVI, vs = kb + SH.kvVS;
+        if (pos < MAXCTX) {
+          SP.kfV.set(swOutV.subarray(Nq + kvh * hd, Nq + kvh * hd + hd));
+          SW.rmsnorm(SP.kfOff, SP.kfOff, SH.qknK + l * hd * 4, hd, aEps); ropeV(SP.kfV, 0);
+          swF32[(ks >> 2) + pos] = SW.quant_vec(ki8 + pos * hd, SP.kfOff, hd);
+          SP.kfV.set(swOutV.subarray(Nq + Nk + kvh * hd, Nq + Nk + kvh * hd + hd));
+          swF32[(vs >> 2) + pos] = SW.quant_vec(vi8 + pos * hd, SP.kfOff, hd);
+        }
+        for (let h = kvh * qpk; h < (kvh + 1) * qpk; h++) {
+          SP.qfV.set(swOutV.subarray(h * hd, h * hd + hd));
+          SW.rmsnorm(SP.qfOff, SP.qfOff, SH.qknQ + l * hd * 4, hd, aEps); ropeV(SP.qfV, 0);
+          const qs = SW.quant_vec(SP.qi8Off, SP.qfOff, hd);
+          SW.attn_scores(SP.scOff, SP.qi8Off, qs, ki8, ks, T, hd, scale);
+          const sc = SP.scV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
+          let sum = 0; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); sc[t] = e; sum += e; }
+          const isum = 1 / sum; for (let t = 0; t < T; t++) sc[t] *= isum;
+          SW.attn_accv(SH.attnOff2 + h * hd * 4, SP.scOff, vi8, vs, T, hd);
+        }
+      }
       Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
       continue;
     }
