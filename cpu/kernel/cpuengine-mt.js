@@ -13,11 +13,12 @@ const CPUEngineMT = (function () {
   // Batched barrier: one dispatch computes up to 3 matmuls sharing ONE input activation
   // (q/k/v share xn; gate/up share xn2). Cuts barriers 197→~113 AND quantizes each shared
   // input once instead of per-matmul. Line 0: GEN. Line 1 (slots 16..31): batch spec.
-  const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16;
-  const CTRL_I32 = 32 + 16 * 16; // room for 16 workers
+  const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320;
+  const CTRL_I32 = 32 + 16 * 16 + 64; // 16 workers + mega/chunk sync words (own cache lines)
+  const CH = 128; // work-stealing chunk rows (shared-weights mode)
   const MAXCTX = 512; // KV positions held in the shared buffer
   const BMAX = 6;     // max tokens verified per batched (speculative) forward
-  let Wn = 8, workers = [], ctrl, sabAsc, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin;
+  let Wn = 8, workers = [], ctrl, sabAsc, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin, sabX, argValV, argIdxV;
   let embedF16 = null; const nrm = {}, mats = {}; // name -> {mid,N,K}
   // MAIN-THREAD wasm instance (private memory) for the SIMD serial ops (quant + rmsnorm)
   // that otherwise run as scalar JS on the critical path, blocking every worker.
@@ -26,6 +27,11 @@ const CPUEngineMT = (function () {
   // and computes it (via MW.gemv_tern) while the workers compute theirs — using the P-core it
   // otherwise burns spin-waiting in waitBarrier. mainMeta[mid] = {codesOff,scalesOff,r0,rows,K}.
   let mainOn = true, mainOutOff = 0, mainOutV = null; const mainMeta = {};
+  // CHUNKED shared-weights mode: ONE WebAssembly.Memory({shared}) holds ALL weights; workers +
+  // main claim CH-row chunks dynamically (CURSOR) → per-phase straggler ≈ one chunk. Set by
+  // load() when globalThis.__chunkMode is true.
+  let chunkOn = false, SWmem = null, MS = null, swLayout = null;
+  let swActOff = 0, swXsumOff = 0, swOutOff = 0, swActI8 = null, swXsumI32 = null, swOutV = null;
   async function initMainWasm() {
     const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
     MW = (await WebAssembly.instantiate(buf, {})).instance.exports;
@@ -44,7 +50,8 @@ const CPUEngineMT = (function () {
   async function load(binUrl, nWorkers) {
     if (workers.length) { try { Atomics.store(ctrl, NMAT, -1); Atomics.add(ctrl, GEN, 1); workers.forEach(w => w.terminate()); } catch (_) {} workers = []; }
     Wn = nWorkers || 8;
-    mainOn = globalThis.__mainCompute !== false;
+    chunkOn = !!globalThis.__chunkMode;
+    mainOn = !chunkOn && globalThis.__mainCompute !== false;   // chunked: main participates via chunk-claim instead
     const parts = Wn + (mainOn ? 1 : 0);   // main participates as a (Wn+1)-th gemv slice
     const ab = await (await fetch(binUrl)).arrayBuffer();
     const dv = new DataView(ab), hlen = dv.getUint32(0, true);
@@ -60,6 +67,41 @@ const CPUEngineMT = (function () {
     }
     await initMainWasm();
     buildMainBufs(ab, dataBase, ternNames, T, parts);  // wasm buffers + norm weights + main's weight slice
+    // ── CHUNKED shared-weights setup: ALL weights once in one shared wasm memory ──
+    let sharedInit = null;
+    if (chunkOn) {
+      const PAGE = 65536, STACK = 1 << 20;
+      let top = 1024;   // leave the module's own data/stack-default region alone at 0.. (kernels have no statics of note; start at 1KB, align below)
+      const align16b = x => (x + 15) & ~15;
+      swLayout = {};
+      for (const name of ternNames) {
+        const t = T[name], ng2 = t.K / 64;
+        const codesOff = align16b(top); top = codesOff + t.N * (t.K / 4);
+        const scalesOff = align16b(top); top = scalesOff + t.N * ng2 * 4;
+        swLayout[mats[name].mid] = { codesOff, scalesOff, N: t.N, K: t.K };
+      }
+      swActOff = align16b(top); top = swActOff + CFG.I;
+      swXsumOff = align16b(top); top = swXsumOff + (CFG.I / 64) * 4;
+      swOutOff = align16b(top); top = swOutOff + CFG.vocab * 4;
+      const stacksBase = align16b(top);
+      top = stacksBase + (Wn + 1) * STACK;                 // one stack region per worker + main
+      const pages = Math.ceil(top / PAGE) + 4;
+      SWmem = new WebAssembly.Memory({ initial: pages, maximum: 24576, shared: true });
+      const swU8 = new Uint8Array(SWmem.buffer), srcAll = new Uint8Array(ab);
+      for (const name of ternNames) {                       // copy ALL weights ONCE
+        const t = T[name], Lw = swLayout[mats[name].mid], ng2 = t.K / 64;
+        swU8.set(srcAll.subarray(dataBase + t.codesOff, dataBase + t.codesOff + t.N * (t.K / 4)), Lw.codesOff);
+        swU8.set(srcAll.subarray(dataBase + t.scalesOff, dataBase + t.scalesOff + t.N * ng2 * 4), Lw.scalesOff);
+      }
+      const smod = await WebAssembly.compile(await (await fetch('cpukern-shared.wasm')).arrayBuffer());
+      const mi = await WebAssembly.instantiate(smod, { env: { memory: SWmem } });
+      mi.exports.__stack_pointer.value = stacksBase + (Wn + 1) * STACK;   // main takes the top stack
+      MS = mi.exports;
+      swActI8 = new Int8Array(SWmem.buffer, swActOff, CFG.I);
+      swXsumI32 = new Int32Array(SWmem.buffer, swXsumOff, CFG.I / 64);
+      swOutV = new Float32Array(SWmem.buffer, swOutOff, CFG.vocab);
+      sharedInit = (w) => ({ mem: SWmem, layout: swLayout, stackTop: stacksBase + (w + 1) * STACK, actOff: swActOff, xsumOff: swXsumOff, outOff: swOutOff, outLen: CFG.vocab });
+    }
     // SAB: ctrl + act(i8) + xsum(i32) + out(f32) + q(f32 nH*hd) + attn(f32 nH*hd)
     //      + kcur/vcur (f32 nKV*hd) — ONLY the current token's k,v. The KV history now lives
     //      as int8 in each worker's PRIVATE wasm memory (per head it owns), so no giant f32
@@ -71,11 +113,14 @@ const CPUEngineMT = (function () {
     const qOff = outOff + BMAX * maxN * 4, attnOff = qOff + BMAX * nH * hd * 4;
     const kcurOff = attnOff + BMAX * nH * hd * 4, vcurOff = kcurOff + BMAX * nKV * hd * 4;
     const cosOff = vcurOff + BMAX * nKV * hd * 4, sinOff = cosOff + BMAX * (hd / 2) * 4;
-    const sabBytes = sinOff + BMAX * (hd / 2) * 4;
+    const xOff = sinOff + BMAX * (hd / 2) * 4;                    // residual x (mega-token)
+    const argValOff = xOff + H * 4, argIdxOff = argValOff + 16 * 4; // per-worker argmax candidates
+    const sabBytes = argIdxOff + 16 * 4;
     const sab = new SharedArrayBuffer(sabBytes);
     ctrl = new Int32Array(sab, 0, CTRL_I32);
     Atomics.store(ctrl, SPIN, (globalThis.__SPIN | 0) || 400);
     Atomics.store(ctrl, BATCH, 1);
+    Atomics.store(ctrl, PBCNT, 0); Atomics.store(ctrl, PBGEN, 0);
     sabAsc = new Float32Array(sab, ascOff, BMAX);
     sabAct = new Int8Array(sab, actOff, BMAX * maxK);
     sabXsum = new Int32Array(sab, xsumOff, BMAX * (maxK / 64));
@@ -86,17 +131,35 @@ const CPUEngineMT = (function () {
     sabVcur = new Float32Array(sab, vcurOff, BMAX * nKV * hd);
     sabCos = new Float32Array(sab, cosOff, BMAX * (hd / 2));
     sabSin = new Float32Array(sab, sinOff, BMAX * (hd / 2));
+    sabX = new Float32Array(sab, xOff, H);
+    argValV = new Float32Array(sab, argValOff, 16);
+    argIdxV = new Int32Array(sab, argIdxOff, 16);
     // qk-norm weights for ALL layers, concatenated → workers apply qk-norm on their heads
     const qNormAll = new Float32Array(L * hd), kNormAll = new Float32Array(L * hd);
     for (let l = 0; l < L; l++) { qNormAll.set(nrm[`model.layers.${l}.self_attn.q_norm.weight`], l * hd); kNormAll.set(nrm[`model.layers.${l}.self_attn.k_norm.weight`], l * hd); }
+    // mega-token: input/post/final norm weights + per-layer matrix mids → workers run the
+    // whole forward themselves (redundant glue), one dispatch per token.
+    const normsAll = new Float32Array((2 * L + 1) * H);
+    for (let l = 0; l < L; l++) {
+      normsAll.set(nrm[`model.layers.${l}.input_layernorm.weight`], l * H);
+      normsAll.set(nrm[`model.layers.${l}.post_attention_layernorm.weight`], (L + l) * H);
+    }
+    normsAll.set(nrm['model.norm.weight'], 2 * L * H);
+    const megaLayers = [];
+    for (let l = 0; l < L; l++) {
+      const p = `model.layers.${l}.`;
+      megaLayers.push({ q: mats[p + 'self_attn.q_proj.weight'].mid, k: mats[p + 'self_attn.k_proj.weight'].mid, v: mats[p + 'self_attn.v_proj.weight'].mid,
+        o: mats[p + 'self_attn.o_proj.weight'].mid, gate: mats[p + 'mlp.gate_proj.weight'].mid, up: mats[p + 'mlp.up_proj.weight'].mid, down: mats[p + 'mlp.down_proj.weight'].mid });
+    }
+    const mega = { H, I: CFG.I, layers: megaLayers, lm: mats['lm_head.weight'].mid };
     // Build each worker's row-partition into its OWN small ArrayBuffer and TRANSFER it
     // (main fetches the 1.16GB binary once; workers never hold the whole thing → no 8×9GB OOM).
     const srcU8 = new Uint8Array(ab);
     const readies = [];
     for (let w = 0; w < Wn; w++) {
-      // size this worker's partition
+      // size this worker's partition (chunked mode: weights live in the shared memory — no partition)
       let bytes = 0; const ents = [];
-      for (const name of ternNames) {
+      if (!chunkOn) for (const name of ternNames) {
         const t = T[name], N = t.N, K = t.K, ng = K / 64, bpr = K / 4;
         const r0 = Math.floor(w * N / parts), r1 = Math.floor((w + 1) * N / parts), rows = r1 - r0;
         const cl = rows * bpr, sl = rows * ng * 4;
@@ -113,7 +176,7 @@ const CPUEngineMT = (function () {
       wk.onerror = e => { (globalThis.__wErr = globalThis.__wErr || []).push('onerror w' + wk.__wid + ': ' + (e.message || e)); };
       wk.__wid = w;
       readies.push(new Promise(res => { wk.onmessage = ev => { if (ev.data.workerError) (globalThis.__wErr = globalThis.__wErr || []).push('w' + wk.__wid + ': ' + ev.data.workerError); if (ev.data.ready) res(); }; }));
-      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, BMAX, ascOff, actOff, xsumOff, outOff, qOff, attnOff, kcurOff, vcurOff, cosOff, sinOff, nH, nKV, hd, L: CFG.L, eps: CFG.eps, qNormAll, kNormAll, mainOn }, [part.buffer]);
+      wk.postMessage({ cmd: 'init', wid: w, Wn, sab, part: part.buffer, layout, maxK, maxN, BMAX, ascOff, actOff, xsumOff, outOff, qOff, attnOff, kcurOff, vcurOff, cosOff, sinOff, nH, nKV, hd, L: CFG.L, eps: CFG.eps, qNormAll, kNormAll, mainOn, xOff, argValOff, argIdxOff, mega, normsAll, shared: sharedInit ? sharedInit(w) : null }, [part.buffer]);
     }
     await Promise.all(readies);
   }
@@ -188,8 +251,13 @@ const CPUEngineMT = (function () {
       // in wasm memory (all matmul inputs are wasm-backed and carry __off); guard-copy otherwise.
       let xo = x.__off; if (xo === undefined) { qXinF32.set(x.subarray(0, K)); xo = qXinOff; }
       asc = MW.quantize(qDstOff, qXsumOff, xo, K);
-      sabAct.set(qDstI8.subarray(0, K));            // int8 activation → SAB (small memcpy)
-      sabXsum.set(qXsumI32.subarray(0, K / 64));    // per-group sums → SAB
+      if (chunkOn) {                                 // chunked: activation lives in SHARED memory
+        swActI8.set(qDstI8.subarray(0, K));
+        swXsumI32.set(qXsumI32.subarray(0, K / 64));
+      } else {
+        sabAct.set(qDstI8.subarray(0, K));           // int8 activation → SAB (small memcpy)
+        sabXsum.set(qXsumI32.subarray(0, K / 64));   // per-group sums → SAB
+      }
     }
     if (globalThis.__act6) {  // TEST: requantize activation to int6 (±31) to gauge LUT-precision quality
       const K64 = K / 64;
@@ -202,7 +270,8 @@ const CPUEngineMT = (function () {
     const t1 = P ? _now() : 0;
     const offs = dispatchMM(names, 1);
     const t2 = P ? _now() : 0;
-    for (let i = 0; i < names.length; i++) outs[i].set(sabOut.subarray(offs[i], offs[i] + mats[names[i]].N));
+    const srcV = chunkOn ? swOutV : sabOut;
+    for (let i = 0; i < names.length; i++) outs[i].set(srcV.subarray(offs[i], offs[i] + mats[names[i]].N));
     if (P) { P.quant += t1 - t0; P.barrier += t2 - t1; P.gather += _now() - t2; P.n++; }
     return outs;
   }
@@ -213,6 +282,28 @@ const CPUEngineMT = (function () {
     const maxN = CFG.vocab, K = mats[names[0]].K, ng = K / 64;
     let off = 0; const offs = [];
     for (let i = 0; i < names.length; i++) { offs.push(off); Atomics.store(ctrl, MATID0 + i, mats[names[i]].mid); Atomics.store(ctrl, OUTOFF0 + i, off); off += mats[names[i]].N; }
+    if (chunkOn) {
+      // CHUNKED dispatch: workers + main claim CH-row chunks off the shared CURSOR.
+      if (B !== 1) throw new Error('chunked mode: batched forwardN unsupported');
+      const asc = sabAsc[0];
+      const mids = names.map(n => mats[n].mid), nchs = mids.map(m => Math.ceil(swLayout[m].N / CH));
+      const tot = nchs.reduce((a, b2) => a + b2, 0);
+      Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, names.length); Atomics.store(ctrl, JOBTYPE, 4); Atomics.store(ctrl, BATCH, 1);
+      Atomics.store(ctrl, CURSOR, 0);
+      const g2 = Atomics.add(ctrl, GEN, 1) + 1;
+      Atomics.notify(ctrl, GEN);
+      for (;;) {   // main claims chunks too (its P-core would otherwise idle-spin)
+        const c = Atomics.add(ctrl, CURSOR, 1);
+        if (c >= tot) break;
+        let b2 = 0, rem = c; while (rem >= nchs[b2]) { rem -= nchs[b2]; b2++; }
+        const Lw = swLayout[mids[b2]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
+        MS.gemv_tern(swOutOff + (offs[b2] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+        const ob = offs[b2] + row0;
+        for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc;
+      }
+      waitBarrier(g2);
+      return offs;
+    }
     Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, names.length); Atomics.store(ctrl, JOBTYPE, 0); Atomics.store(ctrl, BATCH, B);
     const g = Atomics.add(ctrl, GEN, 1) + 1;
     Atomics.notify(ctrl, GEN);
@@ -368,6 +459,37 @@ const CPUEngineMT = (function () {
   }
   function newKV() { return Array.from({ length: CFG.L }, () => ({ k: [], v: [] })); }
   function argmax(a) { let bi = 0, bv = -Infinity; for (let i = 0; i < a.length; i++) if (a[i] > bv) { bv = a[i]; bi = i; } return bi; }
+  // MEGA-token forward: ONE dispatch for the whole token. Main writes embed(x) + rope cos/sin,
+  // bumps GEN once, spins on DONE flags (as every barrier already does), reduces the workers'
+  // per-slice argmax candidates. Requires the pool loaded with __mainCompute=false (workers
+  // hold ALL matrix rows — main's T4 slice would otherwise be missing from the forward).
+  function forwardTok(tokenId, pos) {
+    ensureBufs();
+    if (mainOn) throw new Error('forwardTok requires load with __mainCompute=false');
+    const { H, hd, theta } = CFG, half = hd / 2;
+    for (let i = 0; i < H; i++) sabX[i] = f16f(embedF16[tokenId * H + i]);
+    for (let i = 0; i < half; i++) { const a = pos * Math.pow(theta, -(2 * i) / hd); sabCos[i] = Math.cos(a); sabSin[i] = Math.sin(a); }
+    Atomics.store(ctrl, JOBTYPE, 3); Atomics.store(ctrl, BASEPOS, pos); Atomics.store(ctrl, BATCH, 1);
+    Atomics.store(ctrl, NMAT, 1); Atomics.store(ctrl, PBCNT, 0);
+    const g = Atomics.add(ctrl, GEN, 1) + 1;
+    Atomics.notify(ctrl, GEN);
+    // bounded wait + stall diagnostics (a hung worker would otherwise freeze the page silently)
+    { const t0 = performance.now();
+      for (let w = 0; w < Wn; w++) {
+        const s = DONEBASE + w * DONESTRIDE;
+        while (Atomics.load(ctrl, s) !== g) {
+          if (performance.now() - t0 > 8000) {
+            const prog = [], done = [];
+            for (let x2 = 0; x2 < Wn; x2++) { prog.push(Atomics.load(ctrl, DONEBASE + x2 * DONESTRIDE + 2)); done.push(Atomics.load(ctrl, DONEBASE + x2 * DONESTRIDE)); }
+            throw new Error('mega stall: gen=' + g + ' done=' + JSON.stringify(done) + ' prog(l*8+p)=' + JSON.stringify(prog) + ' pbcnt=' + Atomics.load(ctrl, PBCNT) + ' pbgen=' + Atomics.load(ctrl, PBGEN));
+          }
+        }
+      }
+    }
+    let bi = 0, bv = -Infinity;
+    for (let w = 0; w < Wn; w++) { const v = argValV[w]; if (v > bv) { bv = v; bi = argIdxV[w]; } }
+    return bi;
+  }
   // prompt-lookup: most-recent earlier occurrence of the last `ng` tokens → the up-to-K tokens after it
   function plookup(seq, ng, K) {
     const n = seq.length; if (n < ng + 1) return [];
@@ -409,6 +531,9 @@ const CPUEngineMT = (function () {
   // per-worker gemv busy-µs accumulators (slot DONEBASE+w*STRIDE+1) — load-balance probe
   const busyReset = () => { for (let w = 0; w < Wn; w++) Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 1, 0); };
   const busyTimes = () => { const a = []; for (let w = 0; w < Wn; w++) a.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 1)); return a; };
-  return { load, forward, forwardN, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes };
+  // mega debug: per-worker pbar wait-µs (+3) and park-fallback count (+4)
+  const pbarReset = () => { for (let w = 0; w < Wn; w++) { Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 3, 0); Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 4, 0); } };
+  const pbarStats = () => { const waitUs = [], parks = []; for (let w = 0; w < Wn; w++) { waitUs.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 3)); parks.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 4)); } return { waitUs, parks }; };
+  return { load, forward, forwardTok, forwardN, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
 })();
 if (typeof window !== 'undefined') window.CPUEngineMT = CPUEngineMT;

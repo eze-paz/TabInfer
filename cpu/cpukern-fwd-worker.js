@@ -4,13 +4,19 @@
 // output rows (×asc) into the shared output buffer. Weights partitioned → no dup.
 // ctrl slots: one cache line per contended word (see cpuengine-mt.js) — false sharing
 // in the packed v1 layout cost ~1ms/barrier.
-const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, CTRL_I32 = 32 + 16 * 16;
+const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, CTRL_I32 = 32 + 16 * 16 + 64;
+const CH = 128; // work-stealing chunk rows (shared-weights mode)
 const MAXCTX = 512;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
 let W = null, wid = 0, Wn = 1, aParts = 1;   // aParts = phase-barrier participants (Wn + main)
-let ctrl, sabAsc, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin;
+let ctrl, sabAsc, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin, sabX, argValV, argIdxV;
 let aNH, aNKV, aHD, aScale, aEps, aMaxK, aMaxN, aBMAX;   // attention/batch params
 let A = null;                               // int8-attention state (buffers, owned kvh KV stores)
 let sAct, sXsum, sOutLocal;                 // wasm scratch offsets
+// MEGA-token state: per-layer matrix mids, norm-weight wasm offsets, private glue scratch + views
+let MEGA = null, pXOff = 0, pSwiOff = 0, pXv = null, pSwiV = null, sActV = null, sXsumV = null, loV = null;
+// CHUNKED shared-weights mode: second wasm instance bound to the SHARED memory holding ALL
+// weights; gemv rows are claimed dynamically (CURSOR) so fast cores take more chunks.
+let SW = null, swLayout = null, swActOff = 0, swXsumOff = 0, swOutOff = 0, swOutV = null;
 const meta = [];                            // mid -> {oCodes,oScales,r0,rows,K}
 const _b = new ArrayBuffer(4), _bf = new Float32Array(_b), _bi = new Int32Array(_b);
 const i32f = (v) => { _bi[0] = v; return _bf[0]; };
@@ -21,8 +27,7 @@ function ropeV(v, cb) { const half = aHD >> 1; for (let i = 0; i < half; i++) { 
 // int8 GQA attention over B columns. q read from qA[qBase + c*(nH*hd) + h*hd]; k/v from
 // {k,v}A[{k,v}Base + c*(nKV*hd) + kvh*hd]. Applies qk-norm+rope, appends k/v to per-(layer,kvh)
 // int8 KV, SIMD scores/softmax/weighted-V → sabAttn[c*nH*hd + h*hd]. Shared by JOBTYPE 1 & 2.
-function doAttn(qA, qBase, kA, kBase, vA, vBase) {
-  const l = Atomics.load(ctrl, LAYER), B = Atomics.load(ctrl, BATCH) || 1, p0 = Atomics.load(ctrl, BASEPOS);
+function doAttn(qA, qBase, kA, kBase, vA, vBase, l, p0, B) {
   const hd = aHD, half = hd >> 1, nH = aNH, nKV = aNKV, qpk = A.qpk, scale = aScale, qcs = nH * hd, kcs = nKV * hd;
   const lqn = A.qnOff + l * hd * 4, lkn = A.knOff + l * hd * 4;
   const seen = {};
@@ -52,6 +57,37 @@ function doAttn(qA, qBase, kA, kBase, vA, vBase) {
       sabAttn.set(A.outV.subarray(0, hd), c * nH * hd + h * hd);
     }
   }
+}
+// Worker-side sense-reversing phase barrier (mega-token). Inter-phase gaps are µs (worker
+// imbalance ~1.01, no main in the loop), so spin briefly; park-fallback only for OS noise.
+// Last arriver resets the counter THEN bumps the generation (seq-cst order guarantees no
+// next-phase arrival can see a stale counter), and notifies any parked stragglers.
+function pbar() {
+  const g = Atomics.load(ctrl, PBGEN);
+  if (Atomics.add(ctrl, PBCNT, 1) + 1 === Wn) {
+    Atomics.store(ctrl, PBCNT, 0);
+    Atomics.add(ctrl, PBGEN, 1);
+    Atomics.notify(ctrl, PBGEN);
+  } else {
+    const t0 = performance.now();
+    let s = 0, parks = 0;
+    while (Atomics.load(ctrl, PBGEN) === g) { if (++s > 30000) { parks++; Atomics.wait(ctrl, PBGEN, g); s = 0; } }
+    // debug accumulators (own cache line): +3 total wait µs, +4 park-fallback count
+    Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 3, ((performance.now() - t0) * 1000) | 0);
+    if (parks) Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 4, parks);
+  }
+}
+// gemv my rows of matrix `mid` from the private quantized act (sAct/sXsum), write ×asc into
+// sabOut[outBase + myRows]; resid variant adds into sabX[myRows] instead (o/down projections).
+function gemvRows(mid, outBase, asc) {
+  const m = meta[mid]; if (m.rows <= 0) return;
+  W.gemv_tern(sOutLocal, m.oCodes, m.oScales, sAct, sXsum, m.rows, m.K);
+  for (let i = 0; i < m.rows; i++) sabOut[outBase + m.r0 + i] = loV[i] * asc;
+}
+function gemvRowsResid(mid, asc) {
+  const m = meta[mid]; if (m.rows <= 0) return;
+  W.gemv_tern(sOutLocal, m.oCodes, m.oScales, sAct, sXsum, m.rows, m.K);
+  for (let i = 0; i < m.rows; i++) sabX[m.r0 + i] += loV[i] * asc;
 }
 async function initWasm() {
   const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
@@ -107,13 +143,33 @@ async function setup(msg) {
   const ownedKvh = []; { const seen = {}; for (let h = h0; h < h1; h++) { const kvh = (h / qpk) | 0; if (!seen[kvh]) { seen[kvh] = 1; ownedKvh.push(kvh); } } }
   const kv = {};   // (l*nKV+kvh) -> {ki8,ks,vi8,vs} offsets
   for (let l = 0; l < L; l++) for (const kvh of ownedKvh) kv[l * nKV + kvh] = { ki8: gr0(MAXCTX * hd), ks: gr0(MAXCTX * 4), vi8: gr0(MAXCTX * hd), vs: gr0(MAXCTX * 4) };
+  // ── MEGA-token scratch: layer norm weights (input/post/final) + private glue buffers ──
+  const H = msg.mega.H, I = msg.mega.I;
+  const nrmBase = gr0((2 * L + 1) * H * 4);
+  pXOff = gr0(H * 4); pSwiOff = gr0(I * 4);
   const buf = W.memory.buffer;   // memory stable after here (no more gr0)
   new Float32Array(buf, qnOff, L * hd).set(msg.qNormAll);
   new Float32Array(buf, knOff, L * hd).set(msg.kNormAll);
+  new Float32Array(buf, nrmBase, (2 * L + 1) * H).set(msg.normsAll);
+  MEGA = { H, I, L, layers: msg.mega.layers, lm: msg.mega.lm, inOff: nrmBase, postOff: nrmBase + L * H * 4, finOff: nrmBase + 2 * L * H * 4 };
+  pXv = new Float32Array(buf, pXOff, H); pSwiV = new Float32Array(buf, pSwiOff, I);
+  sActV = new Int8Array(buf, sAct, msg.maxK); sXsumV = new Int32Array(buf, sXsum, msg.maxK / 64);
+  loV = new Float32Array(buf, sOutLocal, Math.ceil(msg.maxN / Wn) + 64);
+  sabX = new Float32Array(sab, msg.xOff, H);
+  argValV = new Float32Array(sab, msg.argValOff, 16); argIdxV = new Int32Array(sab, msg.argIdxOff, 16);
   for (const k in kv) { kv[k].ksV = new Float32Array(buf, kv[k].ks, MAXCTX); kv[k].vsV = new Float32Array(buf, kv[k].vs, MAXCTX); }
   A = { h0, h1, qpk, hd, nKV, qbufOff, qfOff, kfOff, vfOff, scoreOff, wOff, outOff, qnOff, knOff, kv,
     qfV: new Float32Array(buf, qfOff, hd), kfV: new Float32Array(buf, kfOff, hd), vfV: new Float32Array(buf, vfOff, hd),
     scoreV: new Float32Array(buf, scoreOff, MAXCTX), wV: new Float32Array(buf, wOff, MAXCTX), outV: new Float32Array(buf, outOff, hd) };
+  if (msg.shared) {   // chunked shared-weights mode: bind a second instance to the SHARED memory
+    const smod = await WebAssembly.compile(await (await fetch('cpukern-shared.wasm')).arrayBuffer());
+    const inst = await WebAssembly.instantiate(smod, { env: { memory: msg.shared.mem } });
+    inst.exports.__stack_pointer.value = msg.shared.stackTop;   // distinct stack per instance
+    SW = inst.exports;
+    swLayout = msg.shared.layout;
+    swActOff = msg.shared.actOff; swXsumOff = msg.shared.xsumOff; swOutOff = msg.shared.outOff;
+    swOutV = new Float32Array(msg.shared.mem.buffer, swOutOff, msg.shared.outLen);
+  }
   postMessage({ ready: true });
   // barrier loop — SPIN briefly (hot path: next matmul arrives within ~100µs), then PARK
   // via Atomics.wait. Pure spin made orphaned pools burn 100% CPU forever (the bug that
@@ -145,7 +201,7 @@ async function setup(msg) {
     if (nmat < 0) return;
     const jt = Atomics.load(ctrl, JOBTYPE);
     if (jt === 1) {  // standalone attention (used by batched forwardN): q←sabQ, k←sabKcur, v←sabVcur
-      doAttn(sabQ, 0, sabKcur, 0, sabVcur, 0);
+      doAttn(sabQ, 0, sabKcur, 0, sabVcur, 0, Atomics.load(ctrl, LAYER), Atomics.load(ctrl, BASEPOS), Atomics.load(ctrl, BATCH) || 1);
       Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
       continue;
     }
@@ -162,14 +218,92 @@ async function setup(msg) {
       Atomics.add(ctrl, PHASE, 1);
       while (Atomics.load(ctrl, PHASE) < aParts) { /* cheap: all workers hot */ }
       const Nq = aNH * aHD, Nk = aNKV * aHD;   // q at sabOut[0..Nq), k at [Nq..), v at [Nq+Nk..)
-      doAttn(sabOut, 0, sabOut, Nq, sabOut, Nq + Nk);
+      doAttn(sabOut, 0, sabOut, Nq, sabOut, Nq + Nk, Atomics.load(ctrl, LAYER), Atomics.load(ctrl, BASEPOS), Atomics.load(ctrl, BATCH) || 1);
+      Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
+      continue;
+    }
+    if (jt === 3) {
+      // MEGA-TOKEN: the ENTIRE forward in ONE dispatch. Workers self-sequence through all
+      // phases via µs spin phase-barriers (pbar) — no main round-trips. Serial glue
+      // (rmsnorm/quant/swiglu) is computed REDUNDANTLY by every worker (~tens of µs each,
+      // SIMD, parallel — wall-cost same as main doing it once, but zero dispatch machinery).
+      // Main only writes embed(x)+cos/sin before the GEN bump and reduces argmax after.
+      const pos = Atomics.load(ctrl, BASEPOS);
+      const { H, I, L, layers, inOff, postOff, finOff } = MEGA;
+      const Nq = aNH * aHD, Nk = aNKV * aHD;
+      const PROG = DONEBASE + wid * DONESTRIDE + 2;   // debug: my layer*8+phase progress word
+      for (let l = 0; l < L; l++) {
+        const M = layers[l];
+        Atomics.store(ctrl, PROG, l * 8 + 1);
+        // (a) xn = rmsnorm(x, input_norm); quant → private act; qkv gemv on my rows
+        pXv.set(sabX);
+        W.rmsnorm(pXOff, pXOff, inOff + l * H * 4, H, aEps);
+        const a1 = W.quantize(sAct, sXsum, pXOff, H);
+        gemvRows(M.q, 0, a1); gemvRows(M.k, Nq, a1); gemvRows(M.v, Nq + Nk, a1);
+        pbar();                                    // full q/k/v visible
+        Atomics.store(ctrl, PROG, l * 8 + 2);
+        // (b) attention on my heads (q/k/v straight from sabOut; private per-layer int8 KV)
+        doAttn(sabOut, 0, sabOut, Nq, sabOut, Nq + Nk, l, pos, 1);
+        pbar();                                    // full attn visible
+        Atomics.store(ctrl, PROG, l * 8 + 3);
+        // (c) o_proj: quant(attn) → my rows → residual-add into my x rows
+        pXv.set(sabAttn.subarray(0, H));           // nH*hd == H
+        const a2 = W.quantize(sAct, sXsum, pXOff, H);
+        gemvRowsResid(M.o, a2);
+        pbar();                                    // full x updated
+        Atomics.store(ctrl, PROG, l * 8 + 4);
+        // (d) xn2 = rmsnorm(x, post_norm); gate/up gemv on my rows
+        pXv.set(sabX);
+        W.rmsnorm(pXOff, pXOff, postOff + l * H * 4, H, aEps);
+        const a3 = W.quantize(sAct, sXsum, pXOff, H);
+        gemvRows(M.gate, 0, a3); gemvRows(M.up, I, a3);
+        pbar();                                    // full gate/up visible
+        Atomics.store(ctrl, PROG, l * 8 + 5);
+        // (e) swiglu (redundant, full I) → quant → down gemv → residual into my x rows
+        for (let i = 0; i < I; i++) { const g2 = sabOut[i]; pSwiV[i] = (g2 / (1 + Math.exp(-g2))) * sabOut[I + i]; }
+        const a4 = W.quantize(sAct, sXsum, pSwiOff, I);
+        gemvRowsResid(M.down, a4);
+        pbar();                                    // full x updated — layer done
+      }
+      Atomics.store(ctrl, PROG, 9999);
+      // final norm + my lm_head slice + my argmax candidate
+      pXv.set(sabX);
+      W.rmsnorm(pXOff, pXOff, finOff, H, aEps);
+      const a5 = W.quantize(sAct, sXsum, pXOff, H);
+      const lm = meta[MEGA.lm];
+      let bv = -Infinity, bi = 0;
+      if (lm.rows > 0) {
+        W.gemv_tern(sOutLocal, lm.oCodes, lm.oScales, sAct, sXsum, lm.rows, lm.K);
+        for (let i = 0; i < lm.rows; i++) { const v = loV[i] * a5; if (v > bv) { bv = v; bi = lm.r0 + i; } }
+      }
+      argValV[wid] = bv; argIdxV[wid] = bi;
+      Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
+      continue;
+    }
+    if (jt === 4) {
+      // CHUNKED gemv over SHARED weights: claim CH-row chunks off the CURSOR until dry.
+      // Fast cores naturally take more chunks → per-phase straggler collapses to ~one chunk.
+      const nmat4 = Atomics.load(ctrl, NMAT), asc = sabAsc[0];
+      const _t4 = performance.now();
+      const mids = [], offs4 = [], nchs = []; let tot = 0;
+      for (let b = 0; b < nmat4; b++) { const mid = Atomics.load(ctrl, MATID0 + b); mids.push(mid); offs4.push(Atomics.load(ctrl, OUTOFF0 + b)); const nch = Math.ceil(swLayout[mid].N / CH); nchs.push(nch); tot += nch; }
+      for (;;) {
+        const c = Atomics.add(ctrl, CURSOR, 1);
+        if (c >= tot) break;
+        let b = 0, rem = c; while (rem >= nchs[b]) { rem -= nchs[b]; b++; }
+        const Lw = swLayout[mids[b]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
+        SW.gemv_tern(swOutOff + (offs4[b] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+        const ob = offs4[b] + row0;
+        for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc;
+      }
+      Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 1, ((performance.now() - _t4) * 1000) | 0);
       Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
       continue;
     }
     const K = Atomics.load(ctrl, KK), B = Atomics.load(ctrl, BATCH) || 1, maxN = aMaxN, ng = K / 64;
     const _t0 = performance.now();
-    const sActV = new Int8Array(W.memory.buffer, sAct, K), sXsumV = new Int32Array(W.memory.buffer, sXsum, ng);
-    const loV = new Float32Array(W.memory.buffer, sOutLocal, Math.ceil(maxN / Wn) + 64);
+    // module-level preallocated views (sActV/sXsumV/loV) — per-dispatch view alloc removed;
+    // NOTE: local `const loV` here previously TDZ-shadowed the module view used by jt===3.
     // B columns (speculative verify) share ONE barrier; column 0 == single-token path.
     for (let c = 0; c < B; c++) {
       sActV.set(sabAct.subarray(c * K, c * K + K));
