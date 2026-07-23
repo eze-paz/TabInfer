@@ -13,48 +13,57 @@
   const EOS = new Set([151645, 151643]);
   const MAX_NEW = 1024, CTX_CAP = 2000;
 
-  // engine + tokenizer live at the site root; this module runs from modules/
-  const BASE = '../';
+  // Code artifacts (coordinator JS, fwd-worker JS, both wasm kernels) are COMMITTED and must
+  // be same-origin (Worker spawn forbids cross-origin), so they always load from the site
+  // root. Only the two BIG data files — bonsai17.cpu.bin + tokenizer.json — may live on a
+  // separate host: set localStorage['sandpie-cpu-bonsai-base'] to a dir URL serving both
+  // (CORS-enabled if cross-origin); default is the site root (dev machine layout).
+  const BASE = '../';   // site root relative to modules/
   let _loaded = false, _loading = null;
 
-  function ensureLoaded() {
+  function resolveDataBase(cfg) {
+    let b = (cfg && cfg.cpuBonsaiBase) || '';
+    if (!b) return { bin: BASE + 'bonsai17.cpu.bin', tok: BASE + '_bonsai17/', label: 'site root' };
+    if (!b.endsWith('/')) b += '/';
+    return { bin: b + 'bonsai17.cpu.bin', tok: b, label: b };
+  }
+
+  function ensureLoaded(data) {
     if (_loaded) return Promise.resolve();
     if (_loading) return _loading;
     _loading = (async () => {
       if (!self.crossOriginIsolated) throw new Error('CPU engine needs crossOriginIsolated (COOP/COEP) for SharedArrayBuffer');
-      // PREFLIGHT: this model needs gitignored LOCAL files served at the site root. Probe them
-      // up front and name exactly what's missing — otherwise a 404's HTML error page surfaces
-      // later as a baffling `Unexpected token '<' … not valid JSON` from the tokenizer parse.
-      const need = ['_cpukern/cpuengine-mt.js', 'cpukern.wasm', 'cpukern-shared.wasm', 'bonsai17.cpu.bin', '_bonsai17/tokenizer.json'];
+      // PREFLIGHT: probe every required file and name exactly what's missing — otherwise a
+      // 404's HTML page surfaces later as `Unexpected token '<' … not valid JSON`.
+      const need = [
+        [BASE + '_cpukern/cpuengine-mt.js', 'cpukern JS'],
+        [BASE + 'cpukern.wasm', 'cpukern.wasm'],
+        [BASE + 'cpukern-shared.wasm', 'cpukern-shared.wasm'],
+        [data.bin, 'bonsai17.cpu.bin'],
+        [data.tok + 'tokenizer.json', 'tokenizer.json'],
+      ];
       const missing = [];
-      for (const f of need) {
+      for (const [url, name] of need) {
         try {
-          const r = await fetch(BASE + f, { method: 'HEAD' });
+          const r = await fetch(url, { method: 'HEAD' });
           const ct = (r.headers.get('content-type') || '').toLowerCase();
-          if (!r.ok || ct.includes('text/html')) missing.push(f);
-        } catch (_) { missing.push(f); }
+          if (!r.ok || ct.includes('text/html')) missing.push(name + ' (' + url + ')');
+        } catch (_) { missing.push(name + ' (' + url + ')'); }
       }
-      if (missing.length) throw new Error('required local files not served: ' + missing.join(', ') + ' — this EXPERIMENTAL model only runs on a dev machine where bonsai17.cpu.bin, cpukern*.wasm and _bonsai17/ sit at the site root (they are gitignored and not deployed)');
+      if (missing.length) throw new Error('required files not served: ' + missing.join(', ')
+        + ' — EXPERIMENTAL model. The wasm kernels deploy with the site (redeploy if missing); host the two big files '
+        + '(bonsai17.cpu.bin + tokenizer.json) in one directory and set localStorage["sandpie-cpu-bonsai-base"] to its URL '
+        + '(CORS-enabled if cross-origin). On a dev checkout they are read from the site root automatically.');
       globalThis.__cpukernBase = BASE;
       importScripts(BASE + '_cpukern/cpuengine-mt.js?v=41');
-      // the REAL tokenizer module is already imported by webgpu-worker (webgpu-qwen3.js)
-      await self.SandpieQwen3Engine_TOK_load();
+      await self.SandpieQwen3.TOK.load(data.tok);
       globalThis.__chunkMode = true; globalThis.__lutMode = false;
-      await globalThis.CPUEngineMT.load(BASE + 'bonsai17.cpu.bin', 8);
+      await globalThis.CPUEngineMT.load(data.bin, 8);
       _loaded = true;
     })();
     _loading.catch(() => { _loading = null; });
     return _loading;
   }
-
-  // tokenizer access: webgpu-qwen3.js exposes window.SandpieQwen3.TOK in this worker
-  // (self.window aliased). Load its files from the local _bonsai17/ dir once.
-  let _tokLoaded = false;
-  self.SandpieQwen3Engine_TOK_load = async function () {
-    if (_tokLoaded) return;
-    await self.SandpieQwen3.TOK.load(BASE + '_bonsai17/');
-    _tokLoaded = true;
-  };
 
   const yield_ = () => new Promise((r) => setTimeout(r, 0));
 
@@ -62,7 +71,7 @@
     const signal = config && config.signal;
     try {
       emit({ type: 'round_start' });
-      await ensureLoaded();
+      await ensureLoaded(resolveDataBase(config));
       const TOK = self.SandpieQwen3.TOK, E = globalThis.CPUEngineMT;
       // flatten messages (strings only; tools unsupported)
       const msgs = [];
