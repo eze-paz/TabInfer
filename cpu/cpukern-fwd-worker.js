@@ -4,7 +4,7 @@
 // output rows (×asc) into the shared output buffer. Weights partitioned → no dup.
 // ctrl slots: one cache line per contended word (see cpuengine-mt.js) — false sharing
 // in the packed v1 layout cost ~1ms/barrier.
-const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, RESID = 336, AMAX = 337, CTRL_I32 = 32 + 16 * 16 + 64;
+const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, RESID = 336, AMAX = 337, CUR_A = 352, CUR_B = 368, CUR_C = 384, CUR_D = 400, CUR_E = 416, GLUEGEN = 432, CTRL_I32 = 32 + 16 * 16 + 160;
 const CH = 128; // work-stealing chunk rows (shared-weights mode)
 const MAXCTX = 512;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
 let W = null, wid = 0, Wn = 1, aParts = 1;   // aParts = phase-barrier participants (Wn + main)
@@ -77,6 +77,74 @@ function pbar() {
     // debug accumulators (own cache line): +3 total wait µs, +4 park-fallback count
     Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 3, ((performance.now() - t0) * 1000) | 0);
     if (parks) Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 4, parks);
+  }
+}
+// In-job barrier for JOBTYPE=7 mega-layer: Wn+1 participants (workers + main).
+function pbarT(target) {
+  const g = Atomics.load(ctrl, PBGEN);
+  if (Atomics.add(ctrl, PBCNT, 1) + 1 === target) {
+    Atomics.store(ctrl, PBCNT, 0);
+    Atomics.add(ctrl, PBGEN, 1);
+    Atomics.notify(ctrl, PBGEN);
+  } else {
+    let s = 0;
+    while (Atomics.load(ctrl, PBGEN) === g) { if (++s > 30000) { Atomics.wait(ctrl, PBGEN, g); s = 0; } }
+  }
+}
+// wait for main's glue bump past `gTarget` (glue is µs-scale wasm — spin, park fallback)
+function glueWaitW(gTarget) {
+  let s = 0;
+  for (;;) { const v = Atomics.load(ctrl, GLUEGEN); if (v >= gTarget) return; if (++s > 30000) { Atomics.wait(ctrl, GLUEGEN, v); s = 0; } }
+}
+// work-stolen gemv chunks over SHARED weights from cursor `curSlot`; resid folds ×asc into
+// shared x; amax tracks this worker's argmax candidate. asc read from sabAsc[0] at call time.
+function claimChunksW(mids, offs4, curSlot, resid, amax) {
+  const asc = sabAsc[0];
+  const nchs = mids.map(m => Math.ceil(swLayout[m].N / CH));
+  let tot = 0; for (const n2 of nchs) tot += n2;
+  const _t4 = performance.now();
+  let bv = -Infinity, bi = 0;
+  for (;;) {
+    const c = Atomics.add(ctrl, curSlot, 1);
+    if (c >= tot) break;
+    let b = 0, rem = c; while (rem >= nchs[b]) { rem -= nchs[b]; b++; }
+    const Lw = swLayout[mids[b]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
+    if (SH.lut) SW.gemv_lut_tern_s(swOutOff + (offs4[b] + row0) * 4, Lw.widxOff + rem * Lw.cw, Lw.scalesBOff + rem * Lw.cs, SH.tblOff, rows, Lw.K);
+    else SW.gemv_tern(swOutOff + (offs4[b] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+    const ob = offs4[b] + row0;
+    if (resid) { for (let i = 0; i < rows; i++) sxV[ob + i] += swOutV[ob + i] * asc; }
+    else if (amax) { for (let i = 0; i < rows; i++) { const v = swOutV[ob + i] * asc; swOutV[ob + i] = v; if (v > bv) { bv = v; bi = ob + i; } } }
+    else { for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc; }
+  }
+  if (amax) { argValV[wid] = bv; argIdxV[wid] = bi; }
+  Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 1, ((performance.now() - _t4) * 1000) | 0);
+}
+// work-stolen shared-KV attention units (one unit = one kvh: append k/v, then its heads)
+function attnUnitsW(l, pos, curSlot) {
+  const T = pos + 1, hd = aHD, nKV = aNKV, qpk = aNH / nKV, scale = aScale;
+  const Nq = aNH * hd, Nk = nKV * hd;
+  for (;;) {
+    const kvh = Atomics.add(ctrl, curSlot, 1);
+    if (kvh >= nKV) break;
+    const kb = SH.kvOff + (l * nKV + kvh) * SH.kvStride;
+    const ki8 = kb, ks = kb + SH.kvKS, vi8 = kb + SH.kvVI, vs = kb + SH.kvVS;
+    if (pos < MAXCTX) {
+      SP.kfV.set(swOutV.subarray(Nq + kvh * hd, Nq + kvh * hd + hd));
+      SW.rmsnorm(SP.kfOff, SP.kfOff, SH.qknK + l * hd * 4, hd, aEps); ropeV(SP.kfV, 0);
+      swF32[(ks >> 2) + pos] = SW.quant_vec(ki8 + pos * hd, SP.kfOff, hd);
+      SP.kfV.set(swOutV.subarray(Nq + Nk + kvh * hd, Nq + Nk + kvh * hd + hd));
+      swF32[(vs >> 2) + pos] = SW.quant_vec(vi8 + pos * hd, SP.kfOff, hd);
+    }
+    for (let h = kvh * qpk; h < (kvh + 1) * qpk; h++) {
+      SP.qfV.set(swOutV.subarray(h * hd, h * hd + hd));
+      SW.rmsnorm(SP.qfOff, SP.qfOff, SH.qknQ + l * hd * 4, hd, aEps); ropeV(SP.qfV, 0);
+      const qs = SW.quant_vec(SP.qi8Off, SP.qfOff, hd);
+      SW.attn_scores(SP.scOff, SP.qi8Off, qs, ki8, ks, T, hd, scale);
+      const sc = SP.scV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
+      let sum = 0; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); sc[t] = e; sum += e; }
+      const isum = 1 / sum; for (let t = 0; t < T; t++) sc[t] *= isum;
+      SW.attn_accv(SH.attnOff2 + h * hd * 4, SP.scOff, vi8, vs, T, hd);
+    }
   }
 }
 // gemv my rows of matrix `mid` from the private quantized act (sAct/sXsum), write ×asc into
@@ -291,63 +359,43 @@ async function setup(msg) {
       continue;
     }
     if (jt === 4) {
-      // CHUNKED gemv over SHARED weights: claim CH-row chunks off the CURSOR until dry.
-      // Fast cores naturally take more chunks → per-phase straggler collapses to ~one chunk.
-      // RESID: add ×asc into shared x rows (o/down projections) instead of writing OUT.
-      // AMAX: track this participant's argmax candidate over its chunks (lm_head).
-      const nmat4 = Atomics.load(ctrl, NMAT), asc = sabAsc[0];
+      // CHUNKED gemv over SHARED weights (single-phase dispatch)
+      const nmat4 = Atomics.load(ctrl, NMAT);
       const resid = Atomics.load(ctrl, RESID) === 1, amax = Atomics.load(ctrl, AMAX) === 1;
-      const _t4 = performance.now();
-      const mids = [], offs4 = [], nchs = []; let tot = 0;
-      for (let b = 0; b < nmat4; b++) { const mid = Atomics.load(ctrl, MATID0 + b); mids.push(mid); offs4.push(Atomics.load(ctrl, OUTOFF0 + b)); const nch = Math.ceil(swLayout[mid].N / CH); nchs.push(nch); tot += nch; }
-      let bv = -Infinity, bi = 0;
-      for (;;) {
-        const c = Atomics.add(ctrl, CURSOR, 1);
-        if (c >= tot) break;
-        let b = 0, rem = c; while (rem >= nchs[b]) { rem -= nchs[b]; b++; }
-        const Lw = swLayout[mids[b]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
-        if (SH.lut) SW.gemv_lut_tern_s(swOutOff + (offs4[b] + row0) * 4, Lw.widxOff + rem * Lw.cw, Lw.scalesBOff + rem * Lw.cs, SH.tblOff, rows, Lw.K);
-        else SW.gemv_tern(swOutOff + (offs4[b] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
-        const ob = offs4[b] + row0;
-        if (resid) { for (let i = 0; i < rows; i++) sxV[ob + i] += swOutV[ob + i] * asc; }
-        else if (amax) { for (let i = 0; i < rows; i++) { const v = swOutV[ob + i] * asc; swOutV[ob + i] = v; if (v > bv) { bv = v; bi = ob + i; } } }
-        else { for (let i = 0; i < rows; i++) swOutV[ob + i] *= asc; }
-      }
-      if (amax) { argValV[wid] = bv; argIdxV[wid] = bi; }
-      Atomics.add(ctrl, DONEBASE + wid * DONESTRIDE + 1, ((performance.now() - _t4) * 1000) | 0);
+      const mids = [], offs4 = [];
+      for (let b = 0; b < nmat4; b++) { mids.push(Atomics.load(ctrl, MATID0 + b)); offs4.push(Atomics.load(ctrl, OUTOFF0 + b)); }
+      claimChunksW(mids, offs4, CURSOR, resid, amax);
       Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
       continue;
     }
     if (jt === 6) {
-      // SHARED-KV ATTENTION, work-stolen by kvh unit: each unit appends k/v for its kvh
-      // (norm+rope+int8-quant into the SHARED KV) then computes its qpk heads' attention,
-      // reading q/k/v straight from the shared OUT region and writing swAttn. Main claims too.
-      const l = Atomics.load(ctrl, LAYER), pos = Atomics.load(ctrl, BASEPOS), T = pos + 1;
-      const hd = aHD, nKV = aNKV, qpk = aNH / nKV, scale = aScale;
-      const Nq = aNH * hd, Nk = nKV * hd;
-      for (;;) {
-        const kvh = Atomics.add(ctrl, CURSOR, 1);
-        if (kvh >= nKV) break;
-        const kb = SH.kvOff + (l * nKV + kvh) * SH.kvStride;
-        const ki8 = kb, ks = kb + SH.kvKS, vi8 = kb + SH.kvVI, vs = kb + SH.kvVS;
-        if (pos < MAXCTX) {
-          SP.kfV.set(swOutV.subarray(Nq + kvh * hd, Nq + kvh * hd + hd));
-          SW.rmsnorm(SP.kfOff, SP.kfOff, SH.qknK + l * hd * 4, hd, aEps); ropeV(SP.kfV, 0);
-          swF32[(ks >> 2) + pos] = SW.quant_vec(ki8 + pos * hd, SP.kfOff, hd);
-          SP.kfV.set(swOutV.subarray(Nq + Nk + kvh * hd, Nq + Nk + kvh * hd + hd));
-          swF32[(vs >> 2) + pos] = SW.quant_vec(vi8 + pos * hd, SP.kfOff, hd);
-        }
-        for (let h = kvh * qpk; h < (kvh + 1) * qpk; h++) {
-          SP.qfV.set(swOutV.subarray(h * hd, h * hd + hd));
-          SW.rmsnorm(SP.qfOff, SP.qfOff, SH.qknQ + l * hd * 4, hd, aEps); ropeV(SP.qfV, 0);
-          const qs = SW.quant_vec(SP.qi8Off, SP.qfOff, hd);
-          SW.attn_scores(SP.scOff, SP.qi8Off, qs, ki8, ks, T, hd, scale);
-          const sc = SP.scV; let mx = -Infinity; for (let t = 0; t < T; t++) { const v = sc[t]; if (v > mx) mx = v; }
-          let sum = 0; for (let t = 0; t < T; t++) { const e = Math.exp(sc[t] - mx); sc[t] = e; sum += e; }
-          const isum = 1 / sum; for (let t = 0; t < T; t++) sc[t] *= isum;
-          SW.attn_accv(SH.attnOff2 + h * hd * 4, SP.scOff, vi8, vs, T, hd);
-        }
-      }
+      // SHARED-KV ATTENTION, work-stolen by kvh unit (single-phase dispatch)
+      attnUnitsW(Atomics.load(ctrl, LAYER), Atomics.load(ctrl, BASEPOS), CURSOR);
+      Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
+      continue;
+    }
+    if (jt === 7) {
+      // MEGA-LAYER: an ENTIRE layer in ONE dispatch — 5 work-stolen phases (qkv / attention /
+      // o+resid / gate,up / down+resid) separated by µs in-job barriers (Wn+1 participants incl
+      // main). Main does the µs glue (quant/norm/swiglu on its shared instance) at the gaps and
+      // bumps GLUEGEN; each phase's asc is read from sabAsc[0] AFTER the glue wait. Replaces 5
+      // dispatch wakes per layer with 1 — the measured 77%-of-token gemv-dispatch overhead.
+      const l = Atomics.load(ctrl, LAYER), pos = Atomics.load(ctrl, BASEPOS);
+      const M = MEGA.layers[l], I = MEGA.I;
+      const Nq = aNH * aHD, Nk = aNKV * aHD;
+      const gBase = Atomics.load(ctrl, GLUEGEN);
+      claimChunksW([M.q, M.k, M.v], [0, Nq, Nq + Nk], CUR_A, 0, 0);
+      pbarT(Wn + 1);
+      attnUnitsW(l, pos, CUR_B);
+      pbarT(Wn + 1);
+      glueWaitW(gBase + 1);                       // main: quant(attn) → asc
+      claimChunksW([M.o], [0], CUR_C, 1, 0);
+      pbarT(Wn + 1);
+      glueWaitW(gBase + 2);                       // main: post-norm + quant → asc
+      claimChunksW([M.gate, M.up], [0, I], CUR_D, 0, 0);
+      pbarT(Wn + 1);
+      glueWaitW(gBase + 3);                       // main: swiglu + quant → asc
+      claimChunksW([M.down], [0], CUR_E, 1, 0);
       Atomics.store(ctrl, DONEBASE + wid * DONESTRIDE, gen);
       continue;
     }
