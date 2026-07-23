@@ -22,6 +22,19 @@
     if (_loading) return _loading;
     _loading = (async () => {
       if (!self.crossOriginIsolated) throw new Error('CPU engine needs crossOriginIsolated (COOP/COEP) for SharedArrayBuffer');
+      // PREFLIGHT: this model needs gitignored LOCAL files served at the site root. Probe them
+      // up front and name exactly what's missing — otherwise a 404's HTML error page surfaces
+      // later as a baffling `Unexpected token '<' … not valid JSON` from the tokenizer parse.
+      const need = ['_cpukern/cpuengine-mt.js', 'cpukern.wasm', 'cpukern-shared.wasm', 'bonsai17.cpu.bin', '_bonsai17/tokenizer.json'];
+      const missing = [];
+      for (const f of need) {
+        try {
+          const r = await fetch(BASE + f, { method: 'HEAD' });
+          const ct = (r.headers.get('content-type') || '').toLowerCase();
+          if (!r.ok || ct.includes('text/html')) missing.push(f);
+        } catch (_) { missing.push(f); }
+      }
+      if (missing.length) throw new Error('required local files not served: ' + missing.join(', ') + ' — this EXPERIMENTAL model only runs on a dev machine where bonsai17.cpu.bin, cpukern*.wasm and _bonsai17/ sit at the site root (they are gitignored and not deployed)');
       globalThis.__cpukernBase = BASE;
       importScripts(BASE + '_cpukern/cpuengine-mt.js?v=41');
       // the REAL tokenizer module is already imported by webgpu-worker (webgpu-qwen3.js)
