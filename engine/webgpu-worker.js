@@ -17,7 +17,7 @@ let _ok = false;
 try {
   // KEEP the ?v= in sync with sandpie.html when these modules are bumped. Both WebGPU engines
   // share the one webgpu-engine.js device; the host picks which by model id.
-  importScripts('webgpu-engine.js?v=53', 'webgpu-grammar.js?v=1', 'webgpu-qwen3.js?v=150', 'webgpu-lfm25.js?v=54');
+  importScripts('webgpu-engine.js?v=53', 'webgpu-grammar.js?v=1', 'webgpu-qwen3.js?v=150', 'webgpu-lfm25.js?v=54', 'cpu-bonsai.js?v=1');
   _ok = !!self.SandpieQwen3;
 } catch (e) {
   self.postMessage({ t: 'fatal', message: 'worker import failed: ' + ((e && e.message) || e) });
@@ -25,6 +25,7 @@ try {
 
 const Q = self.SandpieQwen3;
 const L = self.SandpieLfm25;
+const C = self.SandpieCpuBonsai;
 const _ctrls = new Map();   // run id -> AbortController
 
 // Pick the engine for a run by the requested model id. LFM2.5 variants ('8B-A1B', …) live in
@@ -32,6 +33,7 @@ const _ctrls = new Map();   // run id -> AbortController
 // provider.endpoint (or modelId).
 function engineFor(config) {
   const ep = (config && config.provider && (config.provider.endpoint || config.provider.modelId)) || '';
+  if (C && C.MODELS && Object.prototype.hasOwnProperty.call(C.MODELS, ep)) return C;
   if (L && L.MODELS && Object.prototype.hasOwnProperty.call(L.MODELS, ep)) return L;
   return Q;
 }

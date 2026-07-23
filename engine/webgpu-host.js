@@ -22,6 +22,7 @@
     { id: 'qwen3-0.6b', modelId: '0.6B', label: 'Qwen3-0.6B dense (~1.1GB download)' },
     { id: 'qwen3-1.7b', modelId: '1.7B', label: 'Qwen3-1.7B dense (~3.9GB download)' },
     { id: 'lfm25-8b', modelId: '8B-A1B', label: 'LFM2.5-8B-A1B MoE (int3, ~4.3GB — ~15 tok/s decode, 125 prefill)' },
+    { id: 'bonsai17-cpu', modelId: 'bonsai-1.7b-cpu', label: 'Bonsai-1.7B ternary CPU (experimental, local file — ~30 tok/s, no tools)' },
   ];
   const DEFAULT_N_CTX = 4096;
 
@@ -75,7 +76,7 @@
 
   function worker() {
     if (_worker) return _worker;
-    _worker = new Worker('modules/webgpu-worker.js?v=53');
+    _worker = new Worker('modules/webgpu-worker.js?v=54');
     _worker.onmessage = (e) => {
       const m = e.data || {};
       if (m.t === 'fatal') { console.error('[webgpu-host]', m.message); return; }

@@ -6,7 +6,7 @@
 // in the packed v1 layout cost ~1ms/barrier.
 const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, RESID = 336, AMAX = 337, CUR_A = 352, CUR_B = 368, CUR_C = 384, CUR_D = 400, CUR_E = 416, GLUEGEN = 432, CTRL_I32 = 32 + 16 * 16 + 160;
 const CH = 128; // work-stealing chunk rows (shared-weights mode)
-const MAXCTX = 512;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
+const MAXCTX = 2048;   // per-worker int8 KV capacity (must match coordinator's context ceiling)
 let W = null, wid = 0, Wn = 1, aParts = 1;   // aParts = phase-barrier participants (Wn + main)
 let ctrl, sabAsc, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin, sabX, argValV, argIdxV;
 let aNH, aNKV, aHD, aScale, aEps, aMaxK, aMaxN, aBMAX;   // attention/batch params

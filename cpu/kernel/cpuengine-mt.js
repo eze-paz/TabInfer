@@ -16,7 +16,7 @@ const CPUEngineMT = (function () {
   const GEN = 0, NMAT = 16, KK = 17, ASC = 18, MATID0 = 19, OUTOFF0 = 22, JOBTYPE = 25, LAYER = 26, TLEN = 27, SPIN = 28, BATCH = 29, BASEPOS = 30, PHASE = 31, DONEBASE = 32, DONESTRIDE = 16, PBCNT = 288, PBGEN = 304, CURSOR = 320, RESID = 336, AMAX = 337, CUR_A = 352, CUR_B = 368, CUR_C = 384, CUR_D = 400, CUR_E = 416, GLUEGEN = 432;
   const CTRL_I32 = 32 + 16 * 16 + 160; // 16 workers + mega/chunk/mega-layer sync words (own cache lines)
   const CH = 128; // work-stealing chunk rows (shared-weights mode)
-  const MAXCTX = 512; // KV positions held in the shared buffer
+  const MAXCTX = 2048; // KV positions held in the shared buffer
   const BMAX = 6;     // max tokens verified per batched (speculative) forward
   let Wn = 8, workers = [], ctrl, sabAsc, sabAct, sabXsum, sabOut, sabQ, sabAttn, sabKcur, sabVcur, sabCos, sabSin, sabX, argValV, argIdxV;
   let embedF16 = null; const nrm = {}, mats = {}; // name -> {mid,N,K}
@@ -36,7 +36,7 @@ const CPUEngineMT = (function () {
   let SG = null;   // {sxOff,sxnOff,sswiOff,nrmIn,nrmPost,nrmFin,qknQ,qknK,kvOff,kvStride,kvKS,kvVI,kvVS,attnOff2,pscrBase,pscrStride}
   let sxV = null, sxnV = null, swAttnV = null, swSwiGV = null, swSwiUV = null, swF32 = null, MSP = null, megaMap = null;
   async function initMainWasm() {
-    const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
+    const buf = await (await fetch((globalThis.__cpukernBase || '') + 'cpukern.wasm')).arrayBuffer();
     MW = (await WebAssembly.instantiate(buf, {})).instance.exports;
   }
   const align16 = x => (x + 15) & ~15;
@@ -108,7 +108,7 @@ const CPUEngineMT = (function () {
       const kvStride = kvVS + MAXCTX * 4;                  // ki8 | ks | vi8 | vs per (l,kvh)
       const kvOff2 = align16b(top); top = kvOff2 + L2 * nKV2 * kvStride;
       const attnOff2 = align16b(top); top = attnOff2 + nH2 * hd2 * 4;
-      const pscrStride = 8192, pscrBase = align16b(top); top = pscrBase + (Wn + 1) * pscrStride;
+      const pscrStride = 16384, pscrBase = align16b(top); top = pscrBase + (Wn + 1) * pscrStride;
       SG = { sxOff, sxnOff, sswiOff, nrmIn: nrmInOff, nrmPost: nrmPostOff, nrmFin: nrmFinOff, qknQ: qknQOff, qknK: qknKOff, kvOff: kvOff2, kvStride, kvKS, kvVI, kvVS, attnOff2, pscrBase, pscrStride, tblOff: tblOff0, lut: lutOn };
       const stacksBase = align16b(top);
       top = stacksBase + (Wn + 1) * STACK;                 // one stack region per worker + main
@@ -146,7 +146,7 @@ const CPUEngineMT = (function () {
           swU8.set(srcAll.subarray(dataBase + t.scalesOff, dataBase + t.scalesOff + t.N * ng2 * 4), Lw.scalesOff);
         }
       }
-      const smod = await WebAssembly.compile(await (await fetch('cpukern-shared.wasm')).arrayBuffer());
+      const smod = await WebAssembly.compile(await (await fetch((globalThis.__cpukernBase || '') + 'cpukern-shared.wasm')).arrayBuffer());
       const mi = await WebAssembly.instantiate(smod, { env: { memory: SWmem } });
       mi.exports.__stack_pointer.value = stacksBase + (Wn + 1) * STACK;   // main takes the top stack
       MS = mi.exports;
@@ -244,7 +244,7 @@ const CPUEngineMT = (function () {
         const so = o; part.set(srcU8.subarray(e.ssrc, e.ssrc + e.sl), o); o += e.sl;
         layout.push({ mid: e.mid, r0: e.r0, rows: e.rows, K: e.K, codesOff: co, codesLen: e.cl, scalesOff: so, scalesLen: e.sl });
       }
-      const wk = new Worker('cpukern-fwd-worker.js'); workers.push(wk);
+      const wk = new Worker((globalThis.__cpukernBase || '') + 'cpukern-fwd-worker.js'); workers.push(wk);
       wk.onerror = e => { (globalThis.__wErr = globalThis.__wErr || []).push('onerror w' + wk.__wid + ': ' + (e.message || e)); };
       wk.__wid = w;
       readies.push(new Promise(res => { wk.onmessage = ev => { if (ev.data.workerError) (globalThis.__wErr = globalThis.__wErr || []).push('w' + wk.__wid + ': ' + ev.data.workerError); if (ev.data.ready) res(); }; }));
@@ -778,3 +778,4 @@ const CPUEngineMT = (function () {
   return { load, forward, forwardTok, forwardN, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
 })();
 if (typeof window !== 'undefined') window.CPUEngineMT = CPUEngineMT;
+if (typeof globalThis !== 'undefined') globalThis.CPUEngineMT = CPUEngineMT;
