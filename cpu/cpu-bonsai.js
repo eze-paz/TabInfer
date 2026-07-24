@@ -44,16 +44,21 @@
       ];
       const missing = [];
       for (const [url, name] of need) {
+        // 1-byte ranged GET, aborted after headers: works across static servers AND
+        // CDNs (HuggingFace, R2, S3) where HEAD is often unsupported or redirects
+        // oddly. Downloads nothing (we abort before reading the body).
+        const ctrl = new AbortController();
         try {
-          const r = await fetch(url, { method: 'HEAD' });
+          const r = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal: ctrl.signal });
           const ct = (r.headers.get('content-type') || '').toLowerCase();
           if (!r.ok || ct.includes('text/html')) missing.push(name + ' (' + url + ')');
         } catch (_) { missing.push(name + ' (' + url + ')'); }
+        finally { try { ctrl.abort(); } catch (_) {} }
       }
       if (missing.length) throw new Error('required files not served: ' + missing.join(', ')
-        + ' — EXPERIMENTAL model. The wasm kernels deploy with the site (redeploy if missing); host the two big files '
-        + '(bonsai17.cpu.bin + tokenizer.json) in one directory and set localStorage["sandpie-cpu-bonsai-base"] to its URL '
-        + '(CORS-enabled if cross-origin). On a dev checkout they are read from the site root automatically.');
+        + ' — EXPERIMENTAL model. The wasm kernels deploy with the site (redeploy if missing). Host the two big files '
+        + '(bonsai17.cpu.bin + tokenizer.json) on any CORS+range host — e.g. a HuggingFace repo (resolve/main/) or R2/S3 — '
+        + 'and set localStorage["sandpie-cpu-bonsai-base"] to that directory URL. On a local dev checkout they load from the site root automatically.');
       globalThis.__cpukernBase = BASE;
       importScripts(BASE + '_cpukern/cpuengine-mt.js?v=41');
       await self.SandpieQwen3.TOK.load(data.tok);
