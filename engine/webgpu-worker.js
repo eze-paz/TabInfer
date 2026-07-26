@@ -17,7 +17,7 @@ let _ok = false;
 try {
   // KEEP the ?v= in sync with sandpie.html when these modules are bumped. Both WebGPU engines
   // share the one webgpu-engine.js device; the host picks which by model id.
-  importScripts('webgpu-engine.js?v=53', 'webgpu-grammar.js?v=1', 'webgpu-qwen3.js?v=150', 'webgpu-lfm25.js?v=54', 'cpu-bonsai.js?v=8');
+  importScripts('webgpu-engine.js?v=53', 'webgpu-grammar.js?v=1', 'webgpu-qwen3.js?v=150', 'webgpu-lfm25.js?v=54', 'cpu-bonsai.js?v=9');
   _ok = !!self.SandpieQwen3;
 } catch (e) {
   self.postMessage({ t: 'fatal', message: 'worker import failed: ' + ((e && e.message) || e) });

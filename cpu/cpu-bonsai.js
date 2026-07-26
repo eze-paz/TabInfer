@@ -164,6 +164,12 @@
         try { console.log('[bonsai] caching ' + Math.round(frac * 100) + '% (' + (loaded / 1e9).toFixed(2) + '/' + (total / 1e9).toFixed(2) + ' GB)'); } catch (_) {}
       });
       const TOK = self.SandpieQwen3.TOK, E = globalThis.CPUEngineMT;
+      // Mega-layer kernel (JOBTYPE=7): one dispatch per layer, main participates —
+      // trades V2's work-stealing for far fewer barriers. Toggle per-run (no reload)
+      // via localStorage['sandpie-cpu-bonsai-v3']='1' to A/B against V2 back-to-back.
+      const v3 = (config.cpuBonsaiV3 === '1' || config.cpuBonsaiV3 === 'true' || config.cpuBonsaiV3 === true);
+      globalThis.__v3 = v3;
+      const kern = v3 ? 'v3-mega' : 'v2';
       // flatten messages (strings only; tools unsupported)
       const msgs = [];
       if (config.systemPrompt) msgs.push({ role: 'system', content: String(config.systemPrompt) });
@@ -228,7 +234,7 @@
       // autoregressive decode (memory-bound)? tok/s each + worker count.
       const decMs = _now() - tDec0;
       const preS = preMs / 1000, decS = decMs / 1000;
-      const perf = `prefill ${ids.length} tok / ${preS.toFixed(1)}s = ${(preS ? ids.length / preS : 0).toFixed(1)} tok/s  ·  decode ${out.length} tok / ${decS.toFixed(1)}s = ${(decS ? out.length / decS : 0).toFixed(1)} tok/s  ·  ${_nWorkers}w`;
+      const perf = `prefill ${ids.length} tok / ${preS.toFixed(1)}s = ${(preS ? ids.length / preS : 0).toFixed(1)} tok/s  ·  decode ${out.length} tok / ${decS.toFixed(1)}s = ${(decS ? out.length / decS : 0).toFixed(1)} tok/s  ·  ${_nWorkers}w ${kern}`;
       try { console.log('[bonsai perf] ' + perf); } catch (_) {}
       emit({ type: 'delta', delta: { content: '\n\n`⏱ ' + perf + '`' } });
       const full = TOK.decode(out);

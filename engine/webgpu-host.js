@@ -76,7 +76,7 @@
 
   function worker() {
     if (_worker) return _worker;
-    _worker = new Worker('modules/webgpu-worker.js?v=61');
+    _worker = new Worker('modules/webgpu-worker.js?v=62');
     _worker.onmessage = (e) => {
       const m = e.data || {};
       if (m.t === 'fatal') { console.error('[webgpu-host]', m.message); return; }
@@ -129,6 +129,7 @@
       // tokenizer.json (workers can't read localStorage — pass it through the run config).
       cpuBonsaiBase: (function () { try { return localStorage.getItem('sandpie-cpu-bonsai-base') || null; } catch (_) { return null; } })(),
       cpuBonsaiWorkers: (function () { try { return localStorage.getItem('sandpie-cpu-bonsai-workers') || null; } catch (_) { return null; } })(),
+      cpuBonsaiV3: (function () { try { return localStorage.getItem('sandpie-cpu-bonsai-v3') || null; } catch (_) { return null; } })(),
     };
     try { if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg); } catch (_) {}
     const p = new Promise((resolve, reject) => {
