@@ -28,25 +28,56 @@
     return { bin: b + 'bonsai17.cpu.bin', tok: b, label: b };
   }
 
-  function ensureLoaded(data) {
+  // ---- one-time model caching ----------------------------------------------
+  // The big bin (~1GB) is cached in OPFS so it downloads ONCE. Cache lives OUTSIDE
+  // sandpie/ so Dropbox never syncs it. Download STREAMS to disk (low peak RAM); a
+  // sibling `.ok` marker guards against a partial/interrupted download being reused.
+  // The coordinator's load() just does fetch(url).arrayBuffer(), so we hand it a
+  // blob: URL backed by the on-disk (disk-backed, not RAM-resident) cache File.
+  const _hashStr = (s) => { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); };
+  async function _cacheDir() { try { const root = await navigator.storage.getDirectory(); return await root.getDirectoryHandle('cpu-model-cache', { create: true }); } catch (_) { return null; } }
+  async function _binCached(url) {
+    const dir = await _cacheDir(); if (!dir) return false;
+    const key = 'bonsai_' + _hashStr(url) + '.bin';
+    try { await dir.getFileHandle(key + '.ok'); const f = await (await dir.getFileHandle(key)).getFile(); return f.size > 0; } catch (_) { return false; }
+  }
+  async function _cachedBinUrl(url, onProgress) {
+    const dir = await _cacheDir();
+    const key = 'bonsai_' + _hashStr(url) + '.bin';
+    if (dir) { try { await dir.getFileHandle(key + '.ok'); const f = await (await dir.getFileHandle(key)).getFile(); if (f.size > 0) return URL.createObjectURL(f); } catch (_) {} }
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error('model download failed: HTTP ' + resp.status + ' from ' + url);
+    if (!dir || !resp.body) { return URL.createObjectURL(new Blob([await resp.arrayBuffer()])); }   // no OPFS → in-memory
+    try { await dir.removeEntry(key + '.ok'); } catch (_) {}                       // invalidate stale marker before rewriting
+    const total = +(resp.headers.get('content-length') || 0);
+    const w = await (await dir.getFileHandle(key, { create: true })).createWritable();
+    const reader = resp.body.getReader(); let loaded = 0, lastPct = -1;
+    for (;;) { const r = await reader.read(); if (r.done) break; await w.write(r.value); loaded += r.value.length; if (onProgress) { const p = total ? Math.floor(loaded / total * 100) : -1; if (p !== lastPct) { lastPct = p; onProgress(total ? loaded / total : 0, loaded, total); } } }
+    await w.close();
+    try { const mw = await (await dir.getFileHandle(key + '.ok', { create: true })).createWritable(); await mw.close(); } catch (_) {}
+    return URL.createObjectURL(await (await dir.getFileHandle(key)).getFile());
+  }
+
+  function ensureLoaded(data, onProgress) {
     if (_loaded) return Promise.resolve();
     if (_loading) return _loading;
     _loading = (async () => {
       if (!self.crossOriginIsolated) throw new Error('CPU engine needs crossOriginIsolated (COOP/COEP) for SharedArrayBuffer');
-      // PREFLIGHT: probe every required file and name exactly what's missing — otherwise a
-      // 404's HTML page surfaces later as `Unexpected token '<' … not valid JSON`.
+      // PREFLIGHT: probe required files and name exactly what's missing — otherwise a
+      // 404's HTML page surfaces later as `Unexpected token '<' … not valid JSON`. Skip
+      // the big bin if it's already cached (works offline / survives HF being down).
+      const binHit = await _binCached(data.bin);
       const need = [
         [BASE + '_cpukern/cpuengine-mt.js', 'cpukern JS'],
         [BASE + 'cpukern.wasm', 'cpukern.wasm'],
         [BASE + 'cpukern-shared.wasm', 'cpukern-shared.wasm'],
-        [data.bin, 'bonsai17.cpu.bin'],
+        ...(binHit ? [] : [[data.bin, 'bonsai17.cpu.bin']]),
         [data.tok + 'tokenizer.json', 'tokenizer.json'],
       ];
       const missing = [];
       for (const [url, name] of need) {
         // 1-byte ranged GET, aborted after headers: works across static servers AND
-        // CDNs (HuggingFace, R2, S3) where HEAD is often unsupported or redirects
-        // oddly. Downloads nothing (we abort before reading the body).
+        // CDNs (HuggingFace, R2, S3) where HEAD is often unsupported. Downloads nothing.
         const ctrl = new AbortController();
         try {
           const r = await fetch(url, { headers: { Range: 'bytes=0-0' }, signal: ctrl.signal });
@@ -63,7 +94,8 @@
       importScripts(BASE + '_cpukern/cpuengine-mt.js?v=41');
       await self.SandpieQwen3.TOK.load(data.tok);
       globalThis.__chunkMode = true; globalThis.__lutMode = false;
-      await globalThis.CPUEngineMT.load(data.bin, 8);
+      const binUrl = await _cachedBinUrl(data.bin, onProgress);   // one-time download → OPFS cache → blob URL
+      try { await globalThis.CPUEngineMT.load(binUrl, 8); } finally { try { URL.revokeObjectURL(binUrl); } catch (_) {} }
       _loaded = true;
     })();
     _loading.catch(() => { _loading = null; });
@@ -76,7 +108,11 @@
     const signal = config && config.signal;
     try {
       emit({ type: 'round_start' });
-      await ensureLoaded(resolveDataBase(config));
+      let _dlAnnounced = false;
+      await ensureLoaded(resolveDataBase(config), (frac, loaded, total) => {
+        if (!_dlAnnounced) { _dlAnnounced = true; emit({ type: 'delta', delta: { reasoning: 'First run on this device: downloading + caching the model (~1 GB) — one-time, then it loads from cache instantly.\n' } }); }
+        try { console.log('[bonsai] caching ' + Math.round(frac * 100) + '% (' + (loaded / 1e9).toFixed(2) + '/' + (total / 1e9).toFixed(2) + ' GB)'); } catch (_) {}
+      });
       const TOK = self.SandpieQwen3.TOK, E = globalThis.CPUEngineMT;
       // flatten messages (strings only; tools unsupported)
       const msgs = [];
