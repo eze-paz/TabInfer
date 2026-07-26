@@ -46,6 +46,7 @@
   // sibling `.ok` marker guards against a partial/interrupted download being reused.
   // The coordinator's load() just does fetch(url).arrayBuffer(), so we hand it a
   // blob: URL backed by the on-disk (disk-backed, not RAM-resident) cache File.
+  const _now = () => (self.performance || Date).now();
   const _hashStr = (s) => { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); };
   async function _cacheDir() { try { const root = await navigator.storage.getDirectory(); return await root.getDirectoryHandle('cpu-model-cache', { create: true }); } catch (_) { return null; } }
   async function _binCached(url) {
@@ -56,18 +57,47 @@
   async function _cachedBinUrl(url, onProgress) {
     const dir = await _cacheDir();
     const key = 'bonsai_' + _hashStr(url) + '.bin';
-    if (dir) { try { await dir.getFileHandle(key + '.ok'); const f = await (await dir.getFileHandle(key)).getFile(); if (f.size > 0) return URL.createObjectURL(f); } catch (_) {} }
-    const resp = await fetch(url);
-    if (!resp.ok) throw new Error('model download failed: HTTP ' + resp.status + ' from ' + url);
-    if (!dir || !resp.body) { return URL.createObjectURL(new Blob([await resp.arrayBuffer()])); }   // no OPFS → in-memory
-    try { await dir.removeEntry(key + '.ok'); } catch (_) {}                       // invalidate stale marker before rewriting
-    const total = +(resp.headers.get('content-length') || 0);
+    if (dir) { try { await dir.getFileHandle(key + '.ok'); const f = await (await dir.getFileHandle(key)).getFile(); if (f.size > 0) { try { console.log('[bonsai load] cache HIT (' + (f.size / 1e9).toFixed(2) + ' GB) — no download'); } catch (_) {} return URL.createObjectURL(f); } } catch (_) {} }
+    // MISS: probe size + range support, then download.
+    const t0 = _now();
+    let total = 0, ranges = false;
+    try { const h = await fetch(url, { headers: { Range: 'bytes=0-0' } }); const cr = h.headers.get('content-range'); if (cr) { total = +cr.split('/')[1]; ranges = true; } else total = +(h.headers.get('content-length') || 0); try { h.body && h.body.cancel(); } catch (_) {} } catch (_) {}
+    try { console.log('[bonsai load] cache MISS — downloading ' + (total / 1e9).toFixed(2) + ' GB, ranges=' + ranges); } catch (_) {}
+    const finish = async () => { try { const mw = await (await dir.getFileHandle(key + '.ok', { create: true })).createWritable(); await mw.close(); } catch (_) {} const u = URL.createObjectURL(await (await dir.getFileHandle(key)).getFile()); try { console.log('[bonsai load] downloaded in ' + ((_now() - t0) / 1000).toFixed(1) + 's'); } catch (_) {} return u; };
+    // Fallback: no OPFS, or server has no range support → single stream.
+    if (!dir || !ranges || !total) {
+      const resp = await fetch(url); if (!resp.ok) throw new Error('model download failed: HTTP ' + resp.status);
+      if (!dir || !resp.body) return URL.createObjectURL(new Blob([await resp.arrayBuffer()]));
+      try { await dir.removeEntry(key + '.ok'); } catch (_) {}
+      const w = await (await dir.getFileHandle(key, { create: true })).createWritable();
+      const rd = resp.body.getReader(); let ld = 0;
+      for (;;) { const r = await rd.read(); if (r.done) break; await w.write(r.value); ld += r.value.length; if (onProgress) onProgress(total ? ld / total : 0, ld, total); }
+      await w.close(); return finish();
+    }
+    // PARALLEL ranged download: N chunks fetched concurrently (network parallelism —
+    // the CDN win), writes serialized onto one OPFS writable at their byte offsets.
+    try { await dir.removeEntry(key + '.ok'); } catch (_) {}
     const w = await (await dir.getFileHandle(key, { create: true })).createWritable();
-    const reader = resp.body.getReader(); let loaded = 0, lastPct = -1;
-    for (;;) { const r = await reader.read(); if (r.done) break; await w.write(r.value); loaded += r.value.length; if (onProgress) { const p = total ? Math.floor(loaded / total * 100) : -1; if (p !== lastPct) { lastPct = p; onProgress(total ? loaded / total : 0, loaded, total); } } }
-    await w.close();
-    try { const mw = await (await dir.getFileHandle(key + '.ok', { create: true })).createWritable(); await mw.close(); } catch (_) {}
-    return URL.createObjectURL(await (await dir.getFileHandle(key)).getFile());
+    try { await w.truncate(total); } catch (_) {}     // pre-size so positioned writes land
+    const CH = 48 * 1024 * 1024, CONC = 8, nCh = Math.ceil(total / CH);
+    let next = 0, done = 0, writeChain = Promise.resolve();
+    const pull = async () => {
+      for (;;) {
+        const idx = next++; if (idx >= nCh) return;
+        const start = idx * CH, end = Math.min(start + CH, total) - 1;
+        let buf;
+        for (let a = 0; ; a++) {
+          try { const r = await fetch(url, { headers: { Range: `bytes=${start}-${end}` } }); if (!r.ok && r.status !== 206) throw new Error('HTTP ' + r.status); buf = new Uint8Array(await r.arrayBuffer()); break; }
+          catch (e) { if (a >= 3) throw e; await new Promise(z => setTimeout(z, 400 * (a + 1))); }
+        }
+        writeChain = writeChain.then(() => w.write({ type: 'write', position: start, data: buf }));
+        await writeChain;
+        done += buf.length; if (onProgress) onProgress(done / total, done, total);
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(CONC, nCh) }, pull));
+    await writeChain; await w.close();
+    return finish();
   }
 
   function ensureLoaded(data, onProgress) {
@@ -110,8 +140,11 @@
       // Right-size the worker pool to the device (was hardcoded 8 → left >1/3 of a
       // 12-thread CPU idle). Leave one thread for the main/coordinator. Override with
       // localStorage['sandpie-cpu-bonsai-workers'] (passed through cfg) to sweep counts.
+      // Memory-bound decode gets ~nothing from hyperthreading and CONTENDS when
+      // oversubscribed (measured: 6w=17.6 vs 11w=13.9 tok/s on a 6C/12T box). So
+      // default to ~physical cores (hc/2), not hc-1. Override via the localStorage knob.
       const hc = (self.navigator && self.navigator.hardwareConcurrency) || 8;
-      _nWorkers = (data.workers > 0) ? data.workers : Math.max(4, Math.min(hc - 1, 16));
+      _nWorkers = (data.workers > 0) ? data.workers : Math.max(4, Math.min(Math.round(hc / 2), 16));
       try { await globalThis.CPUEngineMT.load(binUrl, _nWorkers); } finally { try { URL.revokeObjectURL(binUrl); } catch (_) {} }
       _loaded = true;
     })();
@@ -146,7 +179,6 @@
         return;
       }
       // prefill (sequential single-token forward; ~30ms/tok) — timed for the perf readout
-      const _now = () => (self.performance || Date).now();
       const tPre0 = _now();
       let pos = 0, last = 0;
       for (let i = 0; i < ids.length; i++) {
