@@ -21,9 +21,20 @@
   const BASE = '../';   // site root relative to modules/
   let _loaded = false, _loading = null;
 
+  // Default host for the big data files (bonsai17.cpu.bin + tokenizer.json): a public
+  // HuggingFace repo. Overridable via localStorage['sandpie-cpu-bonsai-base']. On a
+  // LOCAL dev checkout the files sit at the site root, so localhost prefers those
+  // (no needless 1GB HF fetch); everywhere else defaults to HF. Fetched once, then
+  // served from the OPFS cache.
+  const HF_BASE = 'https://huggingface.co/eze-paz/bonsai17-cpu/resolve/main/';
   function resolveDataBase(cfg) {
     let b = (cfg && cfg.cpuBonsaiBase) || '';
-    if (!b) return { bin: BASE + 'bonsai17.cpu.bin', tok: BASE + '_bonsai17/', label: 'site root' };
+    if (!b) {
+      const host = (self.location && self.location.hostname) || '';
+      const local = /^(localhost|127\.|0\.0\.0\.0|::1|\[::1\])/.test(host);
+      if (local) return { bin: BASE + 'bonsai17.cpu.bin', tok: BASE + '_bonsai17/', label: 'site root (local dev)' };
+      b = HF_BASE;
+    }
     if (!b.endsWith('/')) b += '/';
     return { bin: b + 'bonsai17.cpu.bin', tok: b, label: b };
   }
