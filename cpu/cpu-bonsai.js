@@ -135,7 +135,7 @@
       globalThis.__cpukernBase = BASE;
       importScripts(BASE + '_cpukern/cpuengine-mt.js?v=41');
       await self.SandpieQwen3.TOK.load(data.tok);
-      globalThis.__chunkMode = true; globalThis.__lutMode = false;
+      globalThis.__chunkMode = true; globalThis.__lutMode = true;
       const binUrl = await _cachedBinUrl(data.bin, onProgress);   // one-time download → OPFS cache → blob URL
       // Right-size the worker pool to the device (was hardcoded 8 → left >1/3 of a
       // 12-thread CPU idle). Leave one thread for the main/coordinator. Override with
