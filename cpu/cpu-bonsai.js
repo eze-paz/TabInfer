@@ -19,7 +19,7 @@
   // separate host: set localStorage['sandpie-cpu-bonsai-base'] to a dir URL serving both
   // (CORS-enabled if cross-origin); default is the site root (dev machine layout).
   const BASE = '../';   // site root relative to modules/
-  let _loaded = false, _loading = null;
+  let _loaded = false, _loading = null, _nWorkers = 8;
 
   // Default host for the big data files (bonsai17.cpu.bin + tokenizer.json): a public
   // HuggingFace repo. Overridable via localStorage['sandpie-cpu-bonsai-base']. On a
@@ -28,15 +28,16 @@
   // served from the OPFS cache.
   const HF_BASE = 'https://huggingface.co/eze-paz/bonsai17-cpu/resolve/main/';
   function resolveDataBase(cfg) {
+    const workers = parseInt((cfg && cfg.cpuBonsaiWorkers) || '', 10) || 0;   // optional sweep override
     let b = (cfg && cfg.cpuBonsaiBase) || '';
     if (!b) {
       const host = (self.location && self.location.hostname) || '';
       const local = /^(localhost|127\.|0\.0\.0\.0|::1|\[::1\])/.test(host);
-      if (local) return { bin: BASE + 'bonsai17.cpu.bin', tok: BASE + '_bonsai17/', label: 'site root (local dev)' };
+      if (local) return { bin: BASE + 'bonsai17.cpu.bin', tok: BASE + '_bonsai17/', label: 'site root (local dev)', workers };
       b = HF_BASE;
     }
     if (!b.endsWith('/')) b += '/';
-    return { bin: b + 'bonsai17.cpu.bin', tok: b, label: b };
+    return { bin: b + 'bonsai17.cpu.bin', tok: b, label: b, workers };
   }
 
   // ---- one-time model caching ----------------------------------------------
@@ -106,7 +107,12 @@
       await self.SandpieQwen3.TOK.load(data.tok);
       globalThis.__chunkMode = true; globalThis.__lutMode = false;
       const binUrl = await _cachedBinUrl(data.bin, onProgress);   // one-time download → OPFS cache → blob URL
-      try { await globalThis.CPUEngineMT.load(binUrl, 8); } finally { try { URL.revokeObjectURL(binUrl); } catch (_) {} }
+      // Right-size the worker pool to the device (was hardcoded 8 → left >1/3 of a
+      // 12-thread CPU idle). Leave one thread for the main/coordinator. Override with
+      // localStorage['sandpie-cpu-bonsai-workers'] (passed through cfg) to sweep counts.
+      const hc = (self.navigator && self.navigator.hardwareConcurrency) || 8;
+      _nWorkers = (data.workers > 0) ? data.workers : Math.max(4, Math.min(hc - 1, 16));
+      try { await globalThis.CPUEngineMT.load(binUrl, _nWorkers); } finally { try { URL.revokeObjectURL(binUrl); } catch (_) {} }
       _loaded = true;
     })();
     _loading.catch(() => { _loading = null; });
@@ -139,7 +145,9 @@
         emit({ type: 'agent_done' });
         return;
       }
-      // prefill (sequential single-token forward; ~30ms/tok)
+      // prefill (sequential single-token forward; ~30ms/tok) — timed for the perf readout
+      const _now = () => (self.performance || Date).now();
+      const tPre0 = _now();
       let pos = 0, last = 0;
       for (let i = 0; i < ids.length; i++) {
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
@@ -147,6 +155,8 @@
         if (i === ids.length - 1) last = t;
         if ((i & 7) === 7) await yield_();
       }
+      const preMs = _now() - tPre0;
+      const tDec0 = _now();
       // decode + stream, splitting <think>…</think> into delta.reasoning
       const out = [];
       let sent = 0, inThink = false, thinkDone = false, started = false;
@@ -181,9 +191,18 @@
         if ((t & 3) === 3) { pump(); await yield_(); }
       }
       pump();
+      // Perf readout: the prefill vs decode split is the diagnosis — is the wall the
+      // one-time prompt prefill (batch-1, reads all weights per prompt token) or the
+      // autoregressive decode (memory-bound)? tok/s each + worker count.
+      const decMs = _now() - tDec0;
+      const preS = preMs / 1000, decS = decMs / 1000;
+      const perf = `prefill ${ids.length} tok / ${preS.toFixed(1)}s = ${(preS ? ids.length / preS : 0).toFixed(1)} tok/s  ·  decode ${out.length} tok / ${decS.toFixed(1)}s = ${(decS ? out.length / decS : 0).toFixed(1)} tok/s  ·  ${_nWorkers}w`;
+      try { console.log('[bonsai perf] ' + perf); } catch (_) {}
+      emit({ type: 'delta', delta: { content: '\n\n`⏱ ' + perf + '`' } });
       const full = TOK.decode(out);
       const ti = full.indexOf('</think>');
-      const content = ti >= 0 ? full.slice(ti + 8) : (full.startsWith('<think>') ? '' : full);
+      let content = ti >= 0 ? full.slice(ti + 8) : (full.startsWith('<think>') ? '' : full);
+      content += '\n\n`⏱ ' + perf + '`';
       emit({ type: 'round_end', content });
       emit({ type: 'agent_done' });
     } catch (err) {
