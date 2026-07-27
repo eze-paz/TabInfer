@@ -22,6 +22,11 @@ document.getElementById('go').onclick = async () => {
           '  ' + (r.ok ? 'MATCH ✓' : 'MISMATCH ✗') +
           '   seq ' + r.msSeq + 'ms / batched ' + r.msBat + 'ms = ' + r.speedup + '×');
     }
+    log('--- allCols verify isolation ---');
+    for (const ids of [[9707,11,1879,25],[151644,872,198,3838]]) {
+      const a = CPUEngineMT._selfTestAllCols(ids);
+      log(JSON.stringify(ids) + ' seq=' + JSON.stringify(a.seq) + ' bat=' + JSON.stringify(a.bat) + '  ' + (a.ok?'MATCH ✓':'MISMATCH ✗'));
+    }
     log('--- speculative decode (greedy must match sequential exactly) ---');
     const sp = CPUEngineMT._selfTestSpec([151644,872,198,3838,374,279,6722,315,9625,30,151645,151644,77091,198], 24);
     log('spec: ' + (sp.ok ? 'IDENTICAL to sequential ✓' : 'DIVERGED ✗') +

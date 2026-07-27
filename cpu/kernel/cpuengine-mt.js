@@ -559,6 +559,14 @@ const CPUEngineMT = (function () {
     const tBat = _now() - t1;
     return { seqLast, bat, ok: seqLast === bat, msSeq: +tSeq.toFixed(1), msBat: +tBat.toFixed(1), speedup: +(tSeq / tBat).toFixed(3) };
   }
+  // SELF-TEST: isolate the allCols verify path — every column's prediction must equal
+  // the sequential forward at that same position.
+  function _selfTestAllCols(tokenIds) {
+    const seq = []; for (let i = 0; i < 4; i++) seq.push(forwardChunk(tokenIds[i], i));
+    const bat = forwardChunkN(tokenIds, 0, true);
+    let ok = true; for (let i = 0; i < 4; i++) if (seq[i] !== bat[i]) ok = false;
+    return { ok, seq, bat };
+  }
   // SELF-TEST: greedy speculative decode MUST equal sequential greedy exactly.
   function _selfTestSpec(promptIds, nNew) {
     const pf = (ids) => { let l = 0, p = 0; for (let i = 0; i < ids.length; i++) l = forwardChunk(ids[i], p++); return { l, p }; };
@@ -880,7 +888,7 @@ const CPUEngineMT = (function () {
   // mega debug: per-worker pbar wait-µs (+3) and park-fallback count (+4)
   const pbarReset = () => { for (let w = 0; w < Wn; w++) { Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 3, 0); Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 4, 0); } };
   const pbarStats = () => { const waitUs = [], parks = []; for (let w = 0; w < Wn; w++) { waitUs.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 3)); parks.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 4)); } return { waitUs, parks }; };
-  return { load, forward, forwardTok, forwardN, forwardChunkN, _selfTestBatch, _selfTestSpec, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
+  return { load, forward, forwardTok, forwardN, forwardChunkN, _selfTestBatch, _selfTestSpec, _selfTestAllCols, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
 })();
 if (typeof window !== 'undefined') window.CPUEngineMT = CPUEngineMT;
 if (typeof globalThis !== 'undefined') globalThis.CPUEngineMT = CPUEngineMT;
