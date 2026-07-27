@@ -329,10 +329,10 @@ unsafe fn tern_col(
 #[target_feature(enable = "simd128,relaxed-simd")]
 #[no_mangle]
 pub unsafe extern "C" fn gemm_tern_b4(
-    out: *mut f32, codes: *const u8, scales: *const f32,
+    out: *mut f32, out_stride: u32, codes: *const u8, scales: *const f32,
     act: *const i8, xsum: *const i32, n: u32, k: u32,
 ) {
-    let n = n as usize; let k = k as usize;
+    let n = n as usize; let k = k as usize; let os = out_stride as usize;
     let nblocks = k / 64; let bpr = k / 4;
     let m3 = u8x16_splat(3); let zero = i32x4_splat(0);
     let mut row = 0usize;
@@ -359,9 +359,9 @@ pub unsafe extern "C" fn gemm_tern_b4(
             b += 1;
         }
         *out.add(row) = hsum4(f0) - x0;
-        *out.add(n + row) = hsum4(f1) - x1;
-        *out.add(2 * n + row) = hsum4(f2) - x2;
-        *out.add(3 * n + row) = hsum4(f3) - x3;
+        *out.add(os + row) = hsum4(f1) - x1;
+        *out.add(2 * os + row) = hsum4(f2) - x2;
+        *out.add(3 * os + row) = hsum4(f3) - x3;
         row += 1;
     }
 }
