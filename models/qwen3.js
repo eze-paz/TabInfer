@@ -4063,7 +4063,7 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     if (_PERF) _perfData = { encode_ms: +(_t1 - _t0).toFixed(2), gpu_drain_ms: +(_t2 - _t1).toFixed(2), map_ms: +(performance.now() - _t2).toFixed(2) };
     if (opts && opts.logprobs) {
       const _lp = await readLogits();                 // full Float32Array[CONFIG.vocab]
-      return { tok, logprob: logProbOfToken(_lp, tok), topLogprobs: topKLogits(_lp, tok, 5) };
+      return Object.assign({ tok }, distStats(_lp, tok, 5));
     }
     return tok;
   }
@@ -4094,36 +4094,71 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // Debug: full logits readback (call right after a forward, before the next one).
   async function readLogits() { return E.readF32(_scr.logits, CONFIG.vocab); }
 
-  // Log-prob of the chosen token against the vocab distribution currently in
+  // Whole-distribution confidence stats for the vocab distribution currently in
   // _scr.logits. Only used when opts.logprobs is set (confidence display mode);
   // reading the full vocab back is costly, so it is opt-in and the decode path
   // goes serial while it is on. Never Math.max(...arr) over the vocab (150k args
-  // throws RangeError) -- use an explicit loop. Returns log(softmax(logits)[tok]).
-  function logProbOfToken(logits, tok) {
+  // throws RangeError) -- use an explicit loop.
+  //
+  // The readback is the expensive part and it is ALREADY paid, so every extra
+  // metric here is free: two passes over the same Float32Array (was four when
+  // logprob and top-K each re-derived max+logsumexp separately).
+  //
+  //   logprob   log(softmax(logits)[tok]) -- P of the token actually chosen
+  //   entropy   -sum p*log p, in nats, plus `entropyN` normalized by log(vocab)
+  //   varentropy Var(-log p) -- separates "low P because many good options"
+  //             (high entropy, LOW varentropy, safe) from "low P at a real fork"
+  //             (high varentropy, the hallucination-risk case). This is the axis
+  //             mean-P/min-P cannot see.
+  //   margin    p(top1) - p(top2) -- how decisive the pick was
+  //   effSupport exp(entropy) -- "how many tokens were really in play"
+  //   topMass   cumulative p of the returned top-K
+  //
+  // Math is done in max-shifted space (s = logit - max, so s <= 0 and exp never
+  // overflows). With S = sum exp(s), A = sum exp(s)*s, B = sum exp(s)*s^2:
+  //   H       = log S - A/S
+  //   E[lp^2] = B/S - 2*logS*(A/S) + logS^2      (lp = -log p)
+  //   varent  = E[lp^2] - H^2
+  function distStats(logits, chosenTok, K) {
+    const N = logits.length;
     let max = -Infinity;
-    for (let i = 0; i < logits.length; i++) { const v = logits[i]; if (v > max) max = v; }
-    let sum = 0;
-    for (let i = 0; i < logits.length; i++) sum += Math.exp(logits[i] - max);
-    return logits[tok] - (max + Math.log(sum));
-  }
-  // Top-K tokens by logprob (incl. the chosen one). K small (<=8). Used by the
-  // confidence UI to show "other possible words" for a clicked token.
-  function topKLogits(logits, chosenTok, K) {
-    let max = -Infinity;
-    for (let i = 0; i < logits.length; i++) { const v = logits[i]; if (v > max) max = v; }
-    let sum = 0;
-    for (let i = 0; i < logits.length; i++) sum += Math.exp(logits[i] - max);
-    const lse = max + Math.log(sum);
+    for (let i = 0; i < N; i++) { const v = logits[i]; if (v > max) max = v; }
+    let S = 0, A = 0, B = 0;
     const best = [];   // [logit, idx], kept sorted ascending by logit
-    for (let i = 0; i < logits.length; i++) {
+    for (let i = 0; i < N; i++) {
       const v = logits[i];
+      const s = v - max, e = Math.exp(s);
+      S += e; A += e * s; B += e * s * s;
       if (best.length < K) { best.push([v, i]); if (best.length === K) best.sort((a, b) => a[0] - b[0]); }
       else if (v > best[0][0]) { best[0] = [v, i]; best.sort((a, b) => a[0] - b[0]); }
     }
+    const logS = Math.log(S);
+    const lse = max + logS;                       // logsumexp over the vocab
+    const H = logS - A / S;                       // entropy, nats
+    const varent = Math.max(0, (B / S - 2 * logS * (A / S) + logS * logS) - H * H);
+
+    best.sort((a, b) => b[0] - a[0]);             // descending: best[0] = top1
+    const p1 = best.length ? Math.exp(best[0][0] - lse) : 0;
+    const p2 = best.length > 1 ? Math.exp(best[1][0] - lse) : 0;
+    let topMass = 0;
+    for (const [v] of best) topMass += Math.exp(v - lse);
+
+    // Alternatives list (incl. the chosen token even if it fell outside top-K).
     const out = best.map(([v, i]) => ({ tok: i, logprob: v - lse }));
     if (!out.some(o => o.tok === chosenTok)) out.push({ tok: chosenTok, logprob: logits[chosenTok] - lse });
     out.sort((a, b) => b.logprob - a.logprob);
-    return out.slice(0, K).map(o => ({ t: TOK.decode([o.tok]), lp: o.logprob }));
+    const topLogprobs = out.slice(0, K).map(o => ({ t: TOK.decode([o.tok]), lp: o.logprob }));
+
+    return {
+      logprob: logits[chosenTok] - lse,
+      topLogprobs,
+      entropy: H,
+      entropyN: N > 1 ? H / Math.log(N) : 0,
+      varentropy: varent,
+      margin: p1 - p2,
+      effSupport: Math.exp(H),
+      topMass: Math.min(1, topMass),
+    };
   }
 
   // DIAGNOSTIC: prefill a short prompt and report logit STATISTICS (not just the token). Tells us
@@ -4361,7 +4396,16 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
       inThink = open > close;
       const _alts = (r.topLogprobs || []).filter(a => a.t !== text).slice(0, 5)
         .map(a => ({ text: a.t, logprob: +a.lp.toFixed(4) }));
-      if (emitTokenEv) emitTokenEv({ type: 'token', token: { text, logprob: +r.logprob.toFixed(4), alts: _alts }, region: inThink ? 'reasoning' : 'content' });
+      if (emitTokenEv) emitTokenEv({
+        type: 'token',
+        token: {
+          text, logprob: +r.logprob.toFixed(4), alts: _alts,
+          // Tier-1 distribution stats -- free (same readback), see distStats().
+          ent: +r.entropyN.toFixed(4), vent: +r.varentropy.toFixed(4),
+          mgn: +r.margin.toFixed(4), esup: +r.effSupport.toFixed(2),
+        },
+        region: inThink ? 'reasoning' : 'content',
+      });
       p++;
       if (count() >= maxTokens) break;
     }
