@@ -110,7 +110,7 @@
       // the big bin if it's already cached (works offline / survives HF being down).
       const binHit = await _binCached(data.bin);
       const need = [
-        [BASE + '_cpukern/cpuengine-mt.js?v=42', 'cpukern JS'],
+        [BASE + '_cpukern/cpuengine-mt.js?v=43', 'cpukern JS'],
         [BASE + 'cpukern.wasm', 'cpukern.wasm'],
         [BASE + 'cpukern-shared.wasm', 'cpukern-shared.wasm'],
         ...(binHit ? [] : [[data.bin, 'bonsai17.cpu.bin']]),
@@ -133,7 +133,7 @@
         + '(bonsai17.cpu.bin + tokenizer.json) on any CORS+range host — e.g. a HuggingFace repo (resolve/main/) or R2/S3 — '
         + 'and set localStorage["sandpie-cpu-bonsai-base"] to that directory URL. On a local dev checkout they load from the site root automatically.');
       globalThis.__cpukernBase = BASE;
-      importScripts(BASE + '_cpukern/cpuengine-mt.js?v=42');
+      importScripts(BASE + '_cpukern/cpuengine-mt.js?v=43');
       await self.SandpieQwen3.TOK.load(data.tok);
       globalThis.__chunkMode = true; globalThis.__lutMode = false;
       const binUrl = await _cachedBinUrl(data.bin, onProgress);   // one-time download → OPFS cache → blob URL
@@ -169,7 +169,7 @@
       // via localStorage['sandpie-cpu-bonsai-v3']='1' to A/B against V2 back-to-back.
       const v3 = (config.cpuBonsaiV3 === '1' || config.cpuBonsaiV3 === 'true' || config.cpuBonsaiV3 === true);
       globalThis.__v3 = v3;
-      const kern = v3 ? 'v3-mega' : 'v2';
+      const kern = (v3 ? 'v3-mega' : 'v2') + ((config.cpuBonsaiBatch === '1') ? '+bp4' : '');
       // flatten messages (strings only; tools unsupported)
       const msgs = [];
       if (config.systemPrompt) msgs.push({ role: 'system', content: String(config.systemPrompt) });
@@ -186,12 +186,15 @@
       }
       // prefill (sequential single-token forward; ~30ms/tok) — timed for the perf readout
       const tPre0 = _now();
-      let pos = 0, last = 0;
-      for (let i = 0; i < ids.length; i++) {
+      // Batched prefill (opt-in): 4 prompt tokens per pass via gemm_tern_b4. Verified
+      // in-browser to reproduce the sequential next-token exactly (batch-test.html).
+      const useBatch = (config.cpuBonsaiBatch === '1' || config.cpuBonsaiBatch === true) && !!E.forwardChunkN;
+      let pos = 0, last = 0, i = 0;
+      while (i < ids.length) {
         if (signal && signal.aborted) throw new DOMException('aborted', 'AbortError');
-        const t = E.forwardTok(ids[i], pos++);
-        if (i === ids.length - 1) last = t;
-        if ((i & 7) === 7) await yield_();
+        if (useBatch && ids.length - i >= 4) { last = E.forwardChunkN(ids.slice(i, i + 4), pos); pos += 4; i += 4; }
+        else { last = E.forwardTok(ids[i], pos++); i++; }
+        if ((i & 7) === 0) await yield_();
       }
       const preMs = _now() - tPre0;
       const tDec0 = _now();

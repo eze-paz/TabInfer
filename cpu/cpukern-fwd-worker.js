@@ -100,6 +100,7 @@ function glueWaitW(gTarget) {
 // shared x; amax tracks this worker's argmax candidate. asc read from sabAsc[0] at call time.
 function claimChunksW(mids, offs4, curSlot, resid, amax) {
   const asc = sabAsc[0];
+  const Bc = Atomics.load(ctrl, BATCH) || 1;   // batched columns (must mirror mainClaim)
   const nchs = mids.map(m => Math.ceil(swLayout[m].N / CH));
   let tot = 0; for (const n2 of nchs) tot += n2;
   const _t4 = performance.now();
@@ -109,6 +110,12 @@ function claimChunksW(mids, offs4, curSlot, resid, amax) {
     if (c >= tot) break;
     let b = 0, rem = c; while (rem >= nchs[b]) { rem -= nchs[b]; b++; }
     const Lw = swLayout[mids[b]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
+    if (Bc === 4) {   // BATCHED: mirror of mainClaim's path
+      SW.gemm_tern_b4(swOutOff + (offs4[b] + row0) * 4, aMaxN, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+      const obb = offs4[b] + row0;
+      for (let c = 0; c < 4; c++) { const a2 = sabAsc[c], cb = c * aMaxN + obb; for (let i = 0; i < rows; i++) swOutV[cb + i] *= a2; }
+      continue;
+    }
     if (SH.lut) SW.gemv_lut_tern_s(swOutOff + (offs4[b] + row0) * 4, Lw.widxOff + rem * Lw.cw, Lw.scalesBOff + rem * Lw.cs, SH.tblOff, rows, Lw.K);
     else SW.gemv_tern(swOutOff + (offs4[b] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
     const ob = offs4[b] + row0;

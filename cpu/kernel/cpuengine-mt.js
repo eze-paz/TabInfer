@@ -31,6 +31,7 @@ const CPUEngineMT = (function () {
   // main claim CH-row chunks dynamically (CURSOR) → per-phase straggler ≈ one chunk. Set by
   // load() when globalThis.__chunkMode is true.
   let chunkOn = false, lutOn = false, SWmem = null, MS = null, swLayout = null;
+  const BP = 4;   // max batched-prefill columns (gemm_tern_b4)
   let swActOff = 0, swXsumOff = 0, swOutOff = 0, swActI8 = null, swXsumI32 = null, swOutV = null;
   // increment 1+2 shared regions (glue on the shared instance + shared-KV attention)
   let SG = null;   // {sxOff,sxnOff,sswiOff,nrmIn,nrmPost,nrmFin,qknQ,qknK,kvOff,kvStride,kvKS,kvVI,kvVS,attnOff2,pscrBase,pscrStride}
@@ -91,12 +92,12 @@ const CPUEngineMT = (function () {
         }
       }
       const tblOff0 = align16b(top); top = tblOff0 + 65536;   // LUT table (K/2×16 B, ≤48KB @K=6144)
-      swActOff = align16b(top); top = swActOff + CFG.I;
-      swXsumOff = align16b(top); top = swXsumOff + (CFG.I / 64) * 4;
-      swOutOff = align16b(top); top = swOutOff + CFG.vocab * 4;
+      swActOff = align16b(top); top = swActOff + BP * CFG.I;
+      swXsumOff = align16b(top); top = swXsumOff + BP * (CFG.I / 64) * 4;
+      swOutOff = align16b(top); top = swOutOff + BP * CFG.vocab * 4;
       // glue + shared-KV attention regions (increments 1+2)
       const H2 = CFG.H, L2 = CFG.L, hd2 = CFG.hd, nKV2 = CFG.nKV, nH2 = CFG.nH;
-      const sxOff = align16b(top); top = sxOff + H2 * 4;
+      const sxOff = align16b(top); top = sxOff + BP * H2 * 4;   // residual stream per column
       const sxnOff = align16b(top); top = sxnOff + H2 * 4;
       const sswiOff = align16b(top); top = sswiOff + CFG.I * 4;
       const nrmInOff = align16b(top); top = nrmInOff + L2 * H2 * 4;
@@ -152,7 +153,7 @@ const CPUEngineMT = (function () {
       MS = mi.exports;
       swActI8 = new Int8Array(SWmem.buffer, swActOff, CFG.I);
       swXsumI32 = new Int32Array(SWmem.buffer, swXsumOff, CFG.I / 64);
-      swOutV = new Float32Array(SWmem.buffer, swOutOff, CFG.vocab);
+      swOutV = new Float32Array(SWmem.buffer, swOutOff, BP * CFG.vocab);   // BP columns
       sxV = new Float32Array(SWmem.buffer, SG.sxOff, H2);
       sxnV = new Float32Array(SWmem.buffer, SG.sxnOff, H2);
       swAttnV = new Float32Array(SWmem.buffer, SG.attnOff2, nH2 * hd2);
@@ -162,7 +163,7 @@ const CPUEngineMT = (function () {
       const mps = SG.pscrBase + Wn * SG.pscrStride;   // main = participant index Wn
       MSP = { kfOff: mps, qfOff: mps + 512, qi8Off: mps + 1024, scOff: mps + 4096,
         kfV: new Float32Array(SWmem.buffer, mps, hd2), qfV: new Float32Array(SWmem.buffer, mps + 512, hd2), scV: new Float32Array(SWmem.buffer, mps + 4096, MAXCTX) };
-      sharedInit = (w) => ({ mem: SWmem, layout: swLayout, stackTop: stacksBase + (w + 1) * STACK, actOff: swActOff, xsumOff: swXsumOff, outOff: swOutOff, outLen: CFG.vocab, ...SG });
+      sharedInit = (w) => ({ mem: SWmem, layout: swLayout, stackTop: stacksBase + (w + 1) * STACK, actOff: swActOff, xsumOff: swXsumOff, outOff: swOutOff, outLen: BP * CFG.vocab, ...SG });
     }
     // SAB: ctrl + act(i8) + xsum(i32) + out(f32) + q(f32 nH*hd) + attn(f32 nH*hd)
     //      + kcur/vcur (f32 nKV*hd) — ONLY the current token's k,v. The KV history now lives
@@ -395,20 +396,22 @@ const CPUEngineMT = (function () {
   // Chunked dispatch core: workers + main claim CH-row chunks; resid folds ×asc into shared x
   // (o/down), amax tracks per-participant argmax candidates (lm_head). Act must already be in
   // the shared act region and sabAsc[0] set. `offs` = per-matrix output bases in OUT.
-  function dispatchChunk(names, offs, resid, amax) {
+  function dispatchChunk(names, offs, resid, amax, B) {
+    B = B || 1;
     const K = mats[names[0]].K, asc = sabAsc[0];
     const mids = names.map(n => mats[n].mid), nchs = mids.map(m => Math.ceil(swLayout[m].N / CH));
     const tot = nchs.reduce((a, b2) => a + b2, 0);
     for (let i = 0; i < names.length; i++) { Atomics.store(ctrl, MATID0 + i, mids[i]); Atomics.store(ctrl, OUTOFF0 + i, offs[i]); }
-    Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, names.length); Atomics.store(ctrl, JOBTYPE, 4); Atomics.store(ctrl, BATCH, 1);
+    Atomics.store(ctrl, KK, K); Atomics.store(ctrl, NMAT, names.length); Atomics.store(ctrl, JOBTYPE, 4); Atomics.store(ctrl, BATCH, B);
     Atomics.store(ctrl, RESID, resid); Atomics.store(ctrl, AMAX, amax); Atomics.store(ctrl, CURSOR, 0);
     const g = Atomics.add(ctrl, GEN, 1) + 1;
     Atomics.notify(ctrl, GEN);
-    mainClaim(mids, offs, CURSOR, resid, amax);
+    mainClaim(mids, offs, CURSOR, resid, amax, B);
     waitBarrierTO(g, 'chunk');
   }
   // main's work-stealing chunk loop (mirror of the worker's claimChunksW; participant index Wn)
-  function mainClaim(mids, offs, curSlot, resid, amax) {
+  function mainClaim(mids, offs, curSlot, resid, amax, B) {
+    B = B || 1;
     const asc = sabAsc[0];
     const nchs = mids.map(m => Math.ceil(swLayout[m].N / CH));
     let tot = 0; for (const n2 of nchs) tot += n2;
@@ -418,6 +421,12 @@ const CPUEngineMT = (function () {
       if (c >= tot) break;
       let b2 = 0, rem = c; while (rem >= nchs[b2]) { rem -= nchs[b2]; b2++; }
       const Lw = swLayout[mids[b2]], row0 = rem * CH, rows = Math.min(CH, Lw.N - row0), ngw = Lw.K / 64;
+      if (B === 4) {   // BATCHED: one unpack feeds 4 columns (out cols strided by vocab)
+        MS.gemm_tern_b4(swOutOff + (offs[b2] + row0) * 4, CFG.vocab, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
+        const obb = offs[b2] + row0;
+        for (let c = 0; c < 4; c++) { const a2 = sabAsc[c], cb = c * CFG.vocab + obb; for (let i = 0; i < rows; i++) swOutV[cb + i] *= a2; }
+        continue;
+      }
       if (lutOn) MS.gemv_lut_tern_s(swOutOff + (offs[b2] + row0) * 4, Lw.widxOff + rem * Lw.cw, Lw.scalesBOff + rem * Lw.cs, SG.tblOff, rows, Lw.K);
       else MS.gemv_tern(swOutOff + (offs[b2] + row0) * 4, Lw.codesOff + row0 * (Lw.K / 4), Lw.scalesOff + row0 * ngw * 4, swActOff, swXsumOff, rows, Lw.K);
       const ob = offs[b2] + row0;
@@ -476,10 +485,71 @@ const CPUEngineMT = (function () {
   }
   // rope on a shared f32 view using this token's cos/sin (col 0)
   function ropeS(v) { const half = CFG.hd >> 1; for (let i = 0; i < half; i++) { const c = sabCos[i], s = sabSin[i], x0 = v[i], x1 = v[i + half]; v[i] = x0 * c - x1 * s; v[i + half] = x1 * c + x0 * s; } }
+  // Quantize column c of a batched dispatch. Column strides MUST be K / K/64 —
+  // that's what gemm_tern_b4 assumes for act/xsum.
+  function quantForGemvCol(srcOff, K2, c) {
+    const a = MS.quantize(swActOff + c * K2, swXsumOff + c * (K2 / 64) * 4, srcOff, K2);
+    sabAsc[c] = a;
+  }
   function quantForGemv(srcOff, K2) {
     let a = MS.quantize(swActOff, swXsumOff, srcOff, K2);
     if (lutOn) { MS.build_lut_tern(SG.tblOff, swActOff, K2); a *= 127 / 63; }  // int7-act units
     sabAsc[0] = a;
+  }
+
+  // BATCHED PREFILL (B columns, positions p0..p0+B-1). Only the GEMVs are batched
+  // (gemm_tern_b4); attention runs per column through the existing single-position
+  // attnChunk — column c's q/k/v are copied into the slot attnChunk already reads,
+  // so attention/KV/argmax code is untouched. Returns the argmax of the LAST column
+  // (prefill only needs the token after the final prompt token).
+  function forwardChunkN(tokenIds, p0) {
+    const { H, hd, nH, nKV, L, I, eps, theta, vocab } = CFG, half = hd / 2;
+    const B = tokenIds.length;
+    if (B !== 4) throw new Error('forwardChunkN: B must be 4');
+    const Nq = nH * hd, Nk = nKV * hd, qkv = Nq + 2 * Nk;
+    for (let c = 0; c < B; c++) { const tid = tokenIds[c], o = (SG.sxOff >> 2) + c * H;
+      for (let i = 0; i < H; i++) swF32[o + i] = f16f(embedF16[tid * H + i]); }
+    const cosAll = new Float32Array(B * half), sinAll = new Float32Array(B * half);
+    for (let c = 0; c < B; c++) { const pos = p0 + c, cb = c * half;
+      for (let i = 0; i < half; i++) { const a = pos * Math.pow(theta, -(2 * i) / hd); cosAll[cb + i] = Math.cos(a); sinAll[cb + i] = Math.sin(a); } }
+    for (let l = 0; l < L; l++) {
+      const p = `model.layers.${l}.`;
+      for (let c = 0; c < B; c++) { MS.rmsnorm(SG.sxnOff, SG.sxOff + c * H * 4, SG.nrmIn + l * H * 4, H, eps); quantForGemvCol(SG.sxnOff, H, c); }
+      dispatchChunk([p + 'self_attn.q_proj.weight', p + 'self_attn.k_proj.weight', p + 'self_attn.v_proj.weight'], [0, Nq, Nq + Nk], 0, 0, B);
+      for (let c = 0; c < B; c++) {
+        if (c > 0) swOutV.copyWithin(0, c * vocab, c * vocab + qkv);              // col c's qkv → the slot attnChunk reads
+        sabCos.set(cosAll.subarray(c * half, c * half + half));                    // EVERY col (incl. 0): sabCos[0..] is clobbered each pass
+        sabSin.set(sinAll.subarray(c * half, c * half + half));
+        attnChunk(l, p0 + c);                                                     // writes K/V at p0+c, causal over p0+c+1
+        sxnV.set(swAttnV); quantForGemvCol(SG.sxnOff, H, c);
+      }
+      dispatchChunk([p + 'self_attn.o_proj.weight'], [0], 0, 0, B);
+      for (let c = 0; c < B; c++) { const xo = (SG.sxOff >> 2) + c * H, so = c * vocab; for (let i = 0; i < H; i++) swF32[xo + i] += swOutV[so + i]; }
+      for (let c = 0; c < B; c++) { MS.rmsnorm(SG.sxnOff, SG.sxOff + c * H * 4, SG.nrmPost + l * H * 4, H, eps); quantForGemvCol(SG.sxnOff, H, c); }
+      dispatchChunk([p + 'mlp.gate_proj.weight', p + 'mlp.up_proj.weight'], [0, I], 0, 0, B);
+      for (let c = 0; c < B; c++) { MS.swiglu(SG.sswiOff, swOutOff + c * vocab * 4, swOutOff + (c * vocab + I) * 4, I); quantForGemvCol(SG.sswiOff, I, c); }
+      dispatchChunk([p + 'mlp.down_proj.weight'], [0], 0, 0, B);
+      for (let c = 0; c < B; c++) { const xo = (SG.sxOff >> 2) + c * H, so = c * vocab; for (let i = 0; i < H; i++) swF32[xo + i] += swOutV[so + i]; }
+    }
+    const cL = B - 1;
+    MS.rmsnorm(SG.sxnOff, SG.sxOff + cL * H * 4, SG.nrmFin, H, eps); quantForGemvCol(SG.sxnOff, H, 0);
+    dispatchChunk(['lm_head.weight'], [0], 0, 1, 1);                              // single-column lm_head + distributed argmax
+    let bi = 0, bv = -Infinity;
+    for (let w = 0; w <= Wn; w++) { const v = argValV[w]; if (v > bv) { bv = v; bi = argIdxV[w]; } }
+    return bi;
+  }
+  // SELF-TEST: prefill the same 4 tokens at positions 0..3 sequentially, then
+  // batched, and compare the resulting next-token. Both write the same KV slots,
+  // so the batched path must reproduce the sequential result exactly.
+  function _selfTestBatch(tokenIds) {
+    const t0 = _now();
+    let seqLast = 0;
+    for (let i = 0; i < 4; i++) seqLast = forwardChunk(tokenIds[i], i);
+    const tSeq = _now() - t0;
+    const t1 = _now();
+    const bat = forwardChunkN(tokenIds, 0);
+    const tBat = _now() - t1;
+    return { seqLast, bat, ok: seqLast === bat, msSeq: +tSeq.toFixed(1), msBat: +tBat.toFixed(1), speedup: +(tSeq / tBat).toFixed(3) };
   }
   // Chunked-mode token forward: glue on the MS shared instance (zero copies), chunk-stolen
   // gemv with residual fold + distributed argmax, work-stolen shared-KV attention.
@@ -775,7 +845,7 @@ const CPUEngineMT = (function () {
   // mega debug: per-worker pbar wait-µs (+3) and park-fallback count (+4)
   const pbarReset = () => { for (let w = 0; w < Wn; w++) { Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 3, 0); Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 4, 0); } };
   const pbarStats = () => { const waitUs = [], parks = []; for (let w = 0; w < Wn; w++) { waitUs.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 3)); parks.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 4)); } return { waitUs, parks }; };
-  return { load, forward, forwardTok, forwardN, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
+  return { load, forward, forwardTok, forwardN, forwardChunkN, _selfTestBatch, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
 })();
 if (typeof window !== 'undefined') window.CPUEngineMT = CPUEngineMT;
 if (typeof globalThis !== 'undefined') globalThis.CPUEngineMT = CPUEngineMT;
