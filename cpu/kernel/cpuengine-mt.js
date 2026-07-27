@@ -502,7 +502,7 @@ const CPUEngineMT = (function () {
   // attnChunk — column c's q/k/v are copied into the slot attnChunk already reads,
   // so attention/KV/argmax code is untouched. Returns the argmax of the LAST column
   // (prefill only needs the token after the final prompt token).
-  function forwardChunkN(tokenIds, p0) {
+  function forwardChunkN(tokenIds, p0, allCols) {
     const { H, hd, nH, nKV, L, I, eps, theta, vocab } = CFG, half = hd / 2;
     const B = tokenIds.length;
     if (B !== 4) throw new Error('forwardChunkN: B must be 4');
@@ -531,6 +531,14 @@ const CPUEngineMT = (function () {
       dispatchChunk([p + 'mlp.down_proj.weight'], [0], 0, 0, B);
       for (let c = 0; c < B; c++) { const xo = (SG.sxOff >> 2) + c * H, so = c * vocab; for (let i = 0; i < H; i++) swF32[xo + i] += swOutV[so + i]; }
     }
+    if (allCols) {   // SPECULATIVE VERIFY: need each column's prediction, not just the last
+      for (let c = 0; c < B; c++) { MS.rmsnorm(SG.sxnOff, SG.sxOff + c * H * 4, SG.nrmFin, H, eps); quantForGemvCol(SG.sxnOff, H, c); }
+      dispatchChunk(['lm_head.weight'], [0], 0, 0, B);
+      const preds = [];
+      for (let c = 0; c < B; c++) { const so = c * vocab; let bi2 = 0, bv2 = -Infinity;
+        for (let i = 0; i < vocab; i++) { const v = swOutV[so + i]; if (v > bv2) { bv2 = v; bi2 = i; } } preds.push(bi2); }
+      return preds;
+    }
     const cL = B - 1;
     MS.rmsnorm(SG.sxnOff, SG.sxOff + cL * H * 4, SG.nrmFin, H, eps); quantForGemvCol(SG.sxnOff, H, 0);
     dispatchChunk(['lm_head.weight'], [0], 0, 1, 1);                              // single-column lm_head + distributed argmax
@@ -550,6 +558,33 @@ const CPUEngineMT = (function () {
     const bat = forwardChunkN(tokenIds, 0);
     const tBat = _now() - t1;
     return { seqLast, bat, ok: seqLast === bat, msSeq: +tSeq.toFixed(1), msBat: +tBat.toFixed(1), speedup: +(tSeq / tBat).toFixed(3) };
+  }
+  // SELF-TEST: greedy speculative decode MUST equal sequential greedy exactly.
+  function _selfTestSpec(promptIds, nNew) {
+    const pf = (ids) => { let l = 0, p = 0; for (let i = 0; i < ids.length; i++) l = forwardChunk(ids[i], p++); return { l, p }; };
+    let r = pf(promptIds); const seq = []; let last = r.l, pos = r.p;
+    const t0 = _now();
+    for (let i = 0; i < nNew; i++) { seq.push(last); last = forwardChunk(last, pos++); }
+    const msSeq = _now() - t0;
+    r = pf(promptIds); const spec = []; last = r.l; pos = r.p;
+    let drafted = 0, accepted = 0, passes = 0;
+    const t1 = _now();
+    while (spec.length < nNew) {
+      const ctx = promptIds.concat(spec);
+      const d = plookup(ctx, 2, 3);
+      if (d.length === 3) {
+        const pred = forwardChunkN([last, d[0], d[1], d[2]], pos, true);
+        passes++; drafted += 3;
+        spec.push(last); let acc = 0;
+        for (let j = 0; j < 3 && spec.length < nNew; j++) { if (d[j] === pred[j]) { spec.push(d[j]); acc++; } else break; }
+        accepted += acc; last = pred[acc]; pos += 1 + acc;
+      } else { spec.push(last); last = forwardChunk(last, pos++); }
+    }
+    const msSpec = _now() - t1;
+    let ok = true; for (let i = 0; i < nNew; i++) if (seq[i] !== spec[i]) { ok = false; break; }
+    return { ok, nNew, passes, drafted, accepted, acceptRate: drafted ? +(accepted / drafted).toFixed(2) : 0,
+             msSeq: +msSeq.toFixed(0), msSpec: +msSpec.toFixed(0), speedup: +(msSeq / msSpec).toFixed(2),
+             seqHead: seq.slice(0, 8), specHead: spec.slice(0, 8) };
   }
   // Chunked-mode token forward: glue on the MS shared instance (zero copies), chunk-stolen
   // gemv with residual fold + distributed argmax, work-stolen shared-KV attention.
@@ -845,7 +880,7 @@ const CPUEngineMT = (function () {
   // mega debug: per-worker pbar wait-µs (+3) and park-fallback count (+4)
   const pbarReset = () => { for (let w = 0; w < Wn; w++) { Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 3, 0); Atomics.store(ctrl, DONEBASE + w * DONESTRIDE + 4, 0); } };
   const pbarStats = () => { const waitUs = [], parks = []; for (let w = 0; w < Wn; w++) { waitUs.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 3)); parks.push(Atomics.load(ctrl, DONEBASE + w * DONESTRIDE + 4)); } return { waitUs, parks }; };
-  return { load, forward, forwardTok, forwardN, forwardChunkN, _selfTestBatch, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
+  return { load, forward, forwardTok, forwardN, forwardChunkN, _selfTestBatch, _selfTestSpec, generateSpec, plookup, newKV, argmax, stop, CFG, _mats: mats, profReset, profGet, setSpin, busyReset, busyTimes, pbarReset, pbarStats };
 })();
 if (typeof window !== 'undefined') window.CPUEngineMT = CPUEngineMT;
 if (typeof globalThis !== 'undefined') globalThis.CPUEngineMT = CPUEngineMT;
