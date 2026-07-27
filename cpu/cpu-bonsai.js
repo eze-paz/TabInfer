@@ -49,11 +49,28 @@
   const _now = () => (self.performance || Date).now();
   const _hashStr = (s) => { let h = 2166136261 >>> 0; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0).toString(36); };
   async function _cacheDir() { try { const root = await navigator.storage.getDirectory(); return await root.getDirectoryHandle('cpu-model-cache', { create: true }); } catch (_) { return null; } }
-  async function _binCached(url) {
-    const dir = await _cacheDir(); if (!dir) return false;
+  // Report WHY the cache missed — a silent miss is indistinguishable from eviction,
+  // a changed source URL (different hash key), or a marker that never got written.
+  async function _cacheProbe(url) {
+    const dir = await _cacheDir();
+    if (!dir) return { hit: false, why: 'no OPFS dir' };
     const key = 'bonsai_' + _hashStr(url) + '.bin';
-    try { await dir.getFileHandle(key + '.ok'); const f = await (await dir.getFileHandle(key)).getFile(); return f.size > 0; } catch (_) { return false; }
+    let persisted = null;
+    try { persisted = await navigator.storage.persisted(); } catch (_) {}
+    let quota = null, usage = null;
+    try { const e = await navigator.storage.estimate(); quota = e.quota; usage = e.usage; } catch (_) {}
+    const info = { key, persisted, quotaGB: quota ? +(quota / 1e9).toFixed(1) : null, usageGB: usage ? +(usage / 1e9).toFixed(1) : null };
+    let hasData = false, size = 0;
+    try { size = (await (await dir.getFileHandle(key)).getFile()).size; hasData = size > 0; } catch (_) {}
+    let hasOk = false;
+    try { await dir.getFileHandle(key + '.ok'); hasOk = true; } catch (_) {}
+    if (hasData && hasOk) return { hit: true, why: 'hit', size, ...info };
+    return { hit: false, size, ...info,
+      why: !hasData && !hasOk ? 'nothing cached for this key (first run, EVICTED, or the source URL changed → different key)'
+         : (hasData && !hasOk ? 'data present (' + (size / 1e9).toFixed(2) + ' GB) but .ok marker MISSING — previous download was interrupted or the marker write failed'
+                              : '.ok present but data file missing/empty — evicted') };
   }
+  async function _binCached(url) { const p = await _cacheProbe(url); return p.hit; }
   async function _cachedBinUrl(url, onProgress) {
     const dir = await _cacheDir();
     const key = 'bonsai_' + _hashStr(url) + '.bin';
@@ -63,7 +80,8 @@
     let total = 0, ranges = false;
     try { const h = await fetch(url, { headers: { Range: 'bytes=0-0' } }); const cr = h.headers.get('content-range'); if (cr) { total = +cr.split('/')[1]; ranges = true; } else total = +(h.headers.get('content-length') || 0); try { h.body && h.body.cancel(); } catch (_) {} } catch (_) {}
     try { console.log('[bonsai load] cache MISS — downloading ' + (total / 1e9).toFixed(2) + ' GB, ranges=' + ranges); } catch (_) {}
-    const finish = async () => { try { const mw = await (await dir.getFileHandle(key + '.ok', { create: true })).createWritable(); await mw.close(); } catch (_) {} const u = URL.createObjectURL(await (await dir.getFileHandle(key)).getFile()); try { console.log('[bonsai load] downloaded in ' + ((_now() - t0) / 1000).toFixed(1) + 's'); } catch (_) {} return u; };
+    const finish = async () => { try { const mw = await (await dir.getFileHandle(key + '.ok', { create: true })).createWritable(); await mw.close(); }
+      catch (e) { try { console.error('[bonsai cache] FAILED to write .ok marker — next load will re-download:', e && e.message); } catch (_) {} } const u = URL.createObjectURL(await (await dir.getFileHandle(key)).getFile()); try { console.log('[bonsai load] downloaded in ' + ((_now() - t0) / 1000).toFixed(1) + 's'); } catch (_) {} return u; };
     // Fallback: no OPFS, or server has no range support → single stream.
     if (!dir || !ranges || !total) {
       const resp = await fetch(url); if (!resp.ok) throw new Error('model download failed: HTTP ' + resp.status);
@@ -108,7 +126,16 @@
       // PREFLIGHT: probe required files and name exactly what's missing — otherwise a
       // 404's HTML page surfaces later as `Unexpected token '<' … not valid JSON`. Skip
       // the big bin if it's already cached (works offline / survives HF being down).
-      const binHit = await _binCached(data.bin);
+      const probe = await _cacheProbe(data.bin);
+      const binHit = probe.hit;
+      try { console.log('[bonsai cache] ' + (probe.hit ? 'HIT' : 'MISS — ' + probe.why)
+        + ' | key=' + probe.key + ' persisted=' + probe.persisted
+        + ' usage=' + probe.usageGB + 'GB/' + probe.quotaGB + 'GB'); } catch (_) {}
+      // Ask for persistent storage from THIS context: without it the browser may evict
+      // the ~1GB cache between sessions, which looks exactly like "always misses".
+      try { if (probe.persisted === false && navigator.storage.persist) {
+        const g = await navigator.storage.persist(); console.log('[bonsai cache] persist() → ' + g);
+      } } catch (_) {}
       const need = [
         [BASE + '_cpukern/cpuengine-mt.js?v=43', 'cpukern JS'],
         [BASE + 'cpukern.wasm', 'cpukern.wasm'],
