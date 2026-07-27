@@ -149,8 +149,13 @@ Concretely:
 5. **`forwardChunkN(tokenIds, p0)`**: mirror `forwardChunk` with per-column glue; lm_head/argmax
    only on the LAST column (prefill only needs the next token).
 6. **Ship behind `__batchPrefill` (default OFF) + a self-test** that runs the same prompt through
-   batched and sequential prefill and compares logits. **This cannot be verified outside a
-   browser** (needs Workers + SAB + the 1GB model), and the known failure mode here is silent:
+   batched and sequential prefill and compares logits. **Verify it IN THE BROWSER — the path exists and is proven:** `python coiserver.py`
+   (or preview_start name "sandpie-dev", .claude/launch.json) serves the repo root with
+   COOP/COEP so crossOriginIsolated=true; `cpukern-test.html` validates kernels against an
+   independent JS reference (confirmed PASS, relErr=3.2e-7, for the row-blocked kernel) and
+   `bonsai-test.html` runs the full model; the app itself was driven end-to-end this way
+   ("12 * 19 = 228"). NOTE the benchmark blocks the main thread, so an eval right after the
+   click times out — sleep, then read the page text. The known failure mode here is silent:
    a stale ctrl spec once made workers grind the wrong matrices and emit plausible garbage
    (`dispatch fn MUST store its full ctrl spec`). Do not enable the flag until the self-test is green.
 
