@@ -202,9 +202,158 @@ const G: usize = 64; // scale group size along K (matches Bonsai native Q2_0_g64
 /// yields four v128s of 16 int8 codes each — plane j (shift 2j) holds codes
 /// j·16 .. j·16+15 — with zero scalar work and no shuffle. One scale group per
 /// 64-block (G=64, Bonsai native): all four planes accumulate into one i32x4.
+// ── ROW-BLOCKED variants (NR rows share one activation load) ──────────────
+// The activation block does NOT depend on the row, but the 1-row kernel reloads
+// all four act v128s for EVERY row (4 of ~19 instrs per 64 MACs). Processing NR
+// rows per block amortizes those loads NR-fold. Per-row accumulation ORDER is
+// unchanged, so output is bit-identical to gemv_tern.
+#[inline(always)]
+unsafe fn hsum4(f: v128) -> f32 {
+    f32x4_extract_lane::<0>(f) + f32x4_extract_lane::<1>(f)
+        + f32x4_extract_lane::<2>(f) + f32x4_extract_lane::<3>(f)
+}
+
+/// One (row, 64-code block): unpack the row's 4 planes, dot against the CALLER'S
+/// already-loaded activation vectors, accumulate scale·dot and the scale·Σx side term.
+#[inline(always)]
+unsafe fn tern_blk(
+    rc: *const u8, rs: *const f32, b: usize,
+    a0: v128, a1: v128, a2: v128, a3: v128, xs: f32,
+    m3: v128, zero: v128, facc: &mut v128, sxs: &mut f32,
+) {
+    let raw = v128_load(rc.add(b * 16) as *const v128);
+    let p0 = v128_and(raw, m3);
+    let p1 = v128_and(u8x16_shr(raw, 2), m3);
+    let p2 = v128_and(u8x16_shr(raw, 4), m3);
+    let p3 = u8x16_shr(raw, 6);
+    let dot = i32x4_relaxed_dot_i8x16_i7x16_add(a3, p3,
+        i32x4_relaxed_dot_i8x16_i7x16_add(a2, p2,
+            i32x4_relaxed_dot_i8x16_i7x16_add(a1, p1,
+                i32x4_relaxed_dot_i8x16_i7x16_add(a0, p0, zero))));
+    let s = *rs.add(b);
+    *facc = f32x4_add(*facc, f32x4_mul(f32x4_convert_i32x4(dot), f32x4_splat(s)));
+    *sxs += s * xs;
+}
+
+/// Scalar-tail: the original one-row-at-a-time path, for rows past the NR block.
+#[inline(always)]
+unsafe fn tern_rows_1(
+    out: *mut f32, codes: *const u8, scales: *const f32, act: *const i8, xsum: *const i32,
+    row0: usize, n: usize, nblocks: usize, bytes_per_row: usize, m3: v128, zero: v128,
+) {
+    let mut row = row0;
+    while row < n {
+        let rc = codes.add(row * bytes_per_row);
+        let rs = scales.add(row * nblocks);
+        let mut facc = f32x4_splat(0.0);
+        let mut sxs: f32 = 0.0;
+        let mut b = 0usize;
+        while b < nblocks {
+            let ab = act.add(b * 64);
+            tern_blk(rc, rs, b,
+                v128_load(ab as *const v128), v128_load(ab.add(16) as *const v128),
+                v128_load(ab.add(32) as *const v128), v128_load(ab.add(48) as *const v128),
+                *xsum.add(b) as f32, m3, zero, &mut facc, &mut sxs);
+            b += 1;
+        }
+        *out.add(row) = hsum4(facc) - sxs;
+        row += 1;
+    }
+}
+
+/// NR=2 row-blocked gemv. Bit-identical to gemv_tern.
+#[target_feature(enable = "simd128,relaxed-simd")]
+#[no_mangle]
+pub unsafe extern "C" fn gemv_tern_r2(
+    out: *mut f32, codes: *const u8, scales: *const f32,
+    act: *const i8, xsum: *const i32, n: u32, k: u32,
+) {
+    let n = n as usize; let k = k as usize;
+    let nblocks = k / 64; let bytes_per_row = k / 4;
+    let m3 = u8x16_splat(3); let zero = i32x4_splat(0);
+    let mut row = 0usize;
+    while row + 2 <= n {
+        let rc0 = codes.add(row * bytes_per_row); let rc1 = rc0.add(bytes_per_row);
+        let rs0 = scales.add(row * nblocks); let rs1 = rs0.add(nblocks);
+        let (mut f0, mut f1) = (f32x4_splat(0.0), f32x4_splat(0.0));
+        let (mut s0, mut s1) = (0.0f32, 0.0f32);
+        let mut b = 0usize;
+        while b < nblocks {
+            let ab = act.add(b * 64);
+            let a0 = v128_load(ab as *const v128);
+            let a1 = v128_load(ab.add(16) as *const v128);
+            let a2 = v128_load(ab.add(32) as *const v128);
+            let a3 = v128_load(ab.add(48) as *const v128);
+            let xs = *xsum.add(b) as f32;
+            tern_blk(rc0, rs0, b, a0, a1, a2, a3, xs, m3, zero, &mut f0, &mut s0);
+            tern_blk(rc1, rs1, b, a0, a1, a2, a3, xs, m3, zero, &mut f1, &mut s1);
+            b += 1;
+        }
+        *out.add(row) = hsum4(f0) - s0;
+        *out.add(row + 1) = hsum4(f1) - s1;
+        row += 2;
+    }
+    tern_rows_1(out, codes, scales, act, xsum, row, n, nblocks, bytes_per_row, m3, zero);
+}
+
+/// SHIPPED gemv: delegates to the NR=4 row-blocked kernel (measured ~1.15x over the
+/// one-row path, bit-identical output). gemv_tern_r1 keeps the original for A/B.
 #[target_feature(enable = "simd128,relaxed-simd")]
 #[no_mangle]
 pub unsafe extern "C" fn gemv_tern(
+    out: *mut f32, codes: *const u8, scales: *const f32,
+    act: *const i8, xsum: *const i32, n: u32, k: u32,
+) { gemv_tern_r4(out, codes, scales, act, xsum, n, k) }
+
+/// NR=4 row-blocked gemv. Bit-identical to gemv_tern_r1.
+#[target_feature(enable = "simd128,relaxed-simd")]
+#[no_mangle]
+pub unsafe extern "C" fn gemv_tern_r4(
+    out: *mut f32, codes: *const u8, scales: *const f32,
+    act: *const i8, xsum: *const i32, n: u32, k: u32,
+) {
+    let n = n as usize; let k = k as usize;
+    let nblocks = k / 64; let bytes_per_row = k / 4;
+    let m3 = u8x16_splat(3); let zero = i32x4_splat(0);
+    let mut row = 0usize;
+    while row + 4 <= n {
+        let rc0 = codes.add(row * bytes_per_row);
+        let rc1 = rc0.add(bytes_per_row);
+        let rc2 = rc1.add(bytes_per_row);
+        let rc3 = rc2.add(bytes_per_row);
+        let rs0 = scales.add(row * nblocks);
+        let rs1 = rs0.add(nblocks);
+        let rs2 = rs1.add(nblocks);
+        let rs3 = rs2.add(nblocks);
+        let (mut f0, mut f1, mut f2, mut f3) =
+            (f32x4_splat(0.0), f32x4_splat(0.0), f32x4_splat(0.0), f32x4_splat(0.0));
+        let (mut s0, mut s1, mut s2, mut s3) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+        let mut b = 0usize;
+        while b < nblocks {
+            let ab = act.add(b * 64);
+            let a0 = v128_load(ab as *const v128);
+            let a1 = v128_load(ab.add(16) as *const v128);
+            let a2 = v128_load(ab.add(32) as *const v128);
+            let a3 = v128_load(ab.add(48) as *const v128);
+            let xs = *xsum.add(b) as f32;
+            tern_blk(rc0, rs0, b, a0, a1, a2, a3, xs, m3, zero, &mut f0, &mut s0);
+            tern_blk(rc1, rs1, b, a0, a1, a2, a3, xs, m3, zero, &mut f1, &mut s1);
+            tern_blk(rc2, rs2, b, a0, a1, a2, a3, xs, m3, zero, &mut f2, &mut s2);
+            tern_blk(rc3, rs3, b, a0, a1, a2, a3, xs, m3, zero, &mut f3, &mut s3);
+            b += 1;
+        }
+        *out.add(row) = hsum4(f0) - s0;
+        *out.add(row + 1) = hsum4(f1) - s1;
+        *out.add(row + 2) = hsum4(f2) - s2;
+        *out.add(row + 3) = hsum4(f3) - s3;
+        row += 4;
+    }
+    tern_rows_1(out, codes, scales, act, xsum, row, n, nblocks, bytes_per_row, m3, zero);
+}
+
+#[target_feature(enable = "simd128,relaxed-simd")]
+#[no_mangle]
+pub unsafe extern "C" fn gemv_tern_r1(
     out: *mut f32,
     codes: *const u8,
     scales: *const f32,

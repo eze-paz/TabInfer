@@ -36,7 +36,7 @@ const CPUEngineMT = (function () {
   let SG = null;   // {sxOff,sxnOff,sswiOff,nrmIn,nrmPost,nrmFin,qknQ,qknK,kvOff,kvStride,kvKS,kvVI,kvVS,attnOff2,pscrBase,pscrStride}
   let sxV = null, sxnV = null, swAttnV = null, swSwiGV = null, swSwiUV = null, swF32 = null, MSP = null, megaMap = null;
   async function initMainWasm() {
-    const buf = await (await fetch((globalThis.__cpukernBase || '') + 'cpukern.wasm')).arrayBuffer();
+    const buf = await (await fetch((globalThis.__cpukernBase || '') + 'cpukern.wasm?v=2')).arrayBuffer();
     MW = (await WebAssembly.instantiate(buf, {})).instance.exports;
   }
   const align16 = x => (x + 15) & ~15;
@@ -146,7 +146,7 @@ const CPUEngineMT = (function () {
           swU8.set(srcAll.subarray(dataBase + t.scalesOff, dataBase + t.scalesOff + t.N * ng2 * 4), Lw.scalesOff);
         }
       }
-      const smod = await WebAssembly.compile(await (await fetch((globalThis.__cpukernBase || '') + 'cpukern-shared.wasm')).arrayBuffer());
+      const smod = await WebAssembly.compile(await (await fetch((globalThis.__cpukernBase || '') + 'cpukern-shared.wasm?v=2')).arrayBuffer());
       const mi = await WebAssembly.instantiate(smod, { env: { memory: SWmem } });
       mi.exports.__stack_pointer.value = stacksBase + (Wn + 1) * STACK;   // main takes the top stack
       MS = mi.exports;

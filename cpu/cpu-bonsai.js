@@ -110,7 +110,7 @@
       // the big bin if it's already cached (works offline / survives HF being down).
       const binHit = await _binCached(data.bin);
       const need = [
-        [BASE + '_cpukern/cpuengine-mt.js', 'cpukern JS'],
+        [BASE + '_cpukern/cpuengine-mt.js?v=42', 'cpukern JS'],
         [BASE + 'cpukern.wasm', 'cpukern.wasm'],
         [BASE + 'cpukern-shared.wasm', 'cpukern-shared.wasm'],
         ...(binHit ? [] : [[data.bin, 'bonsai17.cpu.bin']]),
@@ -133,7 +133,7 @@
         + '(bonsai17.cpu.bin + tokenizer.json) on any CORS+range host — e.g. a HuggingFace repo (resolve/main/) or R2/S3 — '
         + 'and set localStorage["sandpie-cpu-bonsai-base"] to that directory URL. On a local dev checkout they load from the site root automatically.');
       globalThis.__cpukernBase = BASE;
-      importScripts(BASE + '_cpukern/cpuengine-mt.js?v=41');
+      importScripts(BASE + '_cpukern/cpuengine-mt.js?v=42');
       await self.SandpieQwen3.TOK.load(data.tok);
       globalThis.__chunkMode = true; globalThis.__lutMode = false;
       const binUrl = await _cachedBinUrl(data.bin, onProgress);   // one-time download → OPFS cache → blob URL

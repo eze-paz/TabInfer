@@ -160,7 +160,7 @@ function gemvRowsResid(mid, asc) {
   for (let i = 0; i < m.rows; i++) sabX[m.r0 + i] += loV[i] * asc;
 }
 async function initWasm() {
-  const buf = await (await fetch('cpukern.wasm')).arrayBuffer();
+  const buf = await (await fetch('cpukern.wasm?v=2')).arrayBuffer();
   W = (await WebAssembly.instantiate(buf, {})).instance.exports;
 }
 let heapTop = 0;
@@ -232,7 +232,7 @@ async function setup(msg) {
     qfV: new Float32Array(buf, qfOff, hd), kfV: new Float32Array(buf, kfOff, hd), vfV: new Float32Array(buf, vfOff, hd),
     scoreV: new Float32Array(buf, scoreOff, MAXCTX), wV: new Float32Array(buf, wOff, MAXCTX), outV: new Float32Array(buf, outOff, hd) };
   if (msg.shared) {   // chunked shared-weights mode: bind a second instance to the SHARED memory
-    const smod = await WebAssembly.compile(await (await fetch('cpukern-shared.wasm')).arrayBuffer());
+    const smod = await WebAssembly.compile(await (await fetch('cpukern-shared.wasm?v=2')).arrayBuffer());
     const inst = await WebAssembly.instantiate(smod, { env: { memory: msg.shared.mem } });
     inst.exports.__stack_pointer.value = msg.shared.stackTop;   // distinct stack per instance
     SW = inst.exports;
