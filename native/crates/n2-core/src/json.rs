@@ -181,24 +181,32 @@ impl<'a> Parser<'a> {
 
     fn string(&mut self) -> Result<String, String> {
         self.eat(b'"')?;
-        let mut s = String::new();
+        // Bytes, not chars: pushing `byte as char` would decode UTF-8 as Latin-1
+        // and silently mangle every non-ASCII string. Harmless for the ASCII tensor
+        // names in a `.cpu.bin` header, wrong for anything else, so it is fixed
+        // rather than documented as a limitation.
+        let mut out: Vec<u8> = Vec::new();
+        let mut push = |s: &str, out: &mut Vec<u8>| out.extend_from_slice(s.as_bytes());
         loop {
             let c = self.peek()?;
             self.i += 1;
             match c {
-                b'"' => return Ok(s),
+                b'"' => {
+                    return String::from_utf8(out)
+                        .map_err(|e| format!("string is not valid UTF-8: {e}"))
+                }
                 b'\\' => {
                     let e = self.peek()?;
                     self.i += 1;
                     match e {
-                        b'"' => s.push('"'),
-                        b'\\' => s.push('\\'),
-                        b'/' => s.push('/'),
-                        b'n' => s.push('\n'),
-                        b't' => s.push('\t'),
-                        b'r' => s.push('\r'),
-                        b'b' => s.push('\u{8}'),
-                        b'f' => s.push('\u{c}'),
+                        b'"' => push("\"", &mut out),
+                        b'\\' => push("\\", &mut out),
+                        b'/' => push("/", &mut out),
+                        b'n' => push("\n", &mut out),
+                        b't' => push("\t", &mut out),
+                        b'r' => push("\r", &mut out),
+                        b'b' => push("\u{8}", &mut out),
+                        b'f' => push("\u{c}", &mut out),
                         b'u' => {
                             let h = self
                                 .b
@@ -212,15 +220,17 @@ impl<'a> Parser<'a> {
                             self.i += 4;
                             // Surrogate pairs are not expected in these headers
                             // (tensor names are ASCII); refuse rather than mangle.
-                            s.push(
-                                char::from_u32(n)
-                                    .ok_or_else(|| "unsupported \\u code point".to_string())?,
-                            );
+                            let ch = char::from_u32(n)
+                                .ok_or_else(|| "unsupported \\u code point".to_string())?;
+                            let mut buf = [0u8; 4];
+                            push(ch.encode_utf8(&mut buf), &mut out);
                         }
                         _ => return Err(format!("bad escape `\\{}`", e as char)),
                     }
                 }
-                _ => s.push(c as char),
+                // Raw byte, including UTF-8 continuation bytes: copied through and
+                // validated as a whole when the string closes.
+                _ => out.push(c),
             }
         }
     }
@@ -268,6 +278,26 @@ mod tests {
         assert!(parse("{\"a\":1,}").is_err());
         assert!(parse("{\"a\":1} junk").is_err());
         assert!(parse("").is_err());
+    }
+
+    /// Multi-byte UTF-8 must survive verbatim. Pushing `byte as char` decoded it as
+    /// Latin-1 and produced mojibake, which is invisible until a non-ASCII string
+    /// shows up — the tokenizer's byte-level alphabet is full of them.
+    #[test]
+    fn multibyte_utf8_round_trips() {
+        let v = parse(r#"{"a":"Ġcapital","b":"España","c":"日本","d":"Ġ"}"#).unwrap();
+        assert_eq!(v.get("a").unwrap().as_str().unwrap(), "Ġcapital");
+        assert_eq!(v.get("b").unwrap().as_str().unwrap(), "España");
+        assert_eq!(v.get("c").unwrap().as_str().unwrap(), "日本");
+        // Ġ is the same character as the literal 'Ġ' above.
+        assert_eq!(v.get("d").unwrap().as_str().unwrap(), "Ġ");
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_in_a_string() {
+        // Lone 0xFF is not valid UTF-8 anywhere.
+        let bad = unsafe { String::from_utf8_unchecked(vec![b'{', b'"', b'a', b'"', b':', b'"', 0xFF, b'"', b'}']) };
+        assert!(parse(&bad).is_err());
     }
 
     #[test]

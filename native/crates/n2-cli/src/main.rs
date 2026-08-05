@@ -5,7 +5,10 @@
 //!   n2 bench [N] [K]       ternary GEMV throughput, with a control run
 //!   n2 info <file.cpu.bin> read a packed container and describe it
 
+mod chat;
+
 use n2_kernels::{cpu, timing, tern};
+use std::io::Write;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -54,12 +57,17 @@ fn help() {
            n2 info <file.cpu.bin>    describe a packed weight container\n  \
            n2 run <file.cpu.bin>     generate, reporting prefill and decode tok/s\n\n\
          n2 run OPTIONS\n  \
+           -t, --tokenizer <path>    tokenizer.json; enables text prompts and\n                             \
+                                     streams decoded output\n  \
+           -p, --prompt <text>       user message, wrapped in ChatML\n                             \
+                                     (requires --tokenizer)\n  \
+           --raw                     do not wrap --prompt in the chat template\n  \
            --ids <a,b,c>             prompt as token ids (default: the built-in\n                             \
                                      'capital of France' probe from ref_forward.py)\n  \
            --max-new <n>             tokens to generate (default 16)\n  \
-           --verify                  check the first prediction is Paris (12095)\n                             \
-                                     and print layer-0 RMS for comparison with\n                             \
-                                     tools/ref_forward.py\n",
+           --profile                 per-phase decode breakdown\n  \
+           --verify                  smoke-test the answer and print layer-0 RMS\n                             \
+                                     for comparison with tools/ref_forward.py\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -276,13 +284,31 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         .ok_or("usage: n2 run <file.cpu.bin> [--ids a,b,c] [--max-new n] [--verify]")?;
 
     let mut ids: Vec<u32> = PROBE_IDS.to_vec();
+    let mut ids_given = false;
     let mut max_new = 16usize;
     let mut verify = false;
+    let mut profile = false;
+    let mut tok_path: Option<String> = None;
+    let mut prompt: Option<String> = None;
+    let mut raw = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
+            "-t" | "--tokenizer" => {
+                tok_path = Some(args.get(i + 1).ok_or("--tokenizer needs a path")?.clone());
+                i += 2;
+            }
+            "-p" | "--prompt" => {
+                prompt = Some(args.get(i + 1).ok_or("--prompt needs text")?.clone());
+                i += 2;
+            }
+            "--raw" => {
+                raw = true;
+                i += 1;
+            }
             "--ids" => {
+                ids_given = true;
                 let raw = args.get(i + 1).ok_or("--ids needs a comma-separated list")?;
                 ids = raw
                     .split(',')
@@ -304,8 +330,34 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
                 verify = true;
                 i += 1;
             }
+            "--profile" => {
+                profile = true;
+                i += 1;
+            }
             other => return Err(format!("unknown option `{other}`")),
         }
+    }
+
+    if prompt.is_some() && tok_path.is_none() {
+        return Err("--prompt needs --tokenizer <tokenizer.json> to encode it".into());
+    }
+
+    // Load and validate the tokenizer before touching a 1 GB model file.
+    let chat = match &tok_path {
+        Some(p) => {
+            let c = chat::Chat::open(p)?;
+            c.self_check(&PROBE_IDS)?;
+            println!("tokenizer {p}\n          self-check vs ref_forward.py probe ids: PASS");
+            Some(c)
+        }
+        None => None,
+    };
+
+    if let (Some(c), Some(text)) = (&chat, &prompt) {
+        if ids_given {
+            return Err("--prompt and --ids are mutually exclusive".into());
+        }
+        ids = if raw { c.encode_raw(text)? } else { c.encode_user(text)? };
     }
 
     let cfg = n2_core::Config::bonsai_1_7b();
@@ -339,13 +391,36 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let l0 = model.l0;
 
     // ── Decode: greedy, one token at a time ───────────────────────────────────
-    let mut generated = Vec::with_capacity(max_new);
+    // Profile only decode: prefill's non-last tokens skip lm_head, which would
+    // smear the one phase we most want attributed cleanly.
+    model.reset_prof();
+    let mut generated: Vec<u32> = Vec::with_capacity(max_new);
     let mut next = first_pred as u32;
+    let mut shown = 0usize; // bytes of decoded text already printed
+
+    if chat.is_some() {
+        print!("\n> ");
+        let _ = std::io::stdout().flush();
+    }
+
     let t_dec = std::time::Instant::now();
     for _ in 0..max_new {
         generated.push(next);
-        // 151643 is <|endoftext|>, 151645 is <|im_end|>.
-        if next == 151643 || next == 151645 {
+
+        // Stream text by decoding the whole sequence and printing the delta. A
+        // single token can be a partial UTF-8 sequence, so decoding token-by-token
+        // would emit replacement characters mid-word.
+        if let Some(c) = &chat {
+            if let Ok(text) = c.decode(&generated) {
+                if text.len() > shown {
+                    print!("{}", &text[shown..]);
+                    let _ = std::io::stdout().flush();
+                    shown = text.len();
+                }
+            }
+        }
+
+        if next == chat::IM_END || next == chat::END_OF_TEXT {
             break;
         }
         let logits = model
@@ -355,8 +430,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     }
     let decode = t_dec.elapsed();
 
-    println!("generated ids: {generated:?}");
-    println!();
+    if chat.is_some() {
+        println!("\n");
+    } else {
+        println!("generated ids: {generated:?}\n");
+    }
 
     let pre_tps = ids.len() as f64 / prefill.as_secs_f64();
     let dec_n = generated.len().saturating_sub(1).max(1);
@@ -381,6 +459,55 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         "\nprefill is batch-1 (one forward per prompt token), so it is expected to\n\
          track decode closely. Batched prefill is P3 on the roadmap."
     );
+
+    if profile {
+        let p = model.prof;
+        let n = p.tokens.max(1) as f64;
+        println!("\n── decode profile, per token (averaged over {} tokens) ──", p.tokens);
+        println!(
+            "{:<16} {:>9}   {:>6}   {:>10}   {:>11}",
+            "phase", "ms/tok", "share", "MMAC/tok", "GMAC/s"
+        );
+        let total = p.total().as_secs_f64();
+        for (label, d, macs) in p.rows(&cfg) {
+            let ms = d.as_secs_f64() * 1e3 / n;
+            let share = if total > 0.0 { d.as_secs_f64() / total * 100.0 } else { 0.0 };
+            if macs > 0 {
+                let gmacs = macs as f64 * n / d.as_secs_f64() / 1e9;
+                println!(
+                    "{:<16} {:>9.2}   {:>5.1}%   {:>10.1}   {:>11.2}",
+                    label, ms, share, macs as f64 / 1e6, gmacs
+                );
+            } else {
+                println!(
+                    "{:<16} {:>9.2}   {:>5.1}%   {:>10}   {:>11}",
+                    label, ms, share, "-", "-"
+                );
+            }
+        }
+        let acct = p.total().as_secs_f64() / decode.as_secs_f64() * 100.0;
+        println!(
+            "\nphases sum to {:.1}% of decode wall time (the remainder is loop\n\
+             overhead and the argmax over {} logits).",
+            acct, cfg.vocab
+        );
+
+        let matmul: f64 = [p.qkv, p.o_proj, p.gate_up, p.down, p.lm_head]
+            .iter()
+            .map(|d| d.as_secs_f64())
+            .sum();
+        let glue = total - matmul;
+        println!(
+            "matmul {:.1}%  |  f32 glue {:.1}%   ->  {}",
+            matmul / total * 100.0,
+            glue / total * 100.0,
+            if glue / total > 0.25 {
+                "the glue is worth optimising"
+            } else {
+                "the gap is inside the ternary kernel, not around it"
+            }
+        );
+    }
 
     if verify {
         println!("── verification (smoke test, NOT a correctness proof) ──");

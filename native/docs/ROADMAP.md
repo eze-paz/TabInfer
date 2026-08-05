@@ -81,21 +81,40 @@ Worth doing regardless: a no-cache mode for the oracle (dequantise per use, slow
 but memory-bounded), and a golden-logits regression fixture so future graph changes
 fail loudly even without the oracle.
 
-### Caveat 2 — decode is at 44% of the kernel's rate
+### Caveat 2 — PROFILED: decode is 97.4% ternary matmul
 
-Per token the model does 1.72 GMAC, so 3.95 tok/s is **6.8 GMAC/s against the
-kernel's 15.32 GMAC/s streaming rate.** Unexplained, and it should be profiled
-before any optimisation work, because the answer decides what P1 is worth.
+`n2 run --profile` gives the per-token breakdown. Measured over 13 decode tokens:
 
-One identified, cheap inefficiency: `q`/`k`/`v` all consume the same normed vector
-and `gate`/`up` both consume the same one, but `linear` re-quantises its input every
-call — so 5 of 7 per-layer activation quantisations are redundant. Small in theory;
-measure before assuming.
+| phase | ms/tok | share | GMAC/s |
+|---|---|---|---|
+| gate+up proj | 69.00 | **39.3%** | 10.21 |
+| down proj | 36.03 | **20.5%** | 9.78 |
+| lm_head | 29.81 | **17.0%** | 10.44 |
+| qkv proj | 24.60 | 14.0% | 9.55 |
+| o proj | 11.77 | 6.7% | 9.98 |
+| attention | 2.54 | 1.4% | - |
+| norms + rope + swiglu + residual + embed | 2.00 | 1.2% | - |
 
-The leading hypothesis for the bulk of the gap is memory access pattern: the
-benchmark streams one tensor in a tight loop, where hardware prefetchers do well,
-while the forward pass touches 196 tensors totalling 513 MiB with f32 glue
-interleaved. That is a hypothesis, not a finding.
+**matmul 97.4%, f32 glue 2.6%.** Phases account for 99.8% of wall time.
+
+Consequences, including two corrections to earlier guesses in this file:
+
+- **Threading is the whole game.** Parallelising the matmuls parallelises
+  essentially all of decode. Nothing else is worth touching first.
+- **The redundant-quantisation "inefficiency" is irrelevant** — all glue combined
+  is 2.6%. Retracted as a target.
+- **The "short streams hurt the prefetcher" hypothesis is wrong.** `lm_head` is the
+  largest single tensor (78 MiB of codes) and is the *fastest* at 10.44 GMAC/s,
+  while the 3 MiB per-layer tensors sit at 9.5-10.2. Stream length is not the
+  factor. Retracted.
+- **Part of the apparent gap was a measurement error of mine.** `n2 bench` reports
+  *min of 31*; the profile reports *mean over 13 tokens*. Comparing a min to a mean
+  on a ±40% box flatters the min. The same build measured 3.95 and then 5.68 tok/s
+  decode on consecutive runs — that spread is noise, not change. The honest ratio is
+  ~10 / 15.3 = 65% of the kernel's benchmark rate, and some of that residual is
+  min-vs-mean rather than a real loss.
+- **Remaining real suspect: TLB pressure.** 513 MiB per token over 4 KiB pages is
+  ~131k page walks. Large pages are the lever, and worth testing after threading.
 
 ## P1 — threading
 
@@ -237,7 +256,14 @@ hold, and are flagged as such.
    from monotonic drift — a wrong sign, not a wrong magnitude.
 3. **Absolute timings from this box are not evidence.** Back-to-back relative A/Bs
    only.
-4. **Zero dependencies** unless there is a note here saying why.
+4. **Zero dependencies in the engine** (`n2-kernels`, `n2-core`) — both are still
+   dependency-free. One documented exception exists, in the CLI only:
+   `tokenizers` (with `default-features = false, features = ["fancy-regex"]`, so no
+   C toolchain and no onig). `tokenizer.json` needs an NFC normaliser, the Qwen2
+   split regex with `\p{L}`/`\p{N}` Unicode classes, `ignore_merges`, added-token
+   handling and a ByteLevel decoder; hand-rolling that requires Unicode category
+   tables, and a tokenizer that is 99% correct produces text that looks fine and
+   scores badly. Correctness beat purity. Nothing in the hot path is third-party.
 5. Windows-specific: check line endings after any scripted edit. Python
    `open(...,'w')` silently converted LF to CRLF once and turned a 158-line diff
    into 2,200 lines.

@@ -9,6 +9,7 @@
 use crate::binfmt::{Container, Tensor};
 use crate::ops;
 use n2_kernels::tern;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -151,6 +152,82 @@ pub struct Layer0Rms {
     pub after_mlp: f32,
 }
 
+/// Where a token's time goes.
+///
+/// Accumulated unconditionally: ~300 `Instant::now()` calls per token at roughly
+/// 30 ns each is ~9 us against a ~250 ms token, so gating it behind a flag would
+/// buy 0.004% and cost readability.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Prof {
+    pub embed: Duration,
+    pub norms: Duration,
+    pub qkv: Duration,
+    pub qk_norm_rope: Duration,
+    pub attn: Duration,
+    pub o_proj: Duration,
+    pub gate_up: Duration,
+    pub swiglu: Duration,
+    pub down: Duration,
+    pub lm_head: Duration,
+    pub residual: Duration,
+    pub tokens: usize,
+}
+
+impl Prof {
+    fn accumulate(&mut self, o: &Prof) {
+        self.embed += o.embed;
+        self.norms += o.norms;
+        self.qkv += o.qkv;
+        self.qk_norm_rope += o.qk_norm_rope;
+        self.attn += o.attn;
+        self.o_proj += o.o_proj;
+        self.gate_up += o.gate_up;
+        self.swiglu += o.swiglu;
+        self.down += o.down;
+        self.lm_head += o.lm_head;
+        self.residual += o.residual;
+        self.tokens += o.tokens;
+    }
+
+    /// Every phase summed. Should be within a few percent of wall time.
+    pub fn total(&self) -> Duration {
+        self.embed
+            + self.norms
+            + self.qkv
+            + self.qk_norm_rope
+            + self.attn
+            + self.o_proj
+            + self.gate_up
+            + self.swiglu
+            + self.down
+            + self.lm_head
+            + self.residual
+    }
+
+    /// `(label, time, MACs per token)` for reporting. MAC counts are zero for the
+    /// f32 glue, which is the point — it shows where time goes without arithmetic.
+    pub fn rows(&self, cfg: &Config) -> Vec<(&'static str, Duration, u64)> {
+        let l = cfg.layers as u64;
+        let h = cfg.hidden as u64;
+        let q = cfg.q_dim() as u64;
+        let kv = cfg.kv_dim() as u64;
+        let i = cfg.intermediate as u64;
+        vec![
+            ("embed", self.embed, 0),
+            ("norms", self.norms, 0),
+            ("qkv proj", self.qkv, l * (q * h + 2 * kv * h)),
+            ("qk-norm + rope", self.qk_norm_rope, 0),
+            ("attention", self.attn, 0),
+            ("o proj", self.o_proj, l * h * q),
+            ("gate+up proj", self.gate_up, l * 2 * i * h),
+            ("swiglu", self.swiglu, 0),
+            ("down proj", self.down, l * h * i),
+            ("lm_head", self.lm_head, cfg.vocab as u64 * h),
+            ("residual adds", self.residual, 0),
+        ]
+    }
+}
+
 pub struct Model {
     pub cfg: Config,
     c: Container,
@@ -161,6 +238,8 @@ pub struct Model {
     s: Scratch,
     /// Captured on the most recent forward pass, for validation.
     pub l0: Layer0Rms,
+    /// Accumulated across every forward pass since [`Model::reset_prof`].
+    pub prof: Prof,
 }
 
 impl Model {
@@ -198,6 +277,7 @@ impl Model {
             cfg,
             c,
             l0: Layer0Rms::default(),
+            prof: Prof::default(),
         };
         m.check_shapes()?;
         Ok(m)
@@ -258,6 +338,11 @@ impl Model {
         Ok(())
     }
 
+    /// Zero the profile, e.g. between prefill and decode.
+    pub fn reset_prof(&mut self) {
+        self.prof = Prof::default();
+    }
+
     /// Run one token. Returns logits only when `want_logits`, since the lm_head
     /// projection over a 151936 vocabulary is ~18% of a token's work and is pure
     /// waste on every prompt token but the last.
@@ -272,29 +357,41 @@ impl Model {
         let hd = cfg.head_dim;
         let kv_dim = cfg.kv_dim();
 
-        self.c.embed_row("model.embed_tokens.weight", token as usize, &mut self.s.x)?;
+        // Local accumulators; folded into self.prof at the end so the borrow
+        // checker does not have to reconcile self.prof with self.s.
+        let mut p = Prof::default();
 
+        let t0 = Instant::now();
+        self.c.embed_row("model.embed_tokens.weight", token as usize, &mut self.s.x)?;
         let rope = ops::rope_table(hd, pos, cfg.rope_theta);
+        p.embed += t0.elapsed();
+
         let scale = 1.0 / (hd as f32).sqrt();
 
         for li in 0..cfg.layers {
             let l = &self.layers[li];
 
+            let t = Instant::now();
             let w = self.c.view_f32(&l.input_ln)?;
             ops::rmsnorm(&mut self.s.xn, &self.s.x, w, cfg.eps);
+            p.norms += t.elapsed();
 
+            let t = Instant::now();
             Self::linear(&self.c, &l.q, &self.s.xn, &mut self.s.q, &mut self.s.act, &mut self.s.xsum)?;
             Self::linear(&self.c, &l.k, &self.s.xn, &mut self.s.k, &mut self.s.act, &mut self.s.xsum)?;
             Self::linear(&self.c, &l.v, &self.s.xn, &mut self.s.v, &mut self.s.act, &mut self.s.xsum)?;
+            p.qkv += t.elapsed();
 
+            let t = Instant::now();
             let qnw = self.c.view_f32(&l.q_norm)?;
             ops::rmsnorm_heads(&mut self.s.q, qnw, cfg.n_heads, hd, cfg.eps);
             let knw = self.c.view_f32(&l.k_norm)?;
             ops::rmsnorm_heads(&mut self.s.k, knw, cfg.n_kv_heads, hd, cfg.eps);
-
             ops::rope_with_table(&mut self.s.q, cfg.n_heads, hd, &rope);
             ops::rope_with_table(&mut self.s.k, cfg.n_kv_heads, hd, &rope);
+            p.qk_norm_rope += t.elapsed();
 
+            let t_attn = Instant::now();
             cache.k[li].extend_from_slice(&self.s.k);
             cache.v[li].extend_from_slice(&self.s.v);
             let t = cache.k[li].len() / kv_dim;
@@ -330,29 +427,51 @@ impl Model {
                 }
             }
 
+            p.attn += t_attn.elapsed();
+
+            let t = Instant::now();
             Self::linear(&self.c, &l.o, &self.s.attn, &mut self.s.tmp, &mut self.s.act, &mut self.s.xsum)?;
+            p.o_proj += t.elapsed();
+
             if li == 0 {
                 self.l0.xn = ops::rms(&self.s.xn);
                 self.l0.o = ops::rms(&self.s.tmp[..cfg.hidden]);
             }
+
+            let t = Instant::now();
             for i in 0..cfg.hidden {
                 self.s.x[i] += self.s.tmp[i];
             }
+            p.residual += t.elapsed();
+
             if li == 0 {
                 self.l0.after_attn = ops::rms(&self.s.x);
             }
 
+            let t = Instant::now();
             let w = self.c.view_f32(&l.post_ln)?;
             ops::rmsnorm(&mut self.s.xn, &self.s.x, w, cfg.eps);
+            p.norms += t.elapsed();
 
+            let t = Instant::now();
             Self::linear(&self.c, &l.gate, &self.s.xn, &mut self.s.gate, &mut self.s.act, &mut self.s.xsum)?;
             Self::linear(&self.c, &l.up, &self.s.xn, &mut self.s.up, &mut self.s.act, &mut self.s.xsum)?;
-            ops::swiglu(&mut self.s.swi, &self.s.gate, &self.s.up);
+            p.gate_up += t.elapsed();
 
+            let t = Instant::now();
+            ops::swiglu(&mut self.s.swi, &self.s.gate, &self.s.up);
+            p.swiglu += t.elapsed();
+
+            let t = Instant::now();
             Self::linear(&self.c, &l.down, &self.s.swi, &mut self.s.tmp, &mut self.s.act, &mut self.s.xsum)?;
+            p.down += t.elapsed();
+
+            let t = Instant::now();
             for i in 0..cfg.hidden {
                 self.s.x[i] += self.s.tmp[i];
             }
+            p.residual += t.elapsed();
+
             if li == 0 {
                 self.l0.after_mlp = ops::rms(&self.s.x);
             }
@@ -361,13 +480,23 @@ impl Model {
         cache.len = pos + 1;
 
         if !want_logits {
+            p.tokens = 1;
+            self.prof.accumulate(&p);
             return Ok(None);
         }
 
+        let t = Instant::now();
         let w = self.c.view_f32(&self.final_norm)?;
         ops::rmsnorm(&mut self.s.xn, &self.s.x, w, cfg.eps);
+        p.norms += t.elapsed();
+
+        let t = Instant::now();
         let lm = self.lm_head.clone();
         Self::linear(&self.c, &lm, &self.s.xn, &mut self.s.logits, &mut self.s.act, &mut self.s.xsum)?;
+        p.lm_head += t.elapsed();
+
+        p.tokens = 1;
+        self.prof.accumulate(&p);
         Ok(Some(&self.s.logits))
     }
 }

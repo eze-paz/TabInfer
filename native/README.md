@@ -30,45 +30,59 @@ repo compiles with `panic = "abort"`, `lto = "fat"`, and zero dependencies.
 
 ## Status
 
-**It runs a model.** `n2 run` generates from Bonsai-1.7B end to end:
+**It runs a model from the terminal — text in, text out.**
 
 ```
-$ n2 run bonsai17.cpu.bin --max-new 24 --verify
-prompt  13 tokens
-generated ids: [151667, 198, 151668, 271, 785, 6722, 315, 9625, 374, 3070, 59604, 334, 13, 151645]
+$ n2 run bonsai17.cpu.bin -t tokenizer.json \
+    -p "What is the capital of Argentina? Answer in one short sentence."
+tokenizer tokenizer.json
+          self-check vs ref_forward.py probe ids: PASS
+prompt  21 tokens
+
+> <think>
+</think>
+
+The capital of Argentina is Buenos Aires.<|im_end|>
 
 phase        tokens      seconds          tok/s
-prefill          13        2.374           5.48
-decode           13        3.295           3.95
+prefill          21        2.028          10.36
+decode           12        1.744           6.88
 ```
 
-which decodes to `<think>\n</think>\n\nThe capital of France is **Paris**.`,
-stopping on `<|im_end|>`.
+Output streams as it generates. Non-ASCII round-trips: `"¿Cuál es la capital de
+España?"` answers `"La capital de España es Madrid."`.
 
 Working and tested:
 
 - **Forward pass** — 28 layers, RMSNorm, GQA 16Q/8KV with per-head qk-norm,
   split-half RoPE at `theta = 1e6`, SwiGLU, KV cache, untied `lm_head`, greedy
   sampling. Allocation-free per token.
+- **Tokenizer**, validated rather than assumed: encoding the ChatML-wrapped probe
+  must reproduce `ref_forward.py`'s hardcoded ids exactly, which pins the
+  byte-level alphabet, merge ranks, special tokens *and* the chat template. It runs
+  before the model loads, so a mismatch fails in a second rather than after a
+  gigabyte of I/O.
 - **Ternary kernel** (`Q2_0_g64`) — scalar reference plus an x86_64 AVX2 path.
   Exact agreement with an independent dequantise-and-multiply oracle.
 - **Container reader** — `.cpu.bin`, validated on the real 1.16 GB pack: 311
   tensors, 2.50 bits/param. Blob is read into a `u32`-backed allocation so the
   in-place f32 views are aligned by construction.
+- **Profiler** — `--profile` gives the per-phase, per-token breakdown.
 - **Benchmark harness** — alternating order, min-of-N, mandatory control run.
 
-Two honest gaps:
+Where the time goes (`--profile`, 13 decode tokens):
 
-- **Text in, text out needs a tokenizer.** Prompts are token IDs today
-  (`--ids 1,2,3`). BPE is next.
+**matmul 97.4%, f32 glue 2.6%.** `gate+up` 39.3%, `down` 20.5%, `lm_head` 17.0%,
+`qkv` 14.0%, `o` 6.7%, attention 1.4%, everything else 1.2%. Every matmul runs at
+9.5-10.4 GMAC/s. So **threading is the whole game** — see the roadmap.
+
+One honest gap remains:
+
 - **The forward pass is not numerically verified.** It answers correctly, which is
   evidence but not proof — a subtly wrong RoPE or GQA mapping can still produce
   fluent, correct-looking output. The numpy oracle needs ~11 GiB and could not be
-  run on this box. See "Ground rules" below; this is exactly the case they exist
-  for, and it stays open.
-- **Single-threaded, and slower than the kernel predicts.** 3.95 tok/s is 6.8
-  GMAC/s against the kernel's 15.32 GMAC/s streaming rate. Unexplained; see the
-  roadmap.
+  run on this box. This is exactly the case the ground rules below exist for, and it
+  stays open.
 
 See [docs/ROADMAP.md](docs/ROADMAP.md).
 

@@ -12,3 +12,18 @@ path = "src/main.rs"
 [dependencies]
 n2-core = { path = "../n2-core" }
 n2-kernels = { path = "../n2-kernels" }
+
+# The workspace's zero-dependency rule applies to the ENGINE (n2-kernels,
+# n2-core), which remain dependency-free. This is the documented exception, and it
+# lives here in the CLI on purpose so nothing in the hot path is third-party.
+#
+# Why: tokenizer.json needs an NFC normaliser, the Qwen2 split regex with \p{L}
+# and \p{N} Unicode classes, `ignore_merges`, added-token handling and a ByteLevel
+# decoder. Hand-rolling that needs Unicode category tables, and a tokenizer that is
+# 99% correct produces text that looks fine and scores badly — the silent-failure
+# mode this project keeps hitting. Correctness beats purity here.
+#
+# default-features = false drops onig (C bindings, needs a C toolchain this box
+# does not have) and the progress bar; fancy-regex is then required explicitly and
+# is the pure-Rust regex backend. See docs/ROADMAP.md.
+tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
