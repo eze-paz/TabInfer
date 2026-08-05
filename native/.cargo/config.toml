@@ -1,0 +1,15 @@
+# Windows SDK library paths.
+#
+# rustc's MSVC auto-detection finds the VC tools but not the Windows SDK's `um`
+# and `ucrt` lib directories, so linking any *binary* (the libs are fine) fails
+# with `LNK1181: cannot open input file 'dbghelp.lib'` unless LIB is set. The
+# usual fix is to build from a Developer PowerShell; setting it here means plain
+# `cargo build` works from any shell.
+#
+# These paths are specific to this machine. If the SDK or MSVC version changes,
+# regenerate with:
+#   ls "C:/Program Files (x86)/Windows Kits/10/Lib"
+#   ls "C:/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
+# On Linux/WSL this variable is simply unused.
+[env]
+LIB = "C:\\Program Files (x86)\\Microsoft Visual Studio\\2022\\BuildTools\\VC\\Tools\\MSVC\\14.44.35207\\lib\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.19041.0\\um\\x64;C:\\Program Files (x86)\\Windows Kits\\10\\Lib\\10.0.19041.0\\ucrt\\x64"

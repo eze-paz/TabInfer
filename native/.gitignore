@@ -1,0 +1,16 @@
+/target
+**/target
+Cargo.lock
+
+# Model weights and packed binaries never go in git.
+*.cpu.bin
+*.safetensors
+*.gguf
+*.wasm
+/models/
+/_bonsai17/
+
+# Scratch
+*.log
+*.tmp
+/scratch/

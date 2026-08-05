@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = ["crates/n2-kernels", "crates/n2-core", "crates/n2-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+# Zero external dependencies is a deliberate constraint, not an accident:
+# it keeps `cargo build` working offline, keeps the wasm32 target trivially
+# reachable, and keeps the hot path free of anything we did not write.
+# Do not add a dependency without a note in docs/ROADMAP.md saying why.
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+
+# Benchmarks need symbols and no panic=abort weirdness.
+[profile.bench]
+inherits = "release"
+panic = "unwind"
+debug = true
