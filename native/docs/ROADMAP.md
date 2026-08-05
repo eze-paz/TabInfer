@@ -7,15 +7,50 @@ document, because it is the part that stops work being redone.
 ## Where we are
 
 The ternary GEMV works natively and is verified exactly against an independent
-oracle. AVX2 gives **7.3x over scalar, 26.15 GMAC/s single-threaded** on the
-target box, with a clean 0.975x control run.
+oracle.
 
-For context, the WASM kernel's own microbenchmarks recorded ~18 GMAC/s for
-`gemv_tern` and ~35 GMAC/s for the batched `gemm_tern_b4`. So the native
-single-column path already appears to beat the WASM single-column path by roughly
-1.45x. **Treat that as indicative, not measured** — it compares numbers from two
-different sessions on a box that swings ±40%, which is exactly the comparison this
-project's rules forbid. It will only be a real result when both run back-to-back.
+**Cache residency dominates the kernel number, so quote the right one.** A GEMV has
+zero weight reuse *within* a call, but the benchmark reuses one matrix across reps,
+so small matrices stay in cache and flatter the result. Measured on the target box,
+all with clean control runs:
+
+| working set | AVX2 | scalar | regime |
+|---|---|---|---|
+| 1 MiB | 23.97 GMAC/s | 3.29 | cache-resident |
+| 20 MiB | 24.01 GMAC/s | 3.25 | cache-resident |
+| 40 MiB | 23.54 GMAC/s | 3.13 | cache-resident |
+| **80 MiB** | **15.32 GMAC/s** | 2.69 | **DRAM-streaming** |
+
+Real decode sweeps all 513 MiB of Bonsai's ternary weights per token with nothing
+resident, so **15.32 GMAC/s (= 4.8 GB/s single-threaded) is the figure that
+predicts decode.** The ~24 GMAC/s numbers describe prefill-ish regimes where a
+weight block is reused across columns.
+
+### Projected decode, and why it is credible
+
+Bonsai-1.7B decode costs 1.72 B MACs and **537 MB of weight traffic per token**.
+
+- Native, 1 thread: 1.72e9 / 15.32e9 = 112 ms → **~8.9 tok/s**
+- WASM, measured, multi-threaded on this box: **10-17 tok/s**
+
+Cross-check: 10-17 tok/s x 537 MB = 5.4-9.1 GB/s, and the WASM handoff
+independently measured its weight traffic at "5-8 GB/s". Those agree, which is why
+the model below is worth trusting at all.
+
+So **native single-threaded already matches WASM's entire multi-threaded memory
+throughput.** Assuming 20-30 GB/s achievable aggregate once threading lands
+(DDR4-3200 dual channel peaks at 51.2 GB/s, LPDDR4x-4267 at 68), decode projects to
+**~25-45 tok/s, roughly 2-3x over WASM**, with ~52 tok/s as the saturation wall.
+
+Caveats: this is GEMV arithmetic only — real decode adds attention, RoPE, norms,
+softmax and thread barriers, so expect to land under the projection. And the
+aggregate-bandwidth figure is an *assumption* until P1 exists; it is the largest
+variable, and on a heterogeneous P/E part it is not a given.
+
+The earlier cross-session comparison against the WASM kernel's own ~18 GMAC/s
+microbenchmark is superseded by the table above and should not be quoted. It
+compared a cache-resident WASM number to a cache-resident native number from a
+different session on a box that swings ±40%.
 
 ## P0 — the forward pass
 
@@ -50,9 +85,24 @@ and means almost nothing for this workload.
 - Sweep the thread count on the box and record it. Do not port the `logical/2`
   default without re-measuring; it was derived on a different topology reading.
 
-## P2 — AVX-VNNI
+## P2 — AVX-VNNI, and f16 scales
 
 **Confirmed present on the target box** (`n2 cpu` reports `avxvnni yes`).
+
+**But VNNI will do little for decode.** The streaming measurement above shows decode
+is bandwidth-bound at 537 MB/token, and VNNI is a *compute* lever — once threads are
+pulling 25+ GB/s a faster dot product buys nothing. Its value is in prefill (where
+the ~24 GMAC/s cache-resident regime applies) and in **Maple**, where only the 8
+routed experts are read per token (~150 MB) so the ratio flips back to compute-bound.
+Build it for those, not for Bonsai decode.
+
+**The cheap decode win is narrower scales.** `n2 bench 32768 8192` prints "64.0 MiB
+codes + 16.00 MiB scales" — f32 scales are **20% of the streamed bytes**. Storing
+them as f16 takes the format from 2.50 to 2.25 bits/param: a straight 10% traffic
+cut and therefore ~10% faster decode while bandwidth-bound, for a format change and
+a load-time convert. Cheaper than any kernel work, and only visible once the
+regime was measured. Note it is a **format change**, so it invalidates the
+byte-identity guarantee on the existing pack — version the container.
 
 The current AVX2 inner loop spends two instructions per dot — `vpmaddubsw` then
 `vpmaddwd` — where WASM's `relaxed_dot` spent one. So at 256 bits the present win
