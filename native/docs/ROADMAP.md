@@ -52,19 +52,50 @@ microbenchmark is superseded by the table above and should not be quoted. It
 compared a cache-resident WASM number to a cache-resident native number from a
 different session on a box that swings ±40%.
 
-## P0 — the forward pass
+## P0 — the forward pass — DONE, with two caveats
 
-Nothing downstream can be evaluated until the model runs. Needed:
+`n2 run` generates from Bonsai-1.7B: 28 layers, RMSNorm, GQA 16Q/8KV with per-head
+qk-norm, split-half RoPE at `theta = 1e6`, SwiGLU, KV cache, greedy sampling,
+allocation-free per token. The probe emits `<think>\n</think>\n\nThe capital of
+France is **Paris**.` and stops on `<|im_end|>`.
 
-- RMSNorm, SwiGLU, RoPE, GQA attention, KV cache, argmax/sampling.
-- Wire `n2-core`'s container to a Bonsai-1.7B config and decode one token.
-- **Validate against `tools/ref_forward.py`** (torch CPU) layer by layer, not just
-  on final output. The failure mode this project has actually hit is a shared
-  misread that produces plausible text; per-layer comparison against torch is the
-  only thing that catches it.
-- Resolve the bf16/f16 norm-decode question in `docs/FORMAT.md` as part of this.
+Measured, single-threaded: **prefill 5.48 tok/s, decode 3.95 tok/s.**
 
-Target: a `n2 run <bin> "prompt"` that emits correct tokens. Speed is P1's problem.
+**The bf16/f16 question is resolved and was not a bug.** The checkpoint is genuinely
+mixed: embed F16, all 113 norms F16, the 197 projections BF16. `pack_bin.py` is
+correct. `docs/FORMAT.md` updated.
+
+### Caveat 1 — still not numerically verified
+
+The model answering correctly is evidence, not proof; a subtly wrong RoPE or GQA
+mapping can produce fluent, correct-looking output. The numpy oracle caches every
+dequantised f32 weight and needs ~11 GiB, and this box had 2.5 GiB free and no
+numpy, so it could not be run.
+
+`tools/ref_forward.py` now takes `N2_BONSAI_DIR` so it can be pointed at the
+safetensors. `n2 run --verify` prints layer-0 RMS (`xn=0.095 o=0.392
+after_attn=0.391 after_mlp=0.652`) in the same shape the reference prints, so the
+comparison is a diff when someone has the memory to run it.
+
+Worth doing regardless: a no-cache mode for the oracle (dequantise per use, slower
+but memory-bounded), and a golden-logits regression fixture so future graph changes
+fail loudly even without the oracle.
+
+### Caveat 2 — decode is at 44% of the kernel's rate
+
+Per token the model does 1.72 GMAC, so 3.95 tok/s is **6.8 GMAC/s against the
+kernel's 15.32 GMAC/s streaming rate.** Unexplained, and it should be profiled
+before any optimisation work, because the answer decides what P1 is worth.
+
+One identified, cheap inefficiency: `q`/`k`/`v` all consume the same normed vector
+and `gate`/`up` both consume the same one, but `linear` re-quantises its input every
+call — so 5 of 7 per-layer activation quantisations are redundant. Small in theory;
+measure before assuming.
+
+The leading hypothesis for the bulk of the gap is memory access pattern: the
+benchmark streams one tensor in a tight loop, where hardware prefetchers do well,
+while the forward pass touches 196 tensors totalling 513 MiB with f32 glue
+interleaved. That is a hypothesis, not a finding.
 
 ## P1 — threading
 

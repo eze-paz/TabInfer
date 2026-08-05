@@ -27,6 +27,7 @@ fn main() -> ExitCode {
             Some(p) => cmd_info(p),
             None => Err("usage: n2 info <file.cpu.bin>".to_string()),
         },
+        "run" => cmd_run(&args[1..]),
         "help" | "-h" | "--help" => {
             help();
             Ok(())
@@ -50,7 +51,15 @@ fn help() {
            n2 cpu                    report ISA features and the selected kernel\n  \
            n2 selftest               validate kernels against the dequantise oracle\n  \
            n2 bench [N] [K]          ternary GEMV throughput (default 2048x2048)\n  \
-           n2 info <file.cpu.bin>    describe a packed weight container\n",
+           n2 info <file.cpu.bin>    describe a packed weight container\n  \
+           n2 run <file.cpu.bin>     generate, reporting prefill and decode tok/s\n\n\
+         n2 run OPTIONS\n  \
+           --ids <a,b,c>             prompt as token ids (default: the built-in\n                             \
+                                     'capital of France' probe from ref_forward.py)\n  \
+           --max-new <n>             tokens to generate (default 16)\n  \
+           --verify                  check the first prediction is Paris (12095)\n                             \
+                                     and print layer-0 RMS for comparison with\n                             \
+                                     tools/ref_forward.py\n",
         env!("CARGO_PKG_VERSION")
     );
 }
@@ -244,6 +253,169 @@ fn cmd_bench(n: usize, k: usize) -> Result<(), String> {
     } else {
         Err("control run was not clean; numbers above are not trustworthy".into())
     }
+}
+
+/// The ground-truth probe from `tools/ref_forward.py`: ChatML-wrapped
+/// "The capital of France is".
+const PROBE_IDS: [u32; 13] = [
+    151644, 872, 198, 785, 6722, 315, 9625, 374, 151645, 198, 151644, 77091, 198,
+];
+
+/// Both spellings of the answer. `ref_forward.py` probes 12095 (" Paris", with a
+/// leading space); Bonsai actually emits a `<think>` block first and then writes
+/// "**Paris**", where the token is 59604 ("Paris", no leading space). Checking only
+/// 12095 as the *first* prediction was a wrong assertion about a reasoning model,
+/// not a wrong model.
+const PARIS_TOKENS: [u32; 2] = [12095, 59604];
+const THINK_OPEN: u32 = 151667;
+
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    let path = args
+        .first()
+        .filter(|a| !a.starts_with("--"))
+        .ok_or("usage: n2 run <file.cpu.bin> [--ids a,b,c] [--max-new n] [--verify]")?;
+
+    let mut ids: Vec<u32> = PROBE_IDS.to_vec();
+    let mut max_new = 16usize;
+    let mut verify = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--ids" => {
+                let raw = args.get(i + 1).ok_or("--ids needs a comma-separated list")?;
+                ids = raw
+                    .split(',')
+                    .map(|s| s.trim().parse::<u32>().map_err(|_| format!("bad token id `{s}`")))
+                    .collect::<Result<_, _>>()?;
+                if ids.is_empty() {
+                    return Err("--ids was empty".into());
+                }
+                i += 2;
+            }
+            "--max-new" => {
+                max_new = args
+                    .get(i + 1)
+                    .and_then(|s| s.parse().ok())
+                    .ok_or("--max-new needs a number")?;
+                i += 2;
+            }
+            "--verify" => {
+                verify = true;
+                i += 1;
+            }
+            other => return Err(format!("unknown option `{other}`")),
+        }
+    }
+
+    let cfg = n2_core::Config::bonsai_1_7b();
+    let capacity = ids.len() + max_new + 8;
+
+    let t0 = std::time::Instant::now();
+    let container = n2_core::Container::open(path)?;
+    let mut model = n2_core::Model::load(container, cfg, capacity)?;
+    let load = t0.elapsed();
+
+    let mut cache = n2_core::KvCache::new(&cfg, capacity);
+
+    println!(
+        "model   {} layers, hidden {}, {}Q/{}KV heads, vocab {}, rope_theta {:.0e}",
+        cfg.layers, cfg.hidden, cfg.n_heads, cfg.n_kv_heads, cfg.vocab, cfg.rope_theta
+    );
+    println!("backend {}  (single-threaded)", n2_kernels::tern::backend());
+    println!("loaded  {:.2} s", load.as_secs_f64());
+    println!("prompt  {} tokens\n", ids.len());
+
+    // ── Prefill: every prompt token, logits only on the last ──────────────────
+    let t_pre = std::time::Instant::now();
+    let mut first_pred = 0usize;
+    for (n, &tok) in ids.iter().enumerate() {
+        let last = n == ids.len() - 1;
+        if let Some(logits) = model.forward(tok, &mut cache, last)? {
+            first_pred = n2_core::ops::argmax(logits);
+        }
+    }
+    let prefill = t_pre.elapsed();
+    let l0 = model.l0;
+
+    // ── Decode: greedy, one token at a time ───────────────────────────────────
+    let mut generated = Vec::with_capacity(max_new);
+    let mut next = first_pred as u32;
+    let t_dec = std::time::Instant::now();
+    for _ in 0..max_new {
+        generated.push(next);
+        // 151643 is <|endoftext|>, 151645 is <|im_end|>.
+        if next == 151643 || next == 151645 {
+            break;
+        }
+        let logits = model
+            .forward(next, &mut cache, true)?
+            .ok_or("decode asked for logits and got none")?;
+        next = n2_core::ops::argmax(logits) as u32;
+    }
+    let decode = t_dec.elapsed();
+
+    println!("generated ids: {generated:?}");
+    println!();
+
+    let pre_tps = ids.len() as f64 / prefill.as_secs_f64();
+    let dec_n = generated.len().saturating_sub(1).max(1);
+    let dec_tps = dec_n as f64 / decode.as_secs_f64();
+
+    println!("{:<10} {:>8}   {:>10}   {:>12}", "phase", "tokens", "seconds", "tok/s");
+    println!(
+        "{:<10} {:>8}   {:>10.3}   {:>12.2}",
+        "prefill",
+        ids.len(),
+        prefill.as_secs_f64(),
+        pre_tps
+    );
+    println!(
+        "{:<10} {:>8}   {:>10.3}   {:>12.2}",
+        "decode",
+        dec_n,
+        decode.as_secs_f64(),
+        dec_tps
+    );
+    println!(
+        "\nprefill is batch-1 (one forward per prompt token), so it is expected to\n\
+         track decode closely. Batched prefill is P3 on the roadmap."
+    );
+
+    if verify {
+        println!("── verification (smoke test, NOT a correctness proof) ──");
+        println!(
+            "layer-0 rms: xn={:.3} o={:.3} after_attn={:.3} after_mlp={:.3}",
+            l0.xn, l0.o, l0.after_attn, l0.after_mlp
+        );
+        println!("first prediction: {first_pred}{}", if first_pred as u32 == THINK_OPEN {
+            "  (<think> — expected, Bonsai is a reasoning model)"
+        } else {
+            ""
+        });
+
+        let found = generated.iter().find(|t| PARIS_TOKENS.contains(t));
+        match found {
+            Some(t) => println!("answer token:     {t} (Paris) -- PASS"),
+            None => {
+                return Err(format!(
+                    "no Paris token ({PARIS_TOKENS:?}) in {generated:?}. \
+                     The arch or the weight mapping is wrong; do not trust the text."
+                ))
+            }
+        }
+
+        println!(
+            "\nThis only shows the model answers correctly. It does NOT verify the\n\
+             graph numerically — a subtly wrong RoPE or GQA mapping can still pass.\n\
+             For that, run the numpy oracle and compare the layer-0 RMS above:\n\
+             \n  N2_BONSAI_DIR=/path/to/_bonsai17 python tools/ref_forward.py\n\
+             \nIt needs numpy and roughly 11 GiB of RAM (it caches every dequantised\n\
+             f32 weight), so it will not run on a loaded machine."
+        );
+    }
+
+    Ok(())
 }
 
 fn cmd_info(path: &str) -> Result<(), String> {

@@ -7,7 +7,10 @@ Fast (numpy), runs from the shell — no browser, no 70s reload.
 import json, struct, os, sys
 import numpy as np
 
-ROOT = os.path.join(os.path.dirname(__file__), '..', '_bonsai17')
+# Point this at the unpacked safetensors dir. The weights are not in this repo,
+# so an env var beats editing the file. NOTE: this script caches every dequantised
+# f32 weight, so it needs ~11 GiB of RAM; it is the oracle, not a fast path.
+ROOT = os.environ.get('N2_BONSAI_DIR') or os.path.join(os.path.dirname(__file__), '..', '_bonsai17')
 L, H, NH, NKV, HD, I, THETA, EPS, VOCAB = 28, 2048, 16, 8, 128, 6144, 1e6, 1e-6, 151936
 IDS = [151644,872,198,785,6722,315,9625,374,151645,198,151644,77091,198]
 PARIS = 12095

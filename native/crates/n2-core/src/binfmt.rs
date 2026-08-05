@@ -49,12 +49,39 @@ impl Tensor {
     }
 }
 
+/// The blob, held in a `Vec<u32>` so its base address is guaranteed 4-byte
+/// aligned and the `f32` ranges inside it can be viewed in place.
+///
+/// This matters because the blob starts at file offset `4 + header_len`, and
+/// `header_len` is arbitrary — so the blob is essentially never 4-aligned within
+/// the file. Reading it into its own aligned allocation, with blob-relative
+/// offsets starting at index 0, makes alignment a property of the type instead of
+/// a hope about the allocator.
+struct Blob {
+    words: Vec<u32>,
+    len: usize,
+}
+
+impl Blob {
+    fn with_len(len: usize) -> Self {
+        Blob { words: vec![0u32; len.div_ceil(4)], len }
+    }
+
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: `words` is at least `len` bytes and u8 has weaker alignment.
+        unsafe { std::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.len) }
+    }
+
+    fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above; u8 has no invalid bit patterns.
+        unsafe { std::slice::from_raw_parts_mut(self.words.as_mut_ptr() as *mut u8, self.len) }
+    }
+}
+
 pub struct Container {
     pub group_size: usize,
     pub tensors: BTreeMap<String, Tensor>,
-    /// Whole-file bytes. `blob_base` is where blob-relative offsets start.
-    data: Vec<u8>,
-    blob_base: usize,
+    blob: Blob,
 }
 
 /// Hand-written so `unwrap()` on a `Result<Container, _>` cannot dump a
@@ -70,12 +97,40 @@ impl core::fmt::Debug for Container {
 }
 
 impl Container {
+    /// Read a container from disk.
+    ///
+    /// Streams the header and the blob separately so the blob lands directly in
+    /// its own aligned allocation — no whole-file buffer and no 1 GB copy.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, String> {
+        use std::io::Read;
         let path = path.as_ref();
-        let data = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        Self::from_bytes(data)
+        let ctx = |e: std::io::Error| format!("{}: {e}", path.display());
+
+        let mut f = std::fs::File::open(path).map_err(ctx)?;
+        let total = f.metadata().map_err(ctx)?.len() as usize;
+
+        let mut lenbuf = [0u8; 4];
+        f.read_exact(&mut lenbuf).map_err(ctx)?;
+        let header_len = u32::from_le_bytes(lenbuf) as usize;
+        if 4 + header_len > total {
+            return Err(format!(
+                "header length {header_len} overruns the file ({total} bytes)"
+            ));
+        }
+
+        let mut header_bytes = vec![0u8; header_len];
+        f.read_exact(&mut header_bytes).map_err(ctx)?;
+
+        let mut blob = Blob::with_len(total - 4 - header_len);
+        f.read_exact(blob.bytes_mut()).map_err(ctx)?;
+
+        let header_str = std::str::from_utf8(&header_bytes)
+            .map_err(|e| format!("header is not valid UTF-8: {e}"))?;
+        Self::assemble(header_str, blob)
     }
 
+    /// Parse a whole-file byte buffer. Copies the blob into an aligned
+    /// allocation; [`Container::open`] avoids that copy.
     pub fn from_bytes(data: Vec<u8>) -> Result<Self, String> {
         if data.len() < 4 {
             return Err("file is too short to contain a header length".into());
@@ -89,7 +144,15 @@ impl Container {
             ));
         }
         let header_str = std::str::from_utf8(&data[4..blob_base])
-            .map_err(|e| format!("header is not valid UTF-8: {e}"))?;
+            .map_err(|e| format!("header is not valid UTF-8: {e}"))?
+            .to_string();
+
+        let mut blob = Blob::with_len(data.len() - blob_base);
+        blob.bytes_mut().copy_from_slice(&data[blob_base..]);
+        Self::assemble(&header_str, blob)
+    }
+
+    fn assemble(header_str: &str, blob: Blob) -> Result<Self, String> {
         let header = json::parse(header_str).map_err(|e| format!("header JSON: {e}"))?;
 
         let group_size = header.usize_field("G").unwrap_or(n2_kernels::G);
@@ -162,14 +225,14 @@ impl Container {
             tensors.insert(name.clone(), parsed);
         }
 
-        let c = Container { group_size, tensors, data, blob_base };
+        let c = Container { group_size, tensors, blob };
         c.validate()?;
         Ok(c)
     }
 
     /// Every declared byte range must lie inside the blob.
     fn validate(&self) -> Result<(), String> {
-        let blob = self.data.len() - self.blob_base;
+        let blob = self.blob.len;
         let check = |name: &str, off: usize, len: usize| -> Result<(), String> {
             if off + len > blob {
                 return Err(format!(
@@ -194,15 +257,41 @@ impl Container {
     }
 
     fn slice(&self, off: usize, len: usize) -> &[u8] {
-        &self.data[self.blob_base + off..self.blob_base + off + len]
+        &self.blob.bytes()[off..off + len]
     }
 
     pub fn blob_bytes(&self) -> usize {
-        self.data.len() - self.blob_base
+        self.blob.len
     }
 
     pub fn get(&self, name: &str) -> Option<&Tensor> {
         self.tensors.get(name)
+    }
+
+    /// Borrow a ternary tensor via a previously-resolved [`Tensor`].
+    ///
+    /// The forward pass resolves every tensor once at load and then calls this,
+    /// so the hot loop does no map lookups and no name formatting.
+    pub fn view_tern(&self, t: &Tensor) -> Result<TernaryView<'_>, String> {
+        match t {
+            Tensor::Ternary { n, k, codes_off, codes_len, scales_off, scales_len } => {
+                Ok(TernaryView {
+                    n: *n,
+                    k: *k,
+                    codes: self.slice(*codes_off, *codes_len),
+                    scales: as_f32(self.slice(*scales_off, *scales_len))?,
+                })
+            }
+            other => Err(format!("expected `tern`, found `{}`", other.kind())),
+        }
+    }
+
+    /// Borrow an f32 tensor via a previously-resolved [`Tensor`].
+    pub fn view_f32(&self, t: &Tensor) -> Result<&[f32], String> {
+        match t {
+            Tensor::F32 { off, len, .. } => as_f32(self.slice(*off, *len)),
+            other => Err(format!("expected `f32`, found `{}`", other.kind())),
+        }
     }
 
     /// Borrow a ternary tensor's codes and scales as kernel-ready slices.
@@ -260,15 +349,18 @@ pub struct TernaryView<'a> {
     pub scales: &'a [f32],
 }
 
-/// Reinterpret a byte slice as f32. Requires 4-byte alignment, which the packer's
-/// 16-byte blob alignment guarantees — but we check rather than assume, because an
-/// unaligned read here is UB and the file comes from outside this program.
+/// Reinterpret a byte slice as f32.
+///
+/// Alignment is guaranteed by construction — [`Blob`] is `Vec<u32>`-backed and the
+/// packer 16-aligns every entry within the blob — but it is still checked, because
+/// an unaligned read here is UB and the offsets come from a file we did not write.
+/// If this ever fires, a tensor offset in the header is not 4-aligned.
 fn as_f32(b: &[u8]) -> Result<&[f32], String> {
     if b.len() % 4 != 0 {
         return Err(format!("{} bytes is not a whole number of f32", b.len()));
     }
     if b.as_ptr() as usize % align_of::<f32>() != 0 {
-        return Err("f32 range is not 4-byte aligned in the file".into());
+        return Err("f32 range is not 4-byte aligned: a header offset is misaligned".into());
     }
     // SAFETY: length and alignment checked above; f32 has no invalid bit patterns.
     Ok(unsafe { std::slice::from_raw_parts(b.as_ptr() as *const f32, b.len() / 4) })
@@ -352,19 +444,18 @@ mod tests {
         let mut file = Vec::new();
         file.extend_from_slice(&(header.len() as u32).to_le_bytes());
         file.extend_from_slice(header.as_bytes());
-        // Pad so the blob starts 4-byte aligned inside the Vec allocation.
-        let pad = (4 - (file.len() % 4)) % 4;
-        // Padding would shift the offsets, so instead assert the header length
-        // already lands us aligned; the real packer's headers vary, and the
-        // reader's as_f32 check is what protects us there.
-        if pad == 0 {
-            file.extend_from_slice(&blob);
-            let c = Container::from_bytes(file).unwrap();
-            let t = c.ternary("lm_head.weight").unwrap();
-            assert_eq!((t.n, t.k), (n, k));
-            assert_eq!(t.codes.len(), codes_len);
-            assert_eq!(t.scales, &[1.5, 2.5]);
-        }
+        file.extend_from_slice(&blob);
+
+        // Deliberately unconditional: the reader copies the blob into its own
+        // aligned allocation, so an odd header length must not matter. This test
+        // is what proves that, and the real packer's header lengths are arbitrary.
+        assert_ne!(header.len() % 4, 0, "the point of this test is a misaligned header");
+
+        let c = Container::from_bytes(file).unwrap();
+        let t = c.ternary("lm_head.weight").unwrap();
+        assert_eq!((t.n, t.k), (n, k));
+        assert_eq!(t.codes.len(), codes_len);
+        assert_eq!(t.scales, &[1.5, 2.5]);
     }
 
     #[test]

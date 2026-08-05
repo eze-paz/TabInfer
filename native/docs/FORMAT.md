@@ -143,7 +143,23 @@ weights (`32/64 = 0.5`).
 Note that the **f16 embedding table is 53% of the file** while holding ~18% of the
 parameters. That is the single biggest size win available — see the roadmap.
 
-## Open question, not yet resolved
+## Resolved: the mixed bf16/f16 decode is correct
+
+The question below turned out not to be a bug. The safetensors dtypes were checked
+directly:
+
+| tensors | count | dtype |
+|---|---|---|
+| `model.embed_tokens.weight` | 1 | **F16** |
+| `*norm.weight` | 113 | **F16** |
+| projections and `lm_head` | 197 | **BF16** |
+
+The checkpoint is genuinely mixed, so `pack_bin.py` applying `f16()` to norms and
+`bf16()` to projections is right. 113 norms = 28 layers x 4 (`input_layernorm`,
+`post_attention_layernorm`, `q_norm`, `k_norm`) + `model.norm`. Kept below for the
+record, since the reasoning is worth preserving.
+
+## The original question (answered above)
 
 `tools/pack_bin.py` decodes ternary weights with a **bf16** helper but the norm
 weights with an **f16** helper, from the same checkpoint:

@@ -190,25 +190,35 @@ pub fn gemv_dequant_reference(
 
 /// Quantise f32 activations to i8 and produce the per-block sums the kernel needs.
 ///
-/// Returns `(act, xsum, inv_scale)`; the caller multiplies kernel output by
-/// `1.0 / inv_scale` to get back to f32 units. `amax == 0` yields an all-zero
+/// Returns `(act, xsum, scale)`; the caller multiplies kernel output by
+/// `1.0 / scale` to get back to f32 units. `amax == 0` yields an all-zero
 /// activation vector and a scale of 1.0 rather than a NaN.
 pub fn quantize_act(x: &[f32]) -> (Vec<i8>, Vec<i32>, f32) {
+    let mut act = vec![0i8; x.len()];
+    let mut xsum = vec![0i32; x.len() / G];
+    let scale = quantize_act_into(x, &mut act, &mut xsum);
+    (act, xsum, scale)
+}
+
+/// Allocation-free [`quantize_act`], for the forward pass's inner loop.
+///
+/// Returns the scale. `act` must be `x.len()` long and `xsum` `x.len()/G`.
+pub fn quantize_act_into(x: &[f32], act: &mut [i8], xsum: &mut [i32]) -> f32 {
     assert_eq!(x.len() % G, 0, "activation length must be a multiple of {G}");
+    assert_eq!(act.len(), x.len());
+    assert_eq!(xsum.len(), x.len() / G);
+
     let amax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
     let scale = if amax > 0.0 { 127.0 / amax } else { 1.0 };
 
-    let mut act = vec![0i8; x.len()];
     for (a, &v) in act.iter_mut().zip(x) {
         // round-half-away-from-zero, then clamp — matches the JS engine's Math.round
         *a = (v * scale).round().clamp(-127.0, 127.0) as i8;
     }
-
-    let mut xsum = vec![0i32; x.len() / G];
     for (b, s) in xsum.iter_mut().enumerate() {
         *s = act[b * G..][..G].iter().map(|&v| v as i32).sum();
     }
-    (act, xsum, scale)
+    scale
 }
 
 // ── x86_64 AVX2 ───────────────────────────────────────────────────────────────

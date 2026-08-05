@@ -30,19 +30,47 @@ repo compiles with `panic = "abort"`, `lto = "fat"`, and zero dependencies.
 
 ## Status
 
+**It runs a model.** `n2 run` generates from Bonsai-1.7B end to end:
+
+```
+$ n2 run bonsai17.cpu.bin --max-new 24 --verify
+prompt  13 tokens
+generated ids: [151667, 198, 151668, 271, 785, 6722, 315, 9625, 374, 3070, 59604, 334, 13, 151645]
+
+phase        tokens      seconds          tok/s
+prefill          13        2.374           5.48
+decode           13        3.295           3.95
+```
+
+which decodes to `<think>\n</think>\n\nThe capital of France is **Paris**.`,
+stopping on `<|im_end|>`.
+
 Working and tested:
 
-- **Ternary kernel** (`Q2_0_g64`) — scalar reference plus a new x86_64 AVX2 path.
-  **7.3x over scalar, 26.15 GMAC/s single-threaded** on this box.
-- **Correctness oracle** — the kernel is checked against an independent
-  dequantise-and-multiply reference, not just against another backend. Exact
-  agreement (0.0 relative error) on every case.
-- **Container reader** — the `.cpu.bin` format, validated against the real
-  1.16 GB Bonsai-1.7B pack: 311 tensors, read in 1.9 s.
-- **Benchmark harness** — alternating-order, min-of-N, with a mandatory
-  base-vs-base control run.
+- **Forward pass** — 28 layers, RMSNorm, GQA 16Q/8KV with per-head qk-norm,
+  split-half RoPE at `theta = 1e6`, SwiGLU, KV cache, untied `lm_head`, greedy
+  sampling. Allocation-free per token.
+- **Ternary kernel** (`Q2_0_g64`) — scalar reference plus an x86_64 AVX2 path.
+  Exact agreement with an independent dequantise-and-multiply oracle.
+- **Container reader** — `.cpu.bin`, validated on the real 1.16 GB pack: 311
+  tensors, 2.50 bits/param. Blob is read into a `u32`-backed allocation so the
+  in-place f32 views are aligned by construction.
+- **Benchmark harness** — alternating order, min-of-N, mandatory control run.
 
-Not built yet: the forward pass. See [docs/ROADMAP.md](docs/ROADMAP.md).
+Two honest gaps:
+
+- **Text in, text out needs a tokenizer.** Prompts are token IDs today
+  (`--ids 1,2,3`). BPE is next.
+- **The forward pass is not numerically verified.** It answers correctly, which is
+  evidence but not proof — a subtly wrong RoPE or GQA mapping can still produce
+  fluent, correct-looking output. The numpy oracle needs ~11 GiB and could not be
+  run on this box. See "Ground rules" below; this is exactly the case they exist
+  for, and it stays open.
+- **Single-threaded, and slower than the kernel predicts.** 3.95 tok/s is 6.8
+  GMAC/s against the kernel's 15.32 GMAC/s streaming rate. Unexplained; see the
+  roadmap.
+
+See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What this machine can do
 

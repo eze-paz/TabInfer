@@ -5,5 +5,8 @@
 
 pub mod binfmt;
 pub mod json;
+pub mod model;
+pub mod ops;
 
 pub use binfmt::{Container, Tensor, TernaryView};
+pub use model::{Config, KvCache, Model};
