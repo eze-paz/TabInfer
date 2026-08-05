@@ -70,6 +70,10 @@ Working and tested:
 - **Profiler** — `--profile` gives the per-phase, per-token breakdown.
 - **Benchmark harness** — alternating order, min-of-N, mandatory control run.
 
+**Decode speed: 6.3 tok/s single-threaded** (95-token runs: 6.29 / 6.27 / 6.58,
+±2.4%). Measure over ~100 tokens — a 13-token run is dominated by faulting in 1.1 GB
+of weights and reads anywhere from 3.95 to 6.88.
+
 Where the time goes (`--profile`, 13 decode tokens):
 
 **matmul 97.4%, f32 glue 2.6%.** `gate+up` 39.3%, `down` 20.5%, `lm_head` 17.0%,

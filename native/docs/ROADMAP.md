@@ -26,31 +26,46 @@ resident, so **15.32 GMAC/s (= 4.8 GB/s single-threaded) is the figure that
 predicts decode.** The ~24 GMAC/s numbers describe prefill-ish regimes where a
 weight block is reused across columns.
 
-### Projected decode, and why it is credible
+### MEASURED decode: 6.3 tok/s single-threaded
 
-Bonsai-1.7B decode costs 1.72 B MACs and **537 MB of weight traffic per token**.
+Bonsai-1.7B decode costs 1.72 B MACs and 537 MB of weight traffic per token.
+Three back-to-back runs of **95 decode tokens** each:
 
-- Native, 1 thread: 1.72e9 / 15.32e9 = 112 ms → **~8.9 tok/s**
-- WASM, measured, multi-threaded on this box: **10-17 tok/s**
+| run | decode tok/s |
+|---|---|
+| 1 | 6.29 |
+| 2 | 6.27 |
+| 3 | 6.58 |
 
-Cross-check: 10-17 tok/s x 537 MB = 5.4-9.1 GB/s, and the WASM handoff
-independently measured its weight traffic at "5-8 GB/s". Those agree, which is why
-the model below is worth trusting at all.
+±2.4%, so this one is trustworthy. **6.3 tok/s = 158 ms/token = 10.9 GMAC/s**,
+which agrees with the profiler's independent 9.5-10.4 GMAC/s per matmul.
 
-So **native single-threaded already matches WASM's entire multi-threaded memory
-throughput.** Assuming 20-30 GB/s achievable aggregate once threading lands
-(DDR4-3200 dual channel peaks at 51.2 GB/s, LPDDR4x-4267 at 68), decode projects to
-**~25-45 tok/s, roughly 2-3x over WASM**, with ~52 tok/s as the saturation wall.
+**Measure over ~100 tokens, not ~13.** Short runs on this model are dominated by
+faulting in 1.1 GB of weights on the first pass; over 13 tokens that inflated the
+spread to 3.95-6.88 tok/s (1.74x) and none of those numbers were steady-state. This
+is a distinct trap from the box's general ±40% noise and it fooled us for two
+commits.
 
-Caveats: this is GEMV arithmetic only — real decode adds attention, RoPE, norms,
-softmax and thread barriers, so expect to land under the projection. And the
-aggregate-bandwidth figure is an *assumption* until P1 exists; it is the largest
-variable, and on a heterogeneous P/E part it is not a given.
+### The comparison, corrected
 
-The earlier cross-session comparison against the WASM kernel's own ~18 GMAC/s
-microbenchmark is superseded by the table above and should not be quoted. It
-compared a cache-resident WASM number to a cache-resident native number from a
-different session on a box that swings ±40%.
+- Native, 1 thread: **6.3 tok/s** (measured)
+- WASM, multi-threaded on this box, ~6 workers: **10-17 tok/s** (measured
+  previously)
+
+Per core that is roughly **2.3x** — WASM's midpoint was ~2.7 tok/s per effective
+core against native's 6.3 on one. But native single-threaded is still *below* WASM's
+entire thread pool, so threading is not optional.
+
+At 4 effective cores with realistic scaling, **~18-25 tok/s**. Bandwidth will not
+bind there: 6.3 tok/s is only 3.4 GB/s of the ~25-30 GB/s available, so the ~50
+tok/s bandwidth wall stays clear and compute plus thread scaling are the limits.
+That is consistent with the profile finding 97.4% matmul.
+
+Two earlier estimates in this file are **retracted**: a projected 8.9 tok/s
+single-threaded (the measured figure is 29% lower, because GEMV arithmetic ignores
+per-matmul overheads), and a projected 25-45 tok/s multi-threaded (now 18-25). Also
+retracted: the cross-session comparison against the WASM kernel's ~18 GMAC/s
+microbenchmark, which compared cache-resident numbers from different sessions.
 
 ## P0 — the forward pass — DONE, with two caveats
 
