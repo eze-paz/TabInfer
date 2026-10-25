@@ -1,0 +1,7 @@
+# Keep LF in the repo on every platform. A scripted edit on Windows once silently
+# converted LF to CRLF and turned a 158-line diff into 2,200 lines.
+* text=auto eol=lf
+*.png binary
+*.bin binary
+*.wasm binary
+*.safetensors binary

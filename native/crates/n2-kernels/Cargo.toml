@@ -1,0 +1,8 @@
+[package]
+name = "n2-kernels"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SIMD kernels for ternary (Q2_0_g64) inference: scalar reference + x86_64 AVX2/AVX-VNNI"
+
+[dependencies]
