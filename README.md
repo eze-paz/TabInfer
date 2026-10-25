@@ -18,6 +18,7 @@ Qualcomm Adreno phones, and 4-core laptop CPUs.
 | `models/lfm25.js` | LFM2.5-8B-A1B (MoE) | int3 resident experts streamed from a quant cache; gated short-conv + attention hybrid. ~15 tok/s decode on Iris Xe. |
 | `models/qwen35-gdn.js` | Qwen3.5-0.8B | 18 of 24 layers are **gated DeltaNet** linear attention: from-scratch recurrence + causal conv1d kernels, partial mRoPE, zero-centered RMSNorm baked at load. Phases A–C shipped; not wired into the demo. |
 | `cpu/` | Bonsai-1.7B (ternary) | Rust → WASM SIMD ternary GEMV, work-stolen across a worker pool over one shared `WebAssembly.Memory`; shared-KV attention. 13 tok/s on the i5-1235U below; the ~35 tok/s figure in the notes was measured on a different machine and browser, so treat it as a ceiling, not a promise. |
+| `native/` | Bonsai-1.7B (ternary) | The same ternary kernels as a **native Rust** engine (no browser, no WASM): AVX2 GEMV at 26 GMAC/s, zero dependencies, `panic=abort` + fat LTO. Exists to re-test the WASM engine's ceilings with the runtime constraints removed. |
 | `grammar/` | any | **Grammar-constrained decoding**: a character-level PDA compiled from the tool JSON schema drives a logit mask, so sub-1B models emit valid tool calls. |
 
 Everything runs in a Web Worker so page rendering cannot starve the GPU submit loop
@@ -33,6 +34,7 @@ subgroup-matrix. Re-measured 2026-10-25 from this repo's demo page.
 | Qwen3-0.6B int4 / int8-KV, 4k ctx, 27-token prompt, 647 generated | 27 tok/s (1.0 s) | **29.5 tok/s** |
 | Portable tiled f32 GEMM, 1024³ | | 121 GFLOP/s |
 | Bonsai-1.7B ternary, CPU engine, 6 workers, headless Chromium | 12.3 tok/s | **13.2 tok/s** |
+| Bonsai-1.7B ternary, native Rust (`native/`), single thread, Aug 2026 | | 6.3 tok/s (decode is 97% matmul, bandwidth-bound) |
 
 Earlier measurements and the reasoning behind each design decision are in
 [`docs/notes/`](docs/notes/README.md): the 185 s → 26 s prefill fix, the 32k context
@@ -44,6 +46,7 @@ decode, the Adreno 128 MB bind cap, and the WGSL fast-matmul recipe.
 ```bash
 python demo/serve.py        # http://127.0.0.1:8765/demo/
 npm i -D playwright && node tests/e2e-cpu-bonsai.mjs   # headless end-to-end check of the CPU engine
+cd native && cargo run --release -- run bonsai17.cpu.bin -t tokenizer.json -p "hello"   # native engine
 ```
 
 `demo/index.html` is a minimal chat page over the same `runConversation(config, emit)`
@@ -69,6 +72,8 @@ grammar/  webgpu-grammar.js  char-PDA + logit mask + forced tokens for schema-va
 cpu/      cpu-bonsai.js      CPU engine host; kernel/ holds the Rust crate (src/lib.rs) and the worker-pool coordinator
 demo/     index.html, webgpu-engine-test.html, serve.py; legacy/ = early CPU-engine test pages
 docs/     HANDOFF-memory-cpubonsai.md and notes/ (design notes and measurements)
+native/   Rust workspace: n2-core (model, binfmt), n2-kernels (ternary GEMV, AVX2), n2-cli; see native/README.md
+tests/    e2e-cpu-bonsai.mjs (Playwright, headless)
 ```
 
 ## Integration
