@@ -37,13 +37,13 @@
 // or the model picker until a model actually loads. It's a runnable engine core
 // you can open via docs/webgpu-engine-test.html.
 
-const SandpieWebGPU = (function () {
+const TabInferWebGPU = (function () {
   'use strict';
 
   // ============================================================
   // Debug logging (mirrors the other backends' convention)
   // ============================================================
-  const DEBUG_KEY = 'sandpie-webgpu-debug';
+  const DEBUG_KEY = 'tabinfer-webgpu-debug';
   function isDebug() { try { return localStorage.getItem(DEBUG_KEY) === '1'; } catch (_) { return false; } }
   function dbg(...a) { if (isDebug()) console.log('[webgpu-engine]', ...a); }
 
@@ -601,4 +601,4 @@ fn main(@builtin(global_invocation_id) gid : vec3<u32>,
   };
 })();
 
-if (typeof window !== 'undefined') window.SandpieWebGPU = SandpieWebGPU;
+if (typeof window !== 'undefined') window.TabInferWebGPU = TabInferWebGPU;

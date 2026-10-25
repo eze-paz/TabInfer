@@ -1,0 +1,17 @@
+# project_sandpie-gdn-port
+
+> Gated DeltaNet WGSL port (Qwen3.5-0.8B) — Phases A-C SHIPPED and verified vs HF; Phase D (app wiring) pending
+
+_Design note written during development (sandpie session memory); names like `TabInfer*` refer to the pre-extraction identifiers, now `TabInfer*`._
+
+Qwen3.5-0.8B (hybrid Gated DeltaNet, `Qwen3_5ForConditionalGeneration` text-only) ported to the hand-written WebGPU engine: modules/webgpu-gdn.js (`TabInferQwen35`). Plan at ~/.claude/plans/purrfect-greeting-castle.md. Phases A (kernels+self-tests 6f7702a), B (loader+tokenizer 1770100; tokenizer EXACT-matches HF), C-prep (lfm25 primitives, hd-256 attention retile QT8/KT4/HD4-64, partial RoPE rotDim=64, bdea6ed), C (forward+generate 4d6920b) all verified on Iris Xe 2026-07-20: T=14 argmax == HF transformers CPU, chat generate → "<think>\n\n</think>\n\n2+2=4", prefill 126 tok/s, decode 14.4 tok/s. Quant cache /gdn/v3/ (~0.95GB resident; embed f16 508MB single buffer + tied int4 lm_head twin).
+
+**Why:** best sub-1B model (AA II 9 vs 6.5 for Qwen3-0.6B) + 18/24 layers have O(1) recurrent state (1MB/layer, no KV growth) — the mobile/Adreno win. See [[reference_qwen35-zero-centered-rmsnorm]] for the two bugs that cost the debugging day.
+
+**Perf (2026-07-20, Iris Xe):** decode GPU floor 35.3ms/tok (383 dispatches; gemvQ8 74%, gdnDelta 16%); observed ~10.8 tok/s end-to-end → gap is CPU-encode/submit overhead, NOT GEMV math. GEMV AUTOTUNER shipped (4505325): loadModel races q8/dp4 × NR × WG on real weights, persists verdict at /gdn/v3/<variant>/tune; Iris Xe picked q8/NR4/WG128 (~15% GEMV win); ALL dp4 configs 2-2.4× slower (measured, confirms qwen3-era finding). Next perf levers ranked: dispatch-count diet (fuse mvF16 b/a, gates+qknorm), decode-specialized delta kernel (5.5ms→~1.5), pipelining/encode overhead (GEN_BATCH, uniform writes).
+
+**llama.cpp reference (same box, b10069 Vulkan build, Q4_K_M 497MB, 2026-07-20):** Iris Xe Vulkan pp512 87.6±25 / tg128 **3.33**±0.9; ngl=0 CPU 8t pp512 88.3 / tg128 8.20. Our WebGPU decode (~10.8) is **3.2× faster than llama.cpp Vulkan** and ~1.3× its CPU for this GDN arch — llama.cpp's Vulkan GDN kernels are immature. GGUF at scratchpad q35-08b-q4km.gguf (session-temp; re-download from unsloth/Qwen3.5-0.8B-GGUF).
+
+**Burn/CubeCL 0.21 wgpu reference (same Iris Xe, 2026-07-20):** f32 matmul at our decode shapes achieves 10-20 GB/s weight-read (mlp 0.72ms, qkv 2.46ms/op) — bandwidth parity with our gemvQ8 (~15 GB/s), but f32 reads 4× the bytes → our int4 GEMVs are ~4-6× faster wall-clock per op. Their M=128 prefill GEMM was poor (~78 GFLOPS). Conclusion: nothing kernel-wise to import from CubeCL for gen-12lp; its value is autotune-infrastructure design reference only. Bench crate: session scratchpad burn-bench (needs vcvars64 10.0.19041.0 — the 22621 SDK on this box is partial, missing dbghelp.lib).
+
+**Phase D remaining:** webgpu-worker.js engineFor routing + picker entry + runConversation/streamRound app contract (port from lfm25 lines ~2378-2527: toolPreamble, makeRoundParser, DEFAULT_MODELS) + embed sharding for Adreno's 128MB bind cap (248320-vocab f16 embed = 508MB; works on Iris Xe, will zero-read on Adreno — see [[reference_adreno-batched-encoder-broken]]). Chat template: standard <think>/<tool_call> Qwen3 conventions, NO BOS, eos 248044 AND im_end 248046 both stop. Debug tooling in the module: _stageProbe/_l0Probe/_readScr/_testArgmax + opts.stopLayer/syncLayers; torch CPU reference scripts in the session scratchpad (hf_ref.py, hf_l0.py).

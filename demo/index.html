@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TabInfer demo</title>
+<style>
+  :root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --fg:#c9d1d9; --dim:#8b949e; --acc:#58a6ff; --ok:#3fb950; --bad:#f85149; --hi:#d29922; }
+  * { box-sizing: border-box; }
+  body { font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; background:var(--bg); color:var(--fg); margin:0; padding:1rem; max-width:980px; margin-inline:auto; }
+  h1 { font-size:1.1rem; color:var(--acc); margin:0 0 .25rem; }
+  .sub { color:var(--dim); margin:0 0 1rem; }
+  .row { display:flex; gap:.5rem; flex-wrap:wrap; align-items:center; margin:.5rem 0; }
+  select, input, textarea, button { font:inherit; background:#21262d; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:.4rem .6rem; }
+  textarea { width:100%; min-height:4.5rem; resize:vertical; }
+  button { cursor:pointer; } button:hover { border-color:var(--acc); } button:disabled { opacity:.5; cursor:default; }
+  #status { color:var(--hi); min-height:1.5em; }
+  .out { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:.8rem 1rem; white-space:pre-wrap; word-break:break-word; min-height:6rem; }
+  .think { color:var(--dim); font-style:italic; border-left:2px solid var(--line); padding-left:.6rem; margin-bottom:.6rem; display:none; white-space:pre-wrap; }
+  .stats { color:var(--dim); font-size:12px; margin-top:.4rem; }
+  details { margin-top:1rem; } summary { cursor:pointer; color:var(--dim); }
+  #log { font-size:12px; color:var(--dim); max-height:14rem; overflow:auto; }
+  .warn { color:var(--bad); }
+  a { color:var(--acc); }
+</style>
+</head>
+<body>
+<h1>TabInfer — LLM inference in your browser tab</h1>
+<p class="sub">Hand-written WebGPU (WGSL) and WASM engines. No server does the inference: weights download once from Hugging Face and are cached in this origin. <a href="webgpu-engine-test.html">Capability + kernel bench page</a>.</p>
+
+<div class="row">
+  <label>Model <select id="model"></select></label>
+  <label>Context <select id="ctx"><option>2048</option><option selected>4096</option><option>8192</option><option>16384</option><option>32768</option></select></label>
+  <label><input type="checkbox" id="debug"> verbose engine logs</label>
+  <span id="caps" style="color:var(--dim)"></span>
+</div>
+<textarea id="prompt" placeholder="Ask something…">Explain in three sentences why GPU decode of a small LLM is memory-bandwidth bound.</textarea>
+<div class="row">
+  <button id="run">Run</button>
+  <button id="stop" disabled>Stop</button>
+  <button id="unload">Unload (free GPU)</button>
+  <span id="status"></span>
+</div>
+<div class="out"><div class="think" id="think"></div><div id="answer"></div></div>
+<div class="stats" id="stats"></div>
+<details><summary>engine log</summary><div id="log"></div></details>
+
+<script src="../engine/webgpu-host.js"></script>
+<script>
+  window.TabInferHost = { workerUrl: '../engine/webgpu-worker.js' };
+  const H = window.TabInferQwen3;      // main-thread shim: runConversation(config, emit) → worker
+  const $ = id => document.getElementById(id);
+  const log = (m, cls) => { const d = document.createElement('div'); d.textContent = new Date().toISOString().slice(11, 19) + '  ' + m; if (cls) d.className = cls; $('log').appendChild(d); $('log').scrollTop = 1e9; };
+
+  for (const m of H.DEFAULT_MODELS) { const o = document.createElement('option'); o.value = m.modelId; o.textContent = m.label; $('model').appendChild(o); }
+  try { $('debug').checked = localStorage.getItem('tabinfer-webgpu-debug') === '1'; } catch (_) {}
+  $('debug').onchange = () => { try { localStorage.setItem('tabinfer-webgpu-debug', $('debug').checked ? '1' : '0'); } catch (_) {} };
+
+  (async () => {
+    if (!('gpu' in navigator)) { $('caps').textContent = 'WebGPU not available in this browser'; $('caps').className = 'warn'; return; }
+    try {
+      const a = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+      const f = a ? [...a.features] : [];
+      const info = a && a.info ? (a.info.description || a.info.vendor || '') : '';
+      $('caps').textContent = (info ? info + ' · ' : '') + ['shader-f16', 'subgroups', 'chromium-experimental-subgroup-matrix'].map(x => x.replace('chromium-experimental-', '') + (f.includes(x) ? ' ✓' : ' ✗')).join('  ')
+        + (self.crossOriginIsolated ? '  · COI ✓ (CPU engine ok)' : '  · COI ✗ (CPU ternary engine needs COOP/COEP)');
+    } catch (e) { $('caps').textContent = 'adapter error: ' + e.message; }
+  })();
+
+  let ctrl = null, t0 = 0, tFirst = 0, nChars = 0;
+  function emit(ev) {
+    if (!ev) return;
+    switch (ev.type) {
+      case 'info': if (ev.message) { $('status').textContent = ev.message; log(ev.message); } else $('status').textContent = ''; break;
+      case 'round_start': $('answer').textContent = ''; $('think').textContent = ''; $('think').style.display = 'none'; t0 = performance.now(); tFirst = 0; nChars = 0; break;
+      case 'delta': {
+        const d = ev.delta || {};
+        if (!tFirst) tFirst = performance.now();
+        if (d.reasoning) { $('think').style.display = 'block'; $('think').textContent += d.reasoning; nChars += d.reasoning.length; }
+        if (d.content) { $('answer').textContent += d.content; nChars += d.content.length; }
+        if (d.tool_calls) { $('answer').textContent += '\n[tool call requested: ' + d.tool_calls.map(t => t.function && t.function.name).join(', ') + ' — no tool runner in this demo]'; }
+        const dt = (performance.now() - tFirst) / 1000;
+        if (dt > 0.2) $('stats').textContent = 'first token after ' + ((tFirst - t0) / 1000).toFixed(1) + 's · ' + (nChars / 4 / dt).toFixed(1) + ' tok/s (≈chars/4) · ' + nChars + ' chars';
+        break;
+      }
+      case 'usage': log('prompt tokens: ' + (ev.usage && ev.usage.prompt_tokens)); break;
+      case 'error': $('status').textContent = ''; log('ERROR ' + ev.message, 'warn'); $('answer').textContent += '\n[error] ' + ev.message; break;
+      case 'agent_done': $('status').textContent = 'done'; break;
+      default: break;
+    }
+  }
+
+  $('run').onclick = async () => {
+    const prompt = $('prompt').value.trim(); if (!prompt) return;
+    ctrl = new AbortController();
+    $('run').disabled = true; $('stop').disabled = false; $('status').textContent = 'starting…';
+    const modelId = $('model').value;
+    const provider = { type: 'webgpu', endpoint: modelId, modelId, contextWindow: parseInt($('ctx').value, 10) };
+    try {
+      await H.runConversation({ provider, messages: [{ role: 'user', content: prompt }], systemPrompt: '', tools: [], convId: 'demo', signal: ctrl.signal }, emit);
+    } catch (e) {
+      if (e && e.name === 'AbortError') { $('status').textContent = 'stopped'; log('aborted'); }
+      else { log('ERROR ' + (e && e.message || e), 'warn'); $('status').textContent = 'error: ' + (e && e.message || e); }
+    } finally { $('run').disabled = false; $('stop').disabled = true; ctrl = null; }
+  };
+  $('stop').onclick = () => { if (ctrl) ctrl.abort(); };
+  $('unload').onclick = async () => { $('status').textContent = 'unloading…'; await H.unload(); $('status').textContent = 'GPU freed'; log('unloaded'); };
+</script>
+</body>
+</html>

@@ -98,14 +98,14 @@
 <pre id="bench">—</pre>
 
 <!-- Load the actual engine + model modules from the repo so we test the real code. -->
-<script src="../modules/webgpu-engine.js?v=53"></script>
-<script src="../modules/webgpu-grammar.js?v=1"></script>
-<script src="../modules/webgpu-qwen3.js?v=141"></script>
-<script src="../modules/webgpu-lfm25.js?v=53"></script>
+<script src="../engine/webgpu-engine.js"></script>
+<script src="../grammar/webgpu-grammar.js"></script>
+<script src="../models/qwen3.js"></script>
+<script src="../models/lfm25.js"></script>
 <script>
   // Verbose engine logs in the console for this harness.
-  try { localStorage.setItem('sandpie-webgpu-debug', '1'); } catch (_) {}
-  const E = window.SandpieWebGPU;
+  try { localStorage.setItem('tabinfer-webgpu-debug', '1'); } catch (_) {}
+  const E = window.TabInferWebGPU;
   const $ = id => document.getElementById(id);
   const set = (id, t, cls) => { const el = $(id); el.textContent = t; if (cls) el.className = cls; };
 
@@ -166,8 +166,8 @@
     $('runKernels').disabled = true;
     set('status', 'running Qwen3 kernel tests…', 'hi');
     try {
-      const rows = await window.SandpieQwen3.selfTestKernels();
-      if (window.SandpieLfm25) rows.push(...await window.SandpieLfm25.selfTestKernels());   // LFM2.5 port (Phase A) kernels
+      const rows = await window.TabInferQwen3.selfTestKernels();
+      if (window.TabInferLfm25) rows.push(...await window.TabInferLfm25.selfTestKernels());   // LFM2.5 port (Phase A) kernels
       const allOk = rows.every(r => r.ok);
       $('kernels').innerHTML = rows.map(r =>
         `<span class="${r.ok ? 'ok' : 'bad'}">${r.ok ? 'PASS' : 'FAIL'}</span>  ${r.name}  <span style="color:#6e7681">err=${r.err.toExponential(2)}</span>`
@@ -183,7 +183,7 @@
     $('dbgLogits').disabled = true;
     const o = $('dbgOut'); o.style.display = 'block'; o.textContent = 'loading Qwen3-0.6B + one prefill forward…';
     try {
-      const r = await window.SandpieQwen3._debugLogits($('prompt').value || 'Hello, how are you?', '0.6B');
+      const r = await window.TabInferQwen3._debugLogits($('prompt').value || 'Hello, how are you?', '0.6B');
       o.textContent = JSON.stringify(r, null, 1);
       set('status', 'debug logits done', 'ok');
     } catch (e) { o.textContent = 'ERROR: ' + (e && e.stack || e); console.error(e); }
@@ -195,8 +195,8 @@
     const box = $('stageOut'); box.style.display = 'block';
     $('stageFirst').textContent = 'running…'; $('stageSummary').textContent = '';
     try {
-      const r = await window.SandpieQwen3._stageProbe($('prompt').value || 'Hello', '0.6B', 256);
-      const d = await window.SandpieQwen3._profileDecode($('prompt').value || 'Hello', '0.6B');
+      const r = await window.TabInferQwen3._stageProbe($('prompt').value || 'Hello', '0.6B', 256);
+      const d = await window.TabInferQwen3._profileDecode($('prompt').value || 'Hello', '0.6B');
       $('stageFirst').innerHTML =
         'PREFILL slowest: <b style="color:#f0883e">' + (r.slowestStages || []).join(', ') + '</b>' +
         '<br>DECODE slowest: <b style="color:#3fb950">' + (d.slowestStages || []).join(', ') + '</b>' +
@@ -214,7 +214,7 @@
     const box = $('tsOut'); box.style.display = 'block';
     $('tsCeiling').textContent = 'timing…'; $('tsTop').textContent = ''; $('tsTable').innerHTML = '';
     try {
-      const r = await window.SandpieQwen3._profileDecodeTS($('prompt').value || 'Hello', $('model').value === 'qwen3-1.7b' ? '1.7B' : '0.6B');
+      const r = await window.TabInferQwen3._profileDecodeTS($('prompt').value || 'Hello', $('model').value === 'qwen3-1.7b' ? '1.7B' : '0.6B');
       if (r.error) {
         $('tsCeiling').textContent = 'unavailable';
         $('tsTop').textContent = r.error + ' — ' + (r.fallback || 'use Stage probe');
@@ -236,7 +236,7 @@
     const box = $('pfOut'); box.style.display = 'block';
     $('pfCold').textContent = 'timing…'; $('pfHot').textContent = ''; $('pfDetail').textContent = '';
     try {
-      const r = await window.SandpieQwen3._profilePrefillTS($('prompt').value || 'Hello', $('model').value === 'qwen3-1.7b' ? '1.7B' : '0.6B', 256, 2048);
+      const r = await window.TabInferQwen3._profilePrefillTS($('prompt').value || 'Hello', $('model').value === 'qwen3-1.7b' ? '1.7B' : '0.6B', 256, 2048);
       if (r.error) { $('pfCold').textContent = 'unavailable'; $('pfDetail').textContent = r.error + (r.fallback ? ' — ' + r.fallback : ''); }
       else {
         $('pfCold').textContent = r.cold.prefillCeilingTps + ' tok/s (attn ' + r.cold.attnPct + '%)';
@@ -255,7 +255,7 @@
     const box = $('gemmABout'); box.style.display = 'block';
     $('gemmWin').textContent = 'timing…'; $('gemmDetail').textContent = '';
     try {
-      const r = await window.SandpieQwen3._benchPrefillGemm({});
+      const r = await window.TabInferQwen3._benchPrefillGemm({});
       $('gemmWin').textContent = r.winner + '  → ' + r.recommend;
       $('gemmDetail').textContent = r.shape + '  |  int4 DP4A ' + r.dp4_ms + 'ms (' + r.dp4_gflops + ' GF/s)  ·  f16 ' + r.f16_ms + 'ms (' + r.f16_gflops + ' GF/s)  ·  f32 ' + r.f32_ms + 'ms (' + r.f32_gflops + ' GF/s)';
       set('status', 'gemm A/B done', 'ok');
@@ -266,7 +266,7 @@
   async function runGen(stress) {
     const sel = $('model').value;
     if (sel === 'lfm25-350m' || sel === 'lfm25-8b') {   // LFM2.5 port (Phase C bring-up — greedy, MAX_SEQ 2048)
-      const L = window.SandpieLfm25;
+      const L = window.TabInferLfm25;
       const variant = sel === 'lfm25-8b' ? '8B-A1B' : '350M';
       $('gen').disabled = $('genStress').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
       try {
@@ -285,7 +285,7 @@
       finally { $('gen').disabled = $('genStress').disabled = false; }
       return;
     }
-    const Q = window.SandpieQwen3;
+    const Q = window.TabInferQwen3;
     const variant = sel === 'qwen3-1.7b' ? '1.7B' : '0.6B';
     $('gen').disabled = $('genStress').disabled = true; $('out').textContent = ''; $('tps').textContent = '';
     try {
@@ -337,26 +337,26 @@
   // ---- local model folder (File System Access) ----
   const fsVariant = () => $('model').value === 'lfm25-8b' ? '8B-A1B' : '350M';
   async function fsRefresh() {
-    const L = window.SandpieLfm25; if (!L || !L.folderStatus) return;
+    const L = window.TabInferLfm25; if (!L || !L.folderStatus) return;
     try { const s = await L.folderStatus();
       $('fsstat').textContent = s.connected ? ('folder: ' + s.name + ' ✓') : s.remembered ? ('folder: ' + s.name + ' (click Connect to re-grant)') : 'no folder connected';
     } catch (_) {}
   }
   $('fsConnect').addEventListener('click', async () => {
-    const L = window.SandpieLfm25;
+    const L = window.TabInferLfm25;
     $('fsstat').textContent = 'opening picker…';
     try { const r = await L.connectModelFolder(); $('fsstat').textContent = 'folder: ' + r.name + ' ✓' + (r.reconnected ? ' (reconnected)' : ''); }
     catch (e) { $('fsstat').textContent = 'error: ' + (e && e.message || e); }
   });
   $('fsExport').addEventListener('click', async () => {
-    const L = window.SandpieLfm25, variant = fsVariant();
+    const L = window.TabInferLfm25, variant = fsVariant();
     $('fsExport').disabled = true;
     try { const r = await L.exportToFolder(variant, (p) => { $('fsstat').textContent = 'exporting ' + variant + ' ' + (p.pct || 0) + '%'; });
       $('fsstat').textContent = 'exported ' + r.variant + ': ' + r.chunks + ' chunks + ' + r.experts + ' experts ✓ — reload to use'; }
     catch (e) { $('fsstat').textContent = 'export error: ' + (e && e.message || e); console.error(e); }
     finally { $('fsExport').disabled = false; }
   });
-  $('fsForget').addEventListener('click', async () => { await window.SandpieLfm25.forgetModelFolder(); $('fsstat').textContent = 'folder forgotten (files not deleted)'; });
+  $('fsForget').addEventListener('click', async () => { await window.TabInferLfm25.forgetModelFolder(); $('fsstat').textContent = 'folder forgotten (files not deleted)'; });
   window.addEventListener('load', () => setTimeout(fsRefresh, 300));
 
   $('run').addEventListener('click', runAll);

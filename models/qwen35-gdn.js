@@ -34,13 +34,13 @@
 //   B: loader (streamed safetensors → quant cache; skip model.visual.*; row-permute
 //     in_proj_qkvz/in_proj_ba; A_log/dt_bias/conv taps unquantized), tokenizer (vocab 248320).
 //   C: forward graph (GDN block | gated GQA attn headDim-256 | SwiGLU), generate/_streamIds/
-//     runConversation matching the SandpieQwen3 contract, grammar + logprob hooks.
+//     runConversation matching the TabInferQwen3 contract, grammar + logprob hooks.
 //   D: worker engineFor routing, picker entry, embed sharding (248320-vocab > Adreno bind cap).
 
-const SandpieQwen35 = (function () {
+const TabInferQwen35 = (function () {
   'use strict';
 
-  const E = (typeof window !== 'undefined' ? window : self).SandpieWebGPU;
+  const E = (typeof window !== 'undefined' ? window : self).TabInferWebGPU;
   const U = (typeof GPUBufferUsage !== 'undefined') ? GPUBufferUsage : { STORAGE: 0x80, COPY_DST: 0x8, COPY_SRC: 0x4, UNIFORM: 0x40, MAP_READ: 0x1 };
 
   const CONFIG = {
@@ -682,10 +682,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
 
   // ---- persistent quantized-weights cache (lfm25/qwen3 design; namespaced /gdn/).
   // GPU-ready bytes in fixed 64MiB chunks; manifest written LAST = commit point.
-  const QC_NAME = 'sandpie-webgpu-quant';
+  const QC_NAME = 'tabinfer-webgpu-quant';
   const QC_VER = 3;   // v3: zero-centered RMSNorm weights stored as (1+w); v2: q_proj split q/out_gate
   const QC_CHUNK = 64 * 1024 * 1024;
-  const _qcUrl = (variant, part) => 'https://sandpie.quant/gdn/v' + QC_VER + '/' + variant + '/' + part;
+  const _qcUrl = (variant, part) => 'https://tabinfer.quant/gdn/v' + QC_VER + '/' + variant + '/' + part;
   function _makeSink(variant) {
     let cache = null, buf = new Uint8Array(QC_CHUNK), used = 0, chunkIdx = 0, globalOff = 0, dead = false;
     const segs = [];
@@ -1957,5 +1957,5 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   };
 })();
 
-if (typeof self !== 'undefined') self.SandpieQwen35 = SandpieQwen35;
-if (typeof window !== 'undefined') window.SandpieQwen35 = SandpieQwen35;
+if (typeof self !== 'undefined') self.TabInferQwen35 = TabInferQwen35;
+if (typeof window !== 'undefined') window.TabInferQwen35 = TabInferQwen35;

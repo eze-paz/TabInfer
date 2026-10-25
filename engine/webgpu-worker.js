@@ -9,27 +9,27 @@
 // rendering cannot interrupt → focused/backgrounded stop mattering and the GPU
 // stays continuously fed. Needs NO COOP/COEP (only SharedArrayBuffer would).
 //
-// The engine modules assume a `window` global (they do `window.SandpieWebGPU` /
-// `window.SandpieQwen3`); alias it to the worker global before importing them.
+// The engine modules assume a `window` global (they do `window.TabInferWebGPU` /
+// `window.TabInferQwen3`); alias it to the worker global before importing them.
 self.window = self;
 
 let _ok = false;
 try {
   // KEEP the ?v= in sync with sandpie.html when these modules are bumped. Both WebGPU engines
   // share the one webgpu-engine.js device; the host picks which by model id.
-  importScripts('webgpu-engine.js?v=53', 'webgpu-grammar.js?v=1', 'webgpu-qwen3.js?v=151', 'webgpu-lfm25.js?v=54', 'cpu-bonsai.js?v=13');
-  _ok = !!self.SandpieQwen3;
+  importScripts('webgpu-engine.js', '../grammar/webgpu-grammar.js', '../models/qwen3.js', '../models/lfm25.js', '../cpu/cpu-bonsai.js');
+  _ok = !!self.TabInferQwen3;
 } catch (e) {
   self.postMessage({ t: 'fatal', message: 'worker import failed: ' + ((e && e.message) || e) });
 }
 
-const Q = self.SandpieQwen3;
-const L = self.SandpieLfm25;
-const C = self.SandpieCpuBonsai;
+const Q = self.TabInferQwen3;
+const L = self.TabInferLfm25;
+const C = self.TabInferCpuBonsai;
 const _ctrls = new Map();   // run id -> AbortController
 
 // Pick the engine for a run by the requested model id. LFM2.5 variants ('8B-A1B', …) live in
-// SandpieLfm25.MODELS; everything else is Qwen3. conversations.js puts the modelId in
+// TabInferLfm25.MODELS; everything else is Qwen3. conversations.js puts the modelId in
 // provider.endpoint (or modelId).
 function engineFor(config) {
   const ep = (config && config.provider && (config.provider.endpoint || config.provider.modelId)) || '';

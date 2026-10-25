@@ -24,12 +24,12 @@ Tokenizer reused from the existing module. Single-thread correctness run.</p>
 <span id="stat" class="hi"></span> <span id="tps" class="ok"></span>
 <pre id="out">—</pre>
 
-<script src="modules/webgpu-engine.js?v=3"></script>
-<script src="modules/webgpu-qwen3.js?v=8"></script>
-<script src="_cpukern/cpuengine.js?v=2"></script>
+<script src="../../engine/webgpu-engine.js"></script>
+<script src="../../models/qwen3.js"></script>
+<script src="../../cpu/kernel/cpuengine.js"></script>
 <script>
 const $ = id => document.getElementById(id), log = t => { $('out').textContent += t; };
-const TOK = window.SandpieQwen3.TOK, E = window.CPUEngine;
+const TOK = window.TabInferQwen3.TOK, E = window.CPUEngine;
 const EOS = new Set([151645, 151643]);   // <|im_end|>, <|endoftext|>
 
 async function load() {

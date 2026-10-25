@@ -28,10 +28,10 @@
 //   C: forward graph + MoE dispatch (predicated expert GEMVs: all-expert grid early-exits on
 //     the GPU-resident router output — no CPU readback), generate/runConversation contract.
 
-const SandpieLfm25 = (function () {
+const TabInferLfm25 = (function () {
   'use strict';
 
-  const E = (typeof window !== 'undefined' ? window : self).SandpieWebGPU;
+  const E = (typeof window !== 'undefined' ? window : self).TabInferWebGPU;
   const U = (typeof GPUBufferUsage !== 'undefined') ? GPUBufferUsage : { STORAGE: 0x80, COPY_DST: 0x8, COPY_SRC: 0x4, UNIFORM: 0x40, MAP_READ: 0x1 };
 
   const CONFIG = {
@@ -544,10 +544,10 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // corruption). Reload: allocate buffers from the manifest and writeBuffer chunk slices
   // straight into them — no download, no re-quantize, peak host RAM = one chunk.
   // Namespaced under /lfm25/ so it coexists with the qwen3 cache in the same Cache bucket.
-  const QC_NAME = 'sandpie-webgpu-quant';
+  const QC_NAME = 'tabinfer-webgpu-quant';
   const QC_VER = 2;   // v2: experts stored as individual cache entries (streaming), not in chunks
   const QC_CHUNK = 64 * 1024 * 1024;
-  const _qcUrl = (variant, part) => 'https://sandpie.quant/lfm25/v' + QC_VER + '/' + variant + '/' + part;
+  const _qcUrl = (variant, part) => 'https://tabinfer.quant/lfm25/v' + QC_VER + '/' + variant + '/' + part;
   function _makeSink(variant) {
     let cache = null, buf = new Uint8Array(QC_CHUNK), used = 0, chunkIdx = 0, globalOff = 0, dead = false;
     const segs = [], expertTensors = [];
@@ -648,7 +648,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
   // The directory handle is persisted in IndexedDB so it survives reloads; the browser still
   // requires a user gesture to RE-grant read/write each session unless it persisted the grant.
   // Layout mirrors the cache: <root>/lfm25-vN/<variant>/{manifest.json, c0..cN, e/<tensor>}.
-  const IDB_DB = 'sandpie-lfm25', IDB_STORE = 'handles', IDB_KEY = 'modelDir';
+  const IDB_DB = 'tabinfer-lfm25', IDB_STORE = 'handles', IDB_KEY = 'modelDir';
   function _idb() {
     return new Promise((res, rej) => {
       const r = indexedDB.open(IDB_DB, 1);
@@ -676,7 +676,7 @@ fn main(@builtin(workgroup_id) wg:vec3<u32>, @builtin(local_invocation_id) lid:v
     if (!globalThis.showDirectoryPicker) throw new Error('File System Access API needs Chrome/Edge desktop');
     let h = _fsRoot || await _idbGetDir().catch(() => null);
     if (h) { if (await _perm(h, true) === 'granted') { _fsRoot = h; await _idbSetDir(h).catch(() => {}); return { ok: true, name: h.name, reconnected: true }; } }
-    h = await globalThis.showDirectoryPicker({ id: 'sandpie-lfm25', mode: 'readwrite' });
+    h = await globalThis.showDirectoryPicker({ id: 'tabinfer-lfm25', mode: 'readwrite' });
     if (await _perm(h, true) !== 'granted') throw new Error('folder permission denied');
     _fsRoot = h; await _idbSetDir(h);
     return { ok: true, name: h.name, reconnected: false };
@@ -2523,5 +2523,5 @@ fn main(@builtin(local_invocation_id) lid:vec3<u32>){
   return { CONFIG, MODELS, DEFAULT_MODELS, DEFAULT_N_CTX, shortConv, router, selfTestKernels, loadModel, unload: () => { _freeState(); unload(); }, inventory, TOK, isLoaded: () => _loaded, variant: () => _variant, generate, forward, runConversation, setToolRunner, lastProf: () => _lastProf, expertStats: () => _estat, connectModelFolder, forgetModelFolder, folderStatus, exportToFolder, selfTestInt3, selfTestMoeGemm, _benchDecode };
 })();
 
-if (typeof window !== 'undefined') window.SandpieLfm25 = SandpieLfm25;
-if (typeof self !== 'undefined') self.SandpieLfm25 = SandpieLfm25;
+if (typeof window !== 'undefined') window.TabInferLfm25 = TabInferLfm25;
+if (typeof self !== 'undefined') self.TabInferLfm25 = TabInferLfm25;

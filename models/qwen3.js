@@ -1,5 +1,5 @@
 // sandpie/modules/webgpu-qwen3.js — Qwen3 model layer for the hand-written
-// WebGPU engine. Depends on window.SandpieWebGPU (the generic core in
+// WebGPU engine. Depends on window.TabInferWebGPU (the generic core in
 // webgpu-engine.js) for GPU init, buffers, pipeline cache and dispatch.
 //
 // This file owns the MODEL-SPECIFIC kernels and (later) the forward graph,
@@ -17,10 +17,10 @@
 //   per-head q_norm/k_norm (RMSNorm over head_dim, applied BEFORE RoPE).
 //   Linear weights stored [out,in] row-major → y = x · Wᵀ.
 
-const SandpieQwen3 = (function () {
+const TabInferQwen3 = (function () {
   'use strict';
 
-  const E = (typeof window !== 'undefined') ? window.SandpieWebGPU : null;
+  const E = (typeof window !== 'undefined') ? window.TabInferWebGPU : null;
 
   // Dense Qwen3 (Qwen3ForCausalLM) ONLY — same arch family, just bigger. NOTE:
   // there is NO dense "Qwen3-2B": Qwen/Qwen3-2B is a Qwen3.5-VL multimodal model
@@ -3336,18 +3336,18 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   };
   let MODEL_ROOT = MODEL_ROOTS['0.6B'];
   let _variant = '0.6B';
-  const CACHE_NAME = 'sandpie-webgpu-models';
+  const CACHE_NAME = 'tabinfer-webgpu-models';
   // QUANTIZED-WEIGHTS CACHE: after the first download+quantize we serialize the
   // GPU-ready bytes (int4 packs/scales + f16 tensors) into fixed 64MB chunks in
   // Cache Storage + a manifest. Subsequent loads skip download AND re-quantize:
   // read the chunks in parallel and writeBuffer their slices STRAIGHT into the GPU
   // buffers (peak host memory = one 64MB chunk per in-flight read, no whole-model
   // or whole-tensor materialization). Bump QCACHE_VER to invalidate the format.
-  const QCACHE_NAME = 'sandpie-webgpu-quant';
+  const QCACHE_NAME = 'tabinfer-webgpu-quant';
   const QCACHE_VER = 1;
   const QCHUNK = 64 * 1024 * 1024;       // 64 MiB cache chunk
   const QREAD_CONC = 4;                  // chunks read+uploaded in parallel
-  const _qUrl = (variant, part) => 'https://sandpie.quant/v' + QCACHE_VER + '/' + variant + '/' + part;
+  const _qUrl = (variant, part) => 'https://tabinfer.quant/v' + QCACHE_VER + '/' + variant + '/' + part;
   const _ceil16 = (n) => (n + 15) & ~15;
   let _weights = null;            // name -> { buf, shape, numel }  (buf holds f16)
   let _loaded = false;
@@ -4441,10 +4441,10 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   // vocab bitmask is applied to the logits before argmax, so an illegal token cannot be
   // picked). The batched loop resumes after '</tool_call>'. Free-text/thinking tokens pay
   // ZERO cost — constraint only ever runs inside the tool-call span.
-  const _gdbg = (...a) => { try { if (localStorage.getItem('sandpie-webgpu-debug') === '1') console.log('[qwen3 grammar]', ...a); } catch (_) {} };
+  const _gdbg = (...a) => { try { if (localStorage.getItem('tabinfer-webgpu-debug') === '1') console.log('[qwen3 grammar]', ...a); } catch (_) {} };
   function makeToolGrammar(toolNames) {
     try {
-      const G = (typeof globalThis !== 'undefined') && globalThis.SandpieGrammar;
+      const G = (typeof globalThis !== 'undefined') && globalThis.TabInferGrammar;
       if (!G || !toolNames || !toolNames.length || !TOK.isReady()) return null;
       return G.createToolCallGrammar({
         vocabSize: CONFIG.vocab,
@@ -5212,9 +5212,9 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
     // One-time device fingerprint — compare against the harness to spot a different
     // adapter / power state / memory limits between the two pages (same backend).
     try {
-      const dev = (window.SandpieWebGPU && window.SandpieWebGPU.device && window.SandpieWebGPU.device());
+      const dev = (window.TabInferWebGPU && window.TabInferWebGPU.device && window.TabInferWebGPU.device());
       const lim = dev && dev.limits;
-      const cp = (window.SandpieWebGPU && window.SandpieWebGPU.caps && window.SandpieWebGPU.caps()) || null;
+      const cp = (window.TabInferWebGPU && window.TabInferWebGPU.caps && window.TabInferWebGPU.caps()) || null;
       const ad = cp && cp.adapter;
       if (lim && !_streamIds._dumped) {
         _streamIds._dumped = true;
@@ -5542,4 +5542,4 @@ fn main(@builtin(global_invocation_id) gid:vec3<u32>){
   };
 })();
 
-if (typeof window !== 'undefined') window.SandpieQwen3 = SandpieQwen3;
+if (typeof window !== 'undefined') window.TabInferQwen3 = TabInferQwen3;

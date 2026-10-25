@@ -10,11 +10,11 @@ pre{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:1rem;w
 <button id="load">Load + spawn pool</button><button id="run" disabled>Generate + time</button>
 <span id="stat" class="hi"></span>
 <pre id="out">—</pre>
-<script src="modules/webgpu-engine.js?v=3"></script>
-<script src="modules/webgpu-qwen3.js?v=8"></script>
-<script src="_cpukern/cpuengine-mt.js?v=40"></script>
+<script src="../../engine/webgpu-engine.js"></script>
+<script src="../../models/qwen3.js"></script>
+<script src="../../cpu/kernel/cpuengine-mt.js"></script>
 <script>
-const $=id=>document.getElementById(id), E=window.CPUEngineMT, TOK=window.SandpieQwen3.TOK;
+const $=id=>document.getElementById(id), E=window.CPUEngineMT, TOK=window.TabInferQwen3.TOK;
 const EOS=new Set([151645,151643]);
 $('load').addEventListener('click',async()=>{
   $('load').disabled=true; $('stat').textContent='loading + spawning…';

@@ -1,6 +1,14 @@
-// Main-thread shim for window.SandpieQwen3, backed by a Web Worker that runs the
+// Main-thread shim for window.TabInferQwen3, backed by a Web Worker that runs the
 // actual hand-written WebGPU engine (webgpu-worker.js → webgpu-engine.js +
-// webgpu-qwen3.js). The GPU prefill/decode loop runs off the main thread so page
+// models/qwen3.js, models/lfm25.js, cpu/cpu-bonsai.js).
+//
+// Integration surface (set BEFORE the first runConversation):
+//   window.TabInferHost = {
+//     workerUrl: 'engine/webgpu-worker.js',          // resolved relative to the page
+//     toolRunner: async (name, args, convId) => ({ result: string, artifacts: any|null }),
+//   };
+// Without a toolRunner the engines still run; tool calls from the model are reported
+// and the round ends (see models/qwen3.js runConversation). The GPU prefill/decode loop runs off the main thread so page
 // rendering can't starve the submit windows (fixes the focused-tab decode slowdown
 // — see webgpu-worker.js). The interface mirrors the real engine for exactly the
 // members the main thread uses: DEFAULT_MODELS, DEFAULT_N_CTX, runConversation,
@@ -13,7 +21,7 @@
   // the multi-hundred-MB quantized-weights and KV-prefix snapshots (a manifest can survive
   // while its data chunks are evicted → restore fails → permanent re-prefill). Granted
   // automatically by Chrome on engaged/installed origins; harmless if denied.
-  try { navigator.storage && navigator.storage.persist && navigator.storage.persist().then(function (granted) { try { console.log('[sandpie] persistent storage: ' + (granted ? 'granted' : 'denied (caches may be evicted)')); } catch (_) {} }, function () {}); } catch (_) {}
+  try { navigator.storage && navigator.storage.persist && navigator.storage.persist().then(function (granted) { try { console.log('[tabinfer-host] persistent storage: ' + (granted ? 'granted' : 'denied (caches may be evicted)')); } catch (_) {} }, function () {}); } catch (_) {}
 
   // KEEP IN SYNC with DEFAULT_MODELS in the worker's engines (webgpu-qwen3.js + webgpu-lfm25.js).
   // The worker routes each run to the right engine by modelId, so all WebGPU models can live in
@@ -47,36 +55,25 @@
   }
   const _busyOff = () => setBusy(false);
 
-  // Execute a tool the engine worker requested by routing it through the SHARED in-page
-  // sandpie-worker.js (the SAME Web Worker the cloud agent loop and LiteRT use — it reads
-  // OPFS directly and handles every tool incl. load_skill), then reply to the engine
-  // worker. NOT via fetch('./sandpie-tool'): sandpie-worker is a dedicated Worker, not a
-  // service worker, so nothing intercepts that path and it 404s against the server — which
-  // is why ONLY the WebGPU backend's tools (incl. load_skill) were failing while cloud +
-  // Gemma worked. Mirrors litertlm.js toolViaWorker.
-  let _toolReqSeq = 0;
+  // Execute a tool the engine worker requested via the host-supplied runner, then reply.
   const TOOL_TIMEOUT_MS = 5 * 60 * 1000;
   function runTool(m) {
     const reply = (result, artifacts) => {
       try { _worker && _worker.postMessage({ t: 'toolResult', reqId: m.reqId, result, artifacts: artifacts || null }); } catch (_) {}
     };
-    const sw = window._sandpieWorker;
-    if (!sw) { reply('Error: sandpie-worker not ready — reload the page.', null); return; }
-    const id = 'wg-' + (++_toolReqSeq);
+    const runner = window.TabInferHost && window.TabInferHost.toolRunner;
+    if (typeof runner !== 'function') { reply('Error: no tool runner configured (window.TabInferHost.toolRunner).', null); return; }
     let settled = false;
-    const finish = (result, artifacts) => { if (settled) return; settled = true; cleanup(); reply(result, artifacts); };
-    const onMsg = (e) => { const r = e.data || {}; if (r.id !== id || r.type !== 'tool_result') return; finish(r.result || '', r.artifacts || null); };
-    const onErr = () => finish('Error: sandpie-worker crashed — retry (it restarts automatically).', null);
-    const timer = setTimeout(() => finish('Error: tool timed out after ' + (TOOL_TIMEOUT_MS / 1000) + 's — the worker may be stuck.', null), TOOL_TIMEOUT_MS);
-    function cleanup() { clearTimeout(timer); sw.removeEventListener('message', onMsg); sw.removeEventListener('error', onErr); }
-    sw.addEventListener('message', onMsg);
-    sw.addEventListener('error', onErr);
-    sw.postMessage({ type: 'tool', id, name: m.name, args: m.args, conversation_file_name: m.convId });
+    const finish = (result, artifacts) => { if (settled) return; settled = true; clearTimeout(timer); reply(result, artifacts); };
+    const timer = setTimeout(() => finish('Error: tool timed out after ' + (TOOL_TIMEOUT_MS / 1000) + 's.', null), TOOL_TIMEOUT_MS);
+    Promise.resolve().then(() => runner(m.name, m.args, m.convId)).then(
+      (r) => { if (r && typeof r === 'object' && 'result' in r) finish(String(r.result == null ? '' : r.result), r.artifacts || null); else finish(String(r == null ? '' : r), null); },
+      (e) => finish('Error: ' + ((e && e.message) || e), null));
   }
 
   function worker() {
     if (_worker) return _worker;
-    _worker = new Worker('modules/webgpu-worker.js?v=65');
+    _worker = new Worker((window.TabInferHost && window.TabInferHost.workerUrl) || 'engine/webgpu-worker.js');
     _worker.onmessage = (e) => {
       const m = e.data || {};
       if (m.t === 'fatal') { console.error('[webgpu-host]', m.message); return; }
@@ -85,10 +82,10 @@
       const r = _runs.get(m.id);
       if (!r) return;
       if (m.t === 'emit') {
-        // Capture the model's generated turns for window.SandpieLastResponse (debug).
+        // Capture the model's generated turns for window.TabInferLastResponse (debug).
         if (m.ev && m.ev.type === 'message_added' && r.resp) {
           r.resp.push(m.ev.message);
-          try { if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM message]', m.ev.message); } catch (_) {}
+          try { if (localStorage.getItem('tabinfer-llm-debug') === '1') console.log('[tabinfer LLM message]', m.ev.message); } catch (_) {}
         }
         try { r.emit(m.ev); } catch (_) {}
       }
@@ -108,12 +105,6 @@
   // Same signature/semantics as the real engine's runConversation: resolves after
   // it finishes (agent_done already emitted), rejects with AbortError on abort.
   async function runConversation(config, emit) {
-    // Single active local backend: deep-free the OTHER local LLMs' GPU (incl. their
-    // WebGPU devices) and WAIT for it BEFORE loading/running Qwen3, so two backends never
-    // hold GPU at once (the Gemma↔Qwen overload). Each is a cheap no-op if not loaded.
-    try { await window.SandpieLiteRTLM?.unload?.(); } catch (_) {}
-    try { await window.SandpieWllama?.unload?.(); } catch (_) {}
-    try { await window.SandpieTransformersJS?.unload?.(); } catch (_) {}
     const w = worker();
     const id = ++_seq;
     const signal = config && config.signal;
@@ -127,12 +118,12 @@
       logprobs: config.logprobs,        // confidence display mode (opt-in)
       // Bonsai CPU (experimental): optional URL of a dir hosting bonsai17.cpu.bin +
       // tokenizer.json (workers can't read localStorage — pass it through the run config).
-      cpuBonsaiBase: (function () { try { return localStorage.getItem('sandpie-cpu-bonsai-base') || null; } catch (_) { return null; } })(),
-      cpuBonsaiWorkers: (function () { try { return localStorage.getItem('sandpie-cpu-bonsai-workers') || null; } catch (_) { return null; } })(),
-      cpuBonsaiBatch: (function () { try { return localStorage.getItem('sandpie-cpu-bonsai-batch') || null; } catch (_) { return null; } })(),
-      cpuBonsaiV3: (function () { try { return localStorage.getItem('sandpie-cpu-bonsai-v3') || null; } catch (_) { return null; } })(),
+      cpuBonsaiBase: (function () { try { return localStorage.getItem('tabinfer-cpu-bonsai-base') || null; } catch (_) { return null; } })(),
+      cpuBonsaiWorkers: (function () { try { return localStorage.getItem('tabinfer-cpu-bonsai-workers') || null; } catch (_) { return null; } })(),
+      cpuBonsaiBatch: (function () { try { return localStorage.getItem('tabinfer-cpu-bonsai-batch') || null; } catch (_) { return null; } })(),
+      cpuBonsaiV3: (function () { try { return localStorage.getItem('tabinfer-cpu-bonsai-v3') || null; } catch (_) { return null; } })(),
     };
-    try { if (localStorage.getItem('sandpie-llm-debug') === '1') console.log('[sandpie LLM request — local webgpu]', cfg); } catch (_) {}
+    try { if (localStorage.getItem('tabinfer-llm-debug') === '1') console.log('[tabinfer LLM request — local webgpu]', cfg); } catch (_) {}
     const p = new Promise((resolve, reject) => {
       _runs.set(id, { emit: emit || (function () {}), resolve, reject, resp: respMsgs });
       if (signal) {
@@ -162,5 +153,5 @@
     });
   }
 
-  window.SandpieQwen3 = { DEFAULT_MODELS, DEFAULT_N_CTX, runConversation, unload, _viaWorker: true };
+  window.TabInferQwen3 = { DEFAULT_MODELS, DEFAULT_N_CTX, runConversation, unload, _viaWorker: true };
 })();

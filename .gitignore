@@ -1,0 +1,13 @@
+# weights and packed model binaries never go in git (they load from Hugging Face at runtime)
+*.cpu.bin
+*.safetensors
+*.gguf
+/_bonsai17/
+/models-data/
+# local junk
+*.log
+*.tmp
+.DS_Store
+Thumbs.db
+/node_modules/
+/.pw-profile/

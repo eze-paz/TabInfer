@@ -16,13 +16,13 @@
   // Code artifacts (coordinator JS, fwd-worker JS, both wasm kernels) are COMMITTED and must
   // be same-origin (Worker spawn forbids cross-origin), so they always load from the site
   // root. Only the two BIG data files — bonsai17.cpu.bin + tokenizer.json — may live on a
-  // separate host: set localStorage['sandpie-cpu-bonsai-base'] to a dir URL serving both
+  // separate host: set localStorage['tabinfer-cpu-bonsai-base'] to a dir URL serving both
   // (CORS-enabled if cross-origin); default is the site root (dev machine layout).
-  const BASE = '../';   // site root relative to modules/
+  const BASE = '../cpu/';   // this repo's cpu/ dir, relative to the WORKER script that importScripts() this file (engine/ or demo/)
   let _loaded = false, _loading = null, _nWorkers = 8;
 
   // Default host for the big data files (bonsai17.cpu.bin + tokenizer.json): a public
-  // HuggingFace repo. Overridable via localStorage['sandpie-cpu-bonsai-base']. On a
+  // HuggingFace repo. Overridable via localStorage['tabinfer-cpu-bonsai-base']. On a
   // LOCAL dev checkout the files sit at the site root, so localhost prefers those
   // (no needless 1GB HF fetch); everywhere else defaults to HF. Fetched once, then
   // served from the OPFS cache.
@@ -31,9 +31,6 @@
     const workers = parseInt((cfg && cfg.cpuBonsaiWorkers) || '', 10) || 0;   // optional sweep override
     let b = (cfg && cfg.cpuBonsaiBase) || '';
     if (!b) {
-      const host = (self.location && self.location.hostname) || '';
-      const local = /^(localhost|127\.|0\.0\.0\.0|::1|\[::1\])/.test(host);
-      if (local) return { bin: BASE + 'bonsai17.cpu.bin', tok: BASE + '_bonsai17/', label: 'site root (local dev)', workers };
       b = HF_BASE;
     }
     if (!b.endsWith('/')) b += '/';
@@ -137,7 +134,7 @@
         const g = await navigator.storage.persist(); console.log('[bonsai cache] persist() → ' + g);
       } } catch (_) {}
       const need = [
-        [BASE + '_cpukern/cpuengine-mt.js?v=43', 'cpukern JS'],
+        [BASE + 'kernel/cpuengine-mt.js', 'cpukern JS'],
         [BASE + 'cpukern.wasm', 'cpukern.wasm'],
         [BASE + 'cpukern-shared.wasm', 'cpukern-shared.wasm'],
         ...(binHit ? [] : [[data.bin, 'bonsai17.cpu.bin']]),
@@ -158,15 +155,15 @@
       if (missing.length) throw new Error('required files not served: ' + missing.join(', ')
         + ' — EXPERIMENTAL model. The wasm kernels deploy with the site (redeploy if missing). Host the two big files '
         + '(bonsai17.cpu.bin + tokenizer.json) on any CORS+range host — e.g. a HuggingFace repo (resolve/main/) or R2/S3 — '
-        + 'and set localStorage["sandpie-cpu-bonsai-base"] to that directory URL. On a local dev checkout they load from the site root automatically.');
+        + 'and set localStorage["tabinfer-cpu-bonsai-base"] to that directory URL. On a local dev checkout they load from the site root automatically.');
       globalThis.__cpukernBase = BASE;
-      importScripts(BASE + '_cpukern/cpuengine-mt.js?v=43');
-      await self.SandpieQwen3.TOK.load(data.tok);
+      importScripts(BASE + 'kernel/cpuengine-mt.js');
+      await self.TabInferQwen3.TOK.load(data.tok);
       globalThis.__chunkMode = true; globalThis.__lutMode = false;
       const binUrl = await _cachedBinUrl(data.bin, onProgress);   // one-time download → OPFS cache → blob URL
       // Right-size the worker pool to the device (was hardcoded 8 → left >1/3 of a
       // 12-thread CPU idle). Leave one thread for the main/coordinator. Override with
-      // localStorage['sandpie-cpu-bonsai-workers'] (passed through cfg) to sweep counts.
+      // localStorage['tabinfer-cpu-bonsai-workers'] (passed through cfg) to sweep counts.
       // Memory-bound decode gets ~nothing from hyperthreading and CONTENDS when
       // oversubscribed (measured: 6w=17.6 vs 11w=13.9 tok/s on a 6C/12T box). So
       // default to ~physical cores (hc/2), not hc-1. Override via the localStorage knob.
@@ -190,10 +187,10 @@
         if (!_dlAnnounced) { _dlAnnounced = true; emit({ type: 'delta', delta: { reasoning: 'First run on this device: downloading + caching the model (~1 GB) — one-time, then it loads from cache instantly.\n' } }); }
         try { console.log('[bonsai] caching ' + Math.round(frac * 100) + '% (' + (loaded / 1e9).toFixed(2) + '/' + (total / 1e9).toFixed(2) + ' GB)'); } catch (_) {}
       });
-      const TOK = self.SandpieQwen3.TOK, E = globalThis.CPUEngineMT;
+      const TOK = self.TabInferQwen3.TOK, E = globalThis.CPUEngineMT;
       // Mega-layer kernel (JOBTYPE=7): one dispatch per layer, main participates —
       // trades V2's work-stealing for far fewer barriers. Toggle per-run (no reload)
-      // via localStorage['sandpie-cpu-bonsai-v3']='1' to A/B against V2 back-to-back.
+      // via localStorage['tabinfer-cpu-bonsai-v3']='1' to A/B against V2 back-to-back.
       const v3 = (config.cpuBonsaiV3 === '1' || config.cpuBonsaiV3 === 'true' || config.cpuBonsaiV3 === true);
       globalThis.__v3 = v3;
       const kern = (v3 ? 'v3-mega' : 'v2') + ((config.cpuBonsaiBatch === '1') ? '+bp4' : '');
@@ -286,5 +283,5 @@
     return Promise.resolve();
   }
 
-  self.SandpieCpuBonsai = { MODELS, runConversation, unload, setToolRunner: function () {} };
+  self.TabInferCpuBonsai = { MODELS, runConversation, unload, setToolRunner: function () {} };
 })();

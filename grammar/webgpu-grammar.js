@@ -24,7 +24,7 @@
 //
 // Pure JS, no GPU, no engine imports — loaded by webgpu-worker.js and the test page.
 
-const SandpieGrammar = (function () {
+const TabInferGrammar = (function () {
   'use strict';
 
   const STR_MAX = 4096;      // max chars in one JSON string (near cap, only closers survive)
@@ -344,5 +344,5 @@ const SandpieGrammar = (function () {
   return { createToolCallGrammar, scanVocab };
 })();
 
-if (typeof window !== 'undefined') window.SandpieGrammar = SandpieGrammar;
-if (typeof self !== 'undefined') self.SandpieGrammar = SandpieGrammar;
+if (typeof window !== 'undefined') window.TabInferGrammar = TabInferGrammar;
+if (typeof self !== 'undefined') self.TabInferGrammar = TabInferGrammar;
