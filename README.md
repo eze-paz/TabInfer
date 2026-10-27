@@ -10,6 +10,10 @@ agent client, where it served as the offline backend for tool-calling conversati
 It was built generic-first and measured on commodity hardware: an Intel Iris Xe iGPU,
 Qualcomm Adreno phones, and 4-core laptop CPUs.
 
+**Try it live: https://eze-paz.github.io/TabInfer/demo/** — the demo page served via
+GitHub Pages (needs a WebGPU-capable Chrome/Edge; first load downloads and caches the
+model weights).
+
 ## What is in here
 
 | Engine | Model(s) | How it works |
@@ -40,11 +44,6 @@ Earlier measurements and the reasoning behind each design decision are in
 [`docs/notes/`](docs/notes/README.md): the 185 s → 26 s prefill fix, the 32k context
 ceiling via split-KV decode + int8 KV, why the LUT ternary path wins prefill but loses
 decode, the Adreno 128 MB bind cap, and the WGSL fast-matmul recipe.
-
-## Try it live
-
-**https://eze-paz.github.io/TabInfer/demo/** — the demo page served via GitHub Pages
-(needs a WebGPU-capable Chrome/Edge; first load downloads and caches the model weights).
 
 ## Run the demo locally
 
