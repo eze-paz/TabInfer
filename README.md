@@ -41,7 +41,12 @@ Earlier measurements and the reasoning behind each design decision are in
 ceiling via split-KV decode + int8 KV, why the LUT ternary path wins prefill but loses
 decode, the Adreno 128 MB bind cap, and the WGSL fast-matmul recipe.
 
-## Run the demo
+## Try it live
+
+**https://eze-paz.github.io/TabInfer/demo/** — the demo page served via GitHub Pages
+(needs a WebGPU-capable Chrome/Edge; first load downloads and caches the model weights).
+
+## Run the demo locally
 
 ```bash
 python demo/serve.py        # http://127.0.0.1:8765/demo/
